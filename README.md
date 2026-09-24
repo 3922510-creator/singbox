@@ -24,6 +24,11 @@ SB      # 或 sb
   - 流媒体走 WARP（Netflix / Disney / YouTube 等）
   - 自定义域名走 WARP
   - 查看 / 删除已添加的分流规则
+- 实用小工具：
+  - 流媒体解锁检测（ChatGPT / YouTube / Netflix / Disney+ / TikTok，快速原生检测）
+  - 完整社区检测脚本（RegionRestrictionCheck）
+  - DNS 设置（Cloudflare / Google / Quad9 / AliDNS / 自定义，带备份恢复）
+  - 防火墙 ufw 设置（开放/关闭端口、启用/停用，自动保留 22/SSH 防锁死）
 - 配置诊断：查看原始 JSON、手动编辑、重置、回滚上次有效备份
 
 ## 说明
