@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # ====================================================================
-# Sing-box 管理面板 v3.0.2 (生产级纯净版)
-# 特性: 无备注 / 官方文档配置格式 / 端口转发修复 / 配置回滚 / 并发锁
-# 备份策略: 每次"配置校验通过"才刷新唯一备份(.bak)，校验失败备份不动
+#  Sing-box 管理面板
+#  版本: v3.2.0  |  快捷指令: SB / sb
+# --------------------------------------------------------------------
+#  特性:
+#    • VLESS-Reality 节点管理（二维码 / 分享链接）
+#    • TCP/UDP 端口转发
+#    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
+#    • 配置校验 + 自动回滚 + 并发锁
+#  备份策略: 仅当“校验通过”才刷新唯一备份(.bak)，失败备份不动
 # ====================================================================
 
 set -o pipefail
+
+SCRIPT_VERSION="v3.2.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -17,9 +25,18 @@ BIN_FILE="/usr/local/bin/sing-box"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 META_DIR="/etc/sing-box/.meta"
 REALITY_META="$META_DIR/reality.txt"
+WARP_META="$META_DIR/warp.json"
 LOCK_FILE="/var/run/sing-box-manager.lock"
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
+
+# 若通过管道/进程替换（如 bash <(curl ...)）运行，stdin 不是终端，
+# read 会立即读到 EOF 导致菜单空转或直接退出（表现为“执行完就断连”）。
+# 强制把 stdin 重定向到终端，保证交互菜单始终从 TTY 读取。
+if [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
+
+# ---------- 通用交互 ----------
+pause() { echo ""; read -rp "按回车键继续..." _; }
 
 # ==================== 并发锁 ====================
 acquire_lock() {
@@ -598,7 +615,7 @@ diagnose_config() {
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
-        echo ""; read -rp "按回车键继续..."
+        pause
     done
 }
 
@@ -637,7 +654,7 @@ menu_system() {
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
-        echo ""; read -rp "按回车键继续..."
+        pause
     done
 }
 
@@ -660,7 +677,7 @@ menu_nodes() {
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
-        echo ""; read -rp "按回车键继续..."
+        pause
     done
 }
 
@@ -683,36 +700,303 @@ menu_forward() {
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
-        echo ""; read -rp "按回车键继续..."
+        pause
     done
 }
 
 # ==================== 主菜单 ====================
+show_banner() {
+    echo -e "${CYAN}"
+    echo -e "   ╔════════════════════════════════════╗"
+    echo -e "   ║      Sing-box 管理面板   ${SCRIPT_VERSION}      ║"
+    echo -e "   ║      Reality / 转发 / WARP 分流        ║"
+    echo -e "   ╚════════════════════════════════════╝"
+    echo -e "${PLAIN}"
+}
+
 show_menu() {
     clear
-    echo -e "=================================================="
-    echo -e "        Sing-box 管理面板 v3.0.2 (生产级纯净版)"
-    echo -e "=================================================="
+    show_banner
     echo -e " 当前状态 : $(get_singbox_status)"
-    echo -e "--------------------------------------------------"
-    echo -e " 1. 系统管理   (核心 / 状态 / 日志 / 卸载)"
-    echo -e " 2. 节点管理   (VLESS-Reality / 二维码)"
-    echo -e " 3. 端口转发   (TCP/UDP)"
-    echo -e " 4. 配置诊断   (查看 / 修复 / 回滚)"
-    echo -e " 5. 重启服务   🚀 一键重启"
-    echo -e "--------------------------------------------------"
-    echo -e " 0. 退出脚本"
-    echo -e "=================================================="
-    read -rp "请输入选项 [0-5]: " choice
+    echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+    echo -e "  ${GREEN}1.${PLAIN} 系统管理   核心 / 状态 / 日志 / 卸载"
+    echo -e "  ${GREEN}2.${PLAIN} 节点管理   VLESS-Reality / 二维码"
+    echo -e "  ${GREEN}3.${PLAIN} 端口转发   TCP/UDP"
+    echo -e "  ${GREEN}4.${PLAIN} WARP 出口   AI / 流媒体 / 自定义分流"
+    echo -e "  ${GREEN}5.${PLAIN} 配置诊断   查看 / 修复 / 回滚"
+    echo -e "  ${GREEN}6.${PLAIN} 重启服务   🚀 一键重启"
+    echo -e "${BLUE}--------------------------------------------------${PLAIN}"
+    echo -e "  ${YELLOW}0.${PLAIN} 退出脚本"
+    echo -e "${CYAN}==================================================${PLAIN}"
+    read -rp "请输入选项 [0-6]: " choice
     case "$choice" in
         1) menu_system ;;
         2) menu_nodes ;;
         3) menu_forward ;;
-        4) diagnose_config ;;
-        5) restart_service; echo ""; read -rp "按回车键继续..." ;;
+        4) menu_warp ;;
+        5) diagnose_config ;;
+        6) restart_service; pause ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效选项！${PLAIN}"; sleep 1 ;;
     esac
+}
+
+# ==================== WARP 出口 ====================
+# sing-box 1.11+ 将 wireguard 从 outbound 迁移为 endpoint，这里采用 endpoint 架构。
+# 账号通过 warp-reg 本地注册（不依赖不稳定的第三方 API）。
+WARP_REG_AMD64="https://github.com/badafans/warp-reg/releases/download/v1.0/main-linux-amd64"
+WARP_REG_ARM64="https://github.com/badafans/warp-reg/releases/download/v1.0/main-linux-arm64"
+WARP_PEER_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+
+# geosite 规则集（SagerNet/sing-geosite rule-set 分支，.srs 二进制）
+GEOSITE_BASE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+# AI ：category-ai-!cn 已聚合 ChatGPT/Claude/Gemini 等，再显式补 openai/anthropic
+WARP_AI_SITES="category-ai-!cn openai anthropic"
+# 流媒体
+WARP_MEDIA_SITES="netflix disney hbo youtube primevideo tiktok spotify hulu"
+
+save_warp_meta() { mkdir -p "$META_DIR"; printf '%s' "$1" > "$WARP_META"; chmod 600 "$WARP_META"; }
+
+has_warp_endpoint() {
+    local c
+    c=$(jq '[.endpoints[]? | select(.tag == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+    [[ "$c" =~ ^[0-9]+$ ]] && echo "$c" || echo "0"
+}
+
+register_warp_account() {
+    # 下载 warp-reg 并注册，输出 JSON {ipv6, private_key, reserved:[..]}（写到 stdout）
+    local url="$WARP_REG_AMD64" tmp out pk v6 reserved
+    [[ "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && url="$WARP_REG_ARM64"
+    tmp=$(mktemp)
+    if ! curl -sL --max-time 60 -o "$tmp" "$url"; then
+        rm -f "$tmp"; echo -e "${RED}❌ warp-reg 下载失败${PLAIN}" >&2; return 1
+    fi
+    chmod +x "$tmp"
+    out=$("$tmp" 2>/dev/null)
+    rm -f "$tmp"
+
+    pk=$(grep -oP '^private_key:\s*\K.*' <<<"$out")
+    v6=$(grep -oP '^v6:\s*\K.*' <<<"$out")
+    reserved=$(grep -oP '^reserved:\s*\K.*' <<<"$out" | tr -d ' ')
+    if [[ -z "$pk" || -z "$v6" || -z "$reserved" ]]; then
+        echo -e "${RED}❌ WARP 账号注册失败或返回异常${PLAIN}" >&2; return 1
+    fi
+    jq -cn --arg pk "$pk" --arg v6 "$v6" --argjson reserved "$reserved" \
+        '{ipv6:$v6, private_key:$pk, reserved:$reserved}'
+}
+
+add_warp() {
+    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
+    ensure_config
+
+    if [ "$(has_warp_endpoint)" -gt 0 ]; then
+        echo -e "${YELLOW}已存在 WARP 出口，将重新注册并覆盖。${PLAIN}"
+    fi
+
+    echo -e "${BLUE}⏳ 正在注册 WARP 账号...${PLAIN}"
+    local meta
+    meta=$(register_warp_account) || return 1
+
+    local ip6 pk reserved
+    ip6=$(jq -r '.ipv6' <<<"$meta")
+    pk=$(jq -r '.private_key' <<<"$meta")
+    reserved=$(jq -c '.reserved' <<<"$meta")
+
+    local temp_json
+    temp_json=$(jq --arg ip6 "$ip6" --arg pk "$pk" --argjson reserved "$reserved" --arg pub "$WARP_PEER_PUBKEY" '
+        .endpoints = (.endpoints // [])
+        | .endpoints |= (map(select(.tag != "warp")))
+        | .endpoints += [{
+            "type": "wireguard", "tag": "warp", "mtu": 1280,
+            "address": ["172.16.0.2/32", ($ip6 + "/128")],
+            "private_key": $pk,
+            "peers": [{
+                "address": "162.159.192.1", "port": 2408,
+                "public_key": $pub,
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                "reserved": $reserved
+            }]
+        }]' "$CONFIG_FILE")
+
+    if save_and_check_config "$temp_json"; then
+        save_warp_meta "$meta"
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ WARP 出口添加成功！${PLAIN}"
+        echo -e "  出口标签 : ${BLUE}warp${PLAIN}（wireguard endpoint）"
+        echo -e "  WARP IPv6: ${BLUE}$ip6${PLAIN}"
+        echo -e "  元数据   : $WARP_META"
+        echo -e "${YELLOW}💡 使用方式：菜单选 3 添加分流规则，或手动把路由规则的 outbound 指向 \"warp\"。${PLAIN}"
+    fi
+}
+
+add_warp_route() {
+    ensure_config
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
+    fi
+    read -rp "输入要走 WARP 的域名后缀（逗号分隔，如 openai.com,claude.ai）: " doms
+    [[ -z "$doms" ]] && { echo -e "${RED}未输入域名。${PLAIN}"; return; }
+    local arr
+    arr=$(printf '%s' "$doms" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -cs .)
+    if [[ "$arr" == "[]" || -z "$arr" ]]; then
+        echo -e "${RED}域名解析为空。${PLAIN}"; return
+    fi
+    local temp_json
+    temp_json=$(jq --argjson doms "$arr" '
+        .route = (.route // {})
+        | .route.rules = (.route.rules // [])
+        | .route.rules += [{"domain_suffix": $doms, "outbound": "warp"}]' "$CONFIG_FILE")
+    if save_and_check_config "$temp_json"; then
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 已添加分流规则：$doms → warp${PLAIN}"
+    fi
+}
+
+# 确保 rule_set 定义存在（按 tag 去重）并添加一条指向 warp 的规则；参数：规则组名 + geosite 列表
+add_ruleset_to_warp() {
+    local label="$1"; shift
+    local sites=("$@")
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
+    fi
+
+    local tags_json defs_json
+    tags_json=$(printf '%s\n' "${sites[@]}" | sed 's/^/geosite-/' | jq -R . | jq -cs .)
+    defs_json=$(printf '%s\n' "${sites[@]}" | jq -R --arg base "$GEOSITE_BASE" \
+        '{tag:("geosite-"+.),type:"remote",format:"binary",url:($base+"/geosite-"+.+".srs"),download_detour:"direct"}' | jq -cs .)
+
+    local temp_json
+    temp_json=$(jq --argjson tags "$tags_json" --argjson defs "$defs_json" '
+        .route = (.route // {})
+        | .route.rule_set = ((.route.rule_set // []) + $defs | group_by(.tag) | map(.[0]))
+        | .route.rules = (.route.rules // [])
+        | .route.rules += [{"rule_set": $tags, "outbound": "warp"}]' "$CONFIG_FILE")
+
+    if save_and_check_config "$temp_json"; then
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 已添加「$label」分流规则 → warp${PLAIN}"
+        echo -e "  规则集: $(printf 'geosite-%s ' "${sites[@]}")"
+        echo -e "${YELLOW}💡 首次启动会自动下载规则集（走 direct），若无法下载请确认服务器能访问 GitHub。${PLAIN}"
+    fi
+}
+
+add_warp_ai()    { ensure_config; add_ruleset_to_warp "AI 服务" $WARP_AI_SITES; }
+add_warp_media() { ensure_config; add_ruleset_to_warp "流媒体"   $WARP_MEDIA_SITES; }
+
+view_warp_rules() {
+    ensure_config
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
+    fi
+    local n
+    n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+    echo -e "${CYAN}=== 指向 WARP 的分流规则（共 ${n:-0} 条）===${PLAIN}"
+    if [ "${n:-0}" -eq 0 ]; then
+        echo -e "${YELLOW}暂无规则。可用菜单 3/4/5 添加。${PLAIN}"; return
+    fi
+    jq -r '
+      [.route.rules[]? | select((.outbound? // "") == "warp")]
+      | to_entries[]
+      | "  [\(.key+1)] " +
+        ([ (if .value.rule_set      then "规则集: "   + (.value.rule_set|join(",")) else empty end),
+           (if .value.domain_suffix  then "域名后缀: " + (.value.domain_suffix|join(",")) else empty end),
+           (if .value.domain         then "域名: "     + (.value.domain|join(",")) else empty end),
+           (if .value.domain_keyword then "关键词: "   + (.value.domain_keyword|join(",")) else empty end),
+           (if .value.ip_cidr        then "IP: "       + (.value.ip_cidr|join(",")) else empty end)
+         ] | join("  |  "))
+    ' "$CONFIG_FILE"
+}
+
+delete_warp_rule() {
+    ensure_config
+    local n
+    n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+    if [ "${n:-0}" -eq 0 ]; then
+        echo -e "${YELLOW}暂无指向 warp 的分流规则。${PLAIN}"; return
+    fi
+    view_warp_rules
+    echo -e "--------------------------------------------------"
+    local idx
+    read -rp "输入要删除的规则序号 (0 取消): " idx
+    [[ "$idx" == "0" ]] && return
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ]; then
+        echo -e "${RED}无效序号！${PLAIN}"; return
+    fi
+    local abs
+    abs=$(jq --argjson k "$((idx-1))" '
+      [.route.rules | to_entries[] | select((.value.outbound? // "") == "warp") | .key][$k]' "$CONFIG_FILE")
+    local temp_json
+    temp_json=$(jq --argjson i "$abs" '.route.rules |= (.[:$i] + .[$i+1:])' "$CONFIG_FILE")
+    if save_and_check_config "$temp_json"; then
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ 已删除第 $idx 条 warp 分流规则。${PLAIN}"
+    fi
+}
+
+delete_warp() {
+    ensure_config
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
+    fi
+    local temp_json
+    temp_json=$(jq '
+        .endpoints |= ((. // []) | map(select(.tag != "warp")))
+        | if .route then .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")]) else . end' "$CONFIG_FILE")
+    if save_and_check_config "$temp_json"; then
+        rm -f "$WARP_META"
+        systemctl restart sing-box
+        echo -e "${GREEN}✅ WARP 出口已删除（含指向 warp 的路由规则）。${PLAIN}"
+    fi
+}
+
+view_warp() {
+    ensure_config
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
+    fi
+    echo -e "${CYAN}=== WARP 出口 (wireguard endpoint) ===${PLAIN}"
+    jq '.endpoints[] | select(.tag == "warp")' "$CONFIG_FILE"
+    local rc
+    rc=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+    echo -e "  指向 warp 的路由规则数: ${BLUE}${rc:-0}${PLAIN}"
+    [ -f "$WARP_META" ] && echo -e "  账号元数据: $WARP_META"
+}
+
+menu_warp() {
+    while true; do
+        clear
+        echo -e "=================================================="
+        echo -e "        WARP 出口管理 (Cloudflare WARP)"
+        echo -e "=================================================="
+        echo -e " 当前状态 : $([ "$(has_warp_endpoint)" -gt 0 ] && echo -e "${GREEN}🟢 已配置${PLAIN}" || echo -e "${YELLOW}🟡 未配置${PLAIN}")"
+        echo -e "--------------------------------------------------"
+        echo -e " 1. 添加 / 重置 WARP 出口 (自动注册账号)"
+        echo -e " 2. 查看 WARP 出口信息"
+        echo -e " ${CYAN}【分流规则】${PLAIN}"
+        echo -e " 3. AI 服务走 WARP   (ChatGPT/Claude/Gemini 等)"
+        echo -e " 4. 流媒体走 WARP     (Netflix/Disney/YouTube 等)"
+        echo -e " 5. 自定义域名走 WARP"
+        echo -e " 6. 查看已添加的分流规则"
+        echo -e " 7. 删除指定分流规则"
+        echo -e "--------------------------------------------------"
+        echo -e " 8. 删除 WARP 出口"
+        echo -e " 0. 返回主菜单"
+        echo -e "=================================================="
+        read -rp "请输入选项 [0-8]: " c
+        case "$c" in
+            1) add_warp ;;
+            2) view_warp ;;
+            3) add_warp_ai ;;
+            4) add_warp_media ;;
+            5) add_warp_route ;;
+            6) view_warp_rules ;;
+            7) delete_warp_rule ;;
+            8) delete_warp ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+        esac
+        pause
+    done
 }
 
 # ==================== 入口 ====================
