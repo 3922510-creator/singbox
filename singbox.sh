@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.3.0  |  快捷指令: SB / sb
+#  版本: v3.3.2  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -14,7 +14,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.3.0"
+SCRIPT_VERSION="v3.3.2"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -38,6 +38,22 @@ if [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
 
 # ---------- 通用交互 ----------
 pause() { echo ""; read -rp "按回车键继续..." _; }
+
+# 统一菜单样式：所有菜单使用同一套标题、分组和提示，避免重复绘制导致维护混乱。
+menu_header() {
+    local title="$1" subtitle="${2:-}" status="${3:-}"
+    clear
+    # 不使用固定宽度右边框：printf 的 %-Ns 按字符而非终端显示宽度计算，
+    # 中文、ANSI 颜色码和手机 SSH 客户端会导致边框错位。
+    printf '\n%b┌─ %s ─┐%b\n' "$CYAN" "$title" "$PLAIN"
+    [ -n "$subtitle" ] && printf '%b│%b %s\n' "$CYAN" "$PLAIN" "$subtitle"
+    [ -n "$status" ] && printf '%b│%b 状态：%b\n' "$CYAN" "$PLAIN" "$status"
+    printf '%b└────────────────────────────────────────%b\n' "$CYAN" "$PLAIN"
+}
+menu_section() { printf '\n%b【%s】%b\n' "$BLUE" "$1" "$PLAIN"; }
+menu_option() { printf '  %b%-2s%b %s\n' "$GREEN" "$1." "$PLAIN" "$2"; }
+menu_back() { printf '\n  %b0.%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
+read_menu_choice() { local prompt="${1:-请选择}"; read -rp "$prompt：" REPLY; }
 
 # ==================== 并发锁 ====================
 acquire_lock() {
@@ -565,10 +581,7 @@ delete_port_forward() {
 # ==================== 配置诊断与回滚 ====================
 diagnose_config() {
     while true; do
-        clear
-        echo -e "=================================================="
-        echo -e "        配置诊断与回滚"
-        echo -e "=================================================="
+        menu_header "配置诊断与回滚" "查看、编辑、校验与恢复配置"
         echo -e " 配置文件: ${BLUE}$CONFIG_FILE${PLAIN}"
         if [ -f "$CONFIG_FILE" ]; then
             local size
@@ -584,16 +597,14 @@ diagnose_config() {
             echo -e " 状态: ${RED}配置文件不存在${PLAIN}"
         fi
         echo -e " 备份文件: $([ -f "${CONFIG_FILE}.bak" ] && echo -e "${GREEN}✅ 存在（上一版有效配置）${PLAIN}" || echo -e "${YELLOW}⚠️ 不存在${PLAIN}")"
-        echo -e "--------------------------------------------------"
-        echo -e " 1. 查看原始 JSON"
-        echo -e " 2. 查看 Reality 元数据"
-        echo -e " 3. 手动编辑配置"
-        echo -e " 4. 重置为空配置 (备份旧文件)"
-        echo -e " 5. 回滚到上次有效备份  ${RED}⚠️${PLAIN}"
-        echo -e "--------------------------------------------------"
-        echo -e " 0. 返回主菜单"
-        echo -e "=================================================="
-        read -rp "请输入选项 [0-5]: " c
+        menu_section "配置操作"
+        menu_option 1 "查看原始 JSON"
+        menu_option 2 "查看 Reality 元数据"
+        menu_option 3 "手动编辑并校验配置"
+        menu_option 4 "重置为空配置（自动备份）"
+        menu_option 5 "回滚到上次有效备份 ${RED}⚠️${PLAIN}"
+        menu_back
+        read_menu_choice "请选择 [0-5]"; c="$REPLY"
         case "$c" in
             1) echo -e "${CYAN}--- 原始 JSON ---${PLAIN}"; cat "$CONFIG_FILE" 2>/dev/null ;;
             2) echo -e "${CYAN}--- Reality 元数据 ---${PLAIN}"; [ -f "$REALITY_META" ] && cat "$REALITY_META" || echo -e "${YELLOW}无${PLAIN}" ;;
@@ -623,37 +634,24 @@ diagnose_config() {
 # ==================== 子菜单 ====================
 menu_system() {
     while true; do
-        clear
-        echo -e "=================================================="
-        echo -e "        系统管理"
-        echo -e "=================================================="
-        echo -e " 当前状态 : $(get_singbox_status)"
-        echo -e "--------------------------------------------------"
-        echo -e " ${CYAN}【核心】${PLAIN}"
-        echo -e " 1. 安装 / 更新核心"
-        echo -e " 2. 启动服务"
-        echo -e " 3. 停止服务"
-        echo -e " 4. 重启服务"
-        echo -e " 5. 完全卸载"
-        echo -e " ${CYAN}【监控】${PLAIN}"
-        echo -e " 6. 查看服务运行状态"
-        echo -e " 7. 查看完整配置文件"
-        echo -e " 8. 查看运行日志"
-        echo -e "--------------------------------------------------"
-        echo -e " 0. 返回主菜单"
-        echo -e "=================================================="
-        read -rp "请输入选项 [0-8]: " c
+        menu_header "系统管理" "核心、服务与运行监控" "$(get_singbox_status)"
+        menu_section "服务操作"
+        menu_option 1 "安装 / 更新 Sing-box 核心"
+        menu_option 2 "启动服务"
+        menu_option 3 "停止服务"
+        menu_option 4 "重启服务"
+        menu_option 5 "卸载 Sing-box"
+        menu_section "查看与诊断"
+        menu_option 6 "查看服务状态"
+        menu_option 7 "查看当前配置"
+        menu_option 8 "查看运行日志"
+        menu_back
+        read_menu_choice "请选择 [0-8]"; c="$REPLY"
         case "$c" in
-            1) install_singbox ;;
-            2) systemctl start sing-box && echo -e "${GREEN}✅ 已启动${PLAIN}" ;;
-            3) systemctl stop sing-box  && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;;
-            4) restart_service ;;
-            5) uninstall_singbox ;;
-            6) show_service_status ;;
-            7) show_full_config ;;
-            8) view_logs ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            1) install_singbox ;; 2) systemctl start sing-box && echo -e "${GREEN}✅ 已启动${PLAIN}" ;;
+            3) systemctl stop sing-box && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
+            5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
+            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
     done
@@ -661,46 +659,26 @@ menu_system() {
 
 menu_nodes() {
     while true; do
-        clear
-        echo -e "=================================================="
-        echo -e "        节点管理"
-        echo -e "=================================================="
-        echo -e " 1. 添加 VLESS-Reality 节点"
-        echo -e " 2. 查看节点分享链接 (支持二维码)"
-        echo -e " 3. 删除 VLESS-Reality 节点"
-        echo -e " 0. 返回主菜单"
-        echo -e "=================================================="
-        read -rp "请输入选项 [0-3]: " c
-        case "$c" in
-            1) add_reality_node ;;
-            2) view_node_links ;;
-            3) delete_node ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
-        esac
+        menu_header "节点管理" "VLESS-Reality 节点与分享信息"
+        menu_option 1 "添加 VLESS-Reality 节点"
+        menu_option 2 "查看分享链接 / 二维码"
+        menu_option 3 "删除节点"
+        menu_back
+        read_menu_choice "请选择 [0-3]"; c="$REPLY"
+        case "$c" in 1) add_reality_node ;; 2) view_node_links ;; 3) delete_node ;; 0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;; esac
         pause
     done
 }
 
 menu_forward() {
     while true; do
-        clear
-        echo -e "=================================================="
-        echo -e "        端口转发管理"
-        echo -e "=================================================="
-        echo -e " 1. 添加 TCP/UDP 端口转发"
-        echo -e " 2. 查看所有转发规则"
-        echo -e " 3. 删除转发规则"
-        echo -e " 0. 返回主菜单"
-        echo -e "=================================================="
-        read -rp "请输入选项 [0-3]: " c
-        case "$c" in
-            1) add_port_forward ;;
-            2) view_port_forwards ;;
-            3) delete_port_forward ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
-        esac
+        menu_header "端口转发" "TCP / UDP 转发规则管理"
+        menu_option 1 "添加端口转发"
+        menu_option 2 "查看转发规则"
+        menu_option 3 "删除转发规则"
+        menu_back
+        read_menu_choice "请选择 [0-3]"; c="$REPLY"
+        case "$c" in 1) add_port_forward ;; 2) view_port_forwards ;; 3) delete_port_forward ;; 0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;; esac
         pause
     done
 }
@@ -803,21 +781,17 @@ set_dns() {
 
 menu_dns() {
     while true; do
-        clear
-        echo -e "${CYAN}==================================================${PLAIN}"
-        echo -e "        DNS 设置"
-        echo -e "${CYAN}==================================================${PLAIN}"
+        menu_header "DNS 设置" "解析服务器配置"
         show_dns
-        echo -e "--------------------------------------------------"
-        echo -e "  ${GREEN}1.${PLAIN} Cloudflare  (1.1.1.1 / 1.0.0.1)"
-        echo -e "  ${GREEN}2.${PLAIN} Google      (8.8.8.8 / 8.8.4.4)"
-        echo -e "  ${GREEN}3.${PLAIN} Quad9       (9.9.9.9 / 149.112.112.112)"
-        echo -e "  ${GREEN}4.${PLAIN} AliDNS      (223.5.5.5 / 223.6.6.6)"
-        echo -e "  ${GREEN}5.${PLAIN} 自定义（空格分隔多个）"
-        echo -e "  ${GREEN}6.${PLAIN} 恢复备份 (resolv.conf.bak)"
-        echo -e "  ${YELLOW}0.${PLAIN} 返回"
-        echo -e "${CYAN}==================================================${PLAIN}"
-        read -rp "请选择 [0-6]: " c
+        menu_section "常用 DNS"
+        menu_option 1 "Cloudflare（1.1.1.1 / 1.0.0.1）"
+        menu_option 2 "Google（8.8.8.8 / 8.8.4.4）"
+        menu_option 3 "Quad9（9.9.9.9 / 149.112.112.112）"
+        menu_option 4 "AliDNS（223.5.5.5 / 223.6.6.6）"
+        menu_option 5 "自定义 DNS（空格分隔多个）"
+        menu_option 6 "恢复备份 resolv.conf"
+        menu_back
+        read_menu_choice "请选择 [0-6]"; c="$REPLY"
         case "$c" in
             1) set_dns "1.1.1.1 1.0.0.1 2606:4700:4700::1111" "Cloudflare" ;;
             2) set_dns "8.8.8.8 8.8.4.4 2001:4860:4860::8888" "Google" ;;
@@ -840,20 +814,16 @@ menu_firewall() {
         if [ -f /etc/debian_version ]; then apt-get install -y -qq ufw; else yum install -y -q ufw 2>/dev/null; fi
     fi
     while true; do
-        clear
-        echo -e "${CYAN}==================================================${PLAIN}"
-        echo -e "        防火墙设置 (ufw)"
-        echo -e "${CYAN}==================================================${PLAIN}"
+        menu_header "防火墙设置" "ufw 端口与安全策略"
         ufw status verbose 2>/dev/null | head -20
-        echo -e "--------------------------------------------------"
-        echo -e "  ${GREEN}1.${PLAIN} 开放端口 (tcp+udp)"
-        echo -e "  ${GREEN}2.${PLAIN} 关闭/删除端口规则"
-        echo -e "  ${GREEN}3.${PLAIN} 启用防火墙 (自动保留 22/SSH)"
-        echo -e "  ${GREEN}4.${PLAIN} 关闭防火墙"
-        echo -e "  ${GREEN}5.${PLAIN} 重载防火墙"
-        echo -e "  ${YELLOW}0.${PLAIN} 返回"
-        echo -e "${CYAN}==================================================${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        menu_section "规则操作"
+        menu_option 1 "开放端口（TCP + UDP）"
+        menu_option 2 "关闭 / 删除端口规则"
+        menu_option 3 "启用防火墙（自动保留 SSH 22）"
+        menu_option 4 "关闭防火墙"
+        menu_option 5 "重载防火墙"
+        menu_back
+        read_menu_choice "请选择 [0-5]"; c="$REPLY"
         case "$c" in
             1) local p
                read -rp "要开放的端口: " p
@@ -884,64 +854,40 @@ menu_firewall() {
 
 menu_tools() {
     while true; do
-        clear
-        echo -e "${CYAN}==================================================${PLAIN}"
-        echo -e "        实用小工具"
-        echo -e "${CYAN}==================================================${PLAIN}"
-        echo -e "  ${GREEN}1.${PLAIN} 流媒体解锁检测（快速）"
-        echo -e "  ${GREEN}2.${PLAIN} 流媒体解锁检测（完整社区脚本）"
-        echo -e "  ${GREEN}3.${PLAIN} DNS 设置"
-        echo -e "  ${GREEN}4.${PLAIN} 防火墙 (ufw) 设置"
-        echo -e "  ${YELLOW}0.${PLAIN} 返回主菜单"
-        echo -e "${CYAN}==================================================${PLAIN}"
-        read -rp "请输入选项 [0-4]: " c
+        menu_header "实用工具" "网络检测、DNS 与防火墙"
+        menu_section "网络检测"
+        menu_option 1 "流媒体解锁检测（快速）"
+        menu_option 2 "流媒体解锁检测（完整社区脚本）"
+        menu_section "系统网络"
+        menu_option 3 "DNS 设置"
+        menu_option 4 "防火墙设置（ufw）"
+        menu_back
+        read_menu_choice "请选择 [0-4]"; c="$REPLY"
         case "$c" in
-            1) media_check_quick; pause ;;
-            2) media_check_full; pause ;;
-            3) menu_dns ;;
-            4) menu_firewall ;;
-            0) return ;;
+            1) media_check_quick; pause ;; 2) media_check_full; pause ;;
+            3) menu_dns ;; 4) menu_firewall ;; 0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
     done
 }
 
 # ==================== 主菜单 ====================
-show_banner() {
-    echo -e "${CYAN}"
-    echo -e "   ╔════════════════════════════════════╗"
-    echo -e "   ║      Sing-box 管理面板   ${SCRIPT_VERSION}      ║"
-    echo -e "   ║      Reality / 转发 / WARP 分流        ║"
-    echo -e "   ╚════════════════════════════════════╝"
-    echo -e "${PLAIN}"
-}
-
 show_menu() {
-    clear
-    show_banner
-    echo -e " 当前状态 : $(get_singbox_status)"
-    echo -e "${BLUE}--------------------------------------------------${PLAIN}"
-    echo -e "  ${GREEN}1.${PLAIN} 系统管理   核心 / 状态 / 日志 / 卸载"
-    echo -e "  ${GREEN}2.${PLAIN} 节点管理   VLESS-Reality / 二维码"
-    echo -e "  ${GREEN}3.${PLAIN} 端口转发   TCP/UDP"
-    echo -e "  ${GREEN}4.${PLAIN} WARP 出口   AI / 流媒体 / 自定义分流"
-    echo -e "  ${GREEN}5.${PLAIN} 配置诊断   查看 / 修复 / 回滚"
-    echo -e "  ${GREEN}6.${PLAIN} 实用工具   流媒体检测 / DNS / 防火墙"
-    echo -e "  ${GREEN}7.${PLAIN} 重启服务   🚀 一键重启"
-    echo -e "${BLUE}--------------------------------------------------${PLAIN}"
-    echo -e "  ${YELLOW}0.${PLAIN} 退出脚本"
-    echo -e "${CYAN}==================================================${PLAIN}"
-    read -rp "请输入选项 [0-7]: " choice
+    menu_header "Sing-box 管理面板" "Reality / 转发 / WARP 分流  ·  ${SCRIPT_VERSION}" "$(get_singbox_status)"
+    menu_section "核心管理"
+    menu_option 1 "系统管理（安装、服务、日志、卸载）"
+    menu_option 2 "节点管理（VLESS-Reality、链接、二维码）"
+    menu_option 3 "端口转发（TCP / UDP）"
+    menu_option 4 "WARP 出口与分流"
+    menu_section "配置与工具"
+    menu_option 5 "配置诊断（查看、编辑、回滚）"
+    menu_option 6 "实用工具（解锁检测、DNS、防火墙）"
+    printf '\n  %b0.%b 退出脚本\n\n' "$YELLOW" "$PLAIN"
+    read_menu_choice "请选择 [0-6]"; choice="$REPLY"
     case "$choice" in
-        1) menu_system ;;
-        2) menu_nodes ;;
-        3) menu_forward ;;
-        4) menu_warp ;;
-        5) diagnose_config ;;
-        6) menu_tools ;;
-        7) restart_service; pause ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项！${PLAIN}"; sleep 1 ;;
+        1) menu_system ;; 2) menu_nodes ;; 3) menu_forward ;; 4) menu_warp ;;
+        5) diagnose_config ;; 6) menu_tools ;;
+        0) exit 0 ;; *) echo -e "${RED}无效选项！${PLAIN}"; sleep 1 ;;
     esac
 }
 
@@ -1033,6 +979,48 @@ add_warp() {
     fi
 }
 
+add_warp_node_route() {
+    ensure_config
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
+    fi
+
+    local tags=() i=0 n=0 tag choice selected
+    while [ $i -lt "$(inbound_count)" ]; do
+        tag=$(inbound_field "$i" "tag")
+        if [ "$(inbound_field "$i" "type")" == "vless" ] && [ -n "$tag" ]; then
+            tags+=("$tag")
+            n=$((n+1))
+            echo "  $n. $tag"
+        fi
+        i=$((i+1))
+    done
+    if [ "$n" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有 VLESS 节点。${PLAIN}"; return
+    fi
+
+    read -rp "选择要全部走 WARP 的节点 [1-$n]: " choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
+        echo -e "${RED}无效序号。${PLAIN}"; return
+    fi
+    selected="${tags[$((choice-1))]}"
+
+    local temp_json
+    temp_json=$(jq --arg tag "$selected" '
+        .route = (.route // {})
+        | .route.rules = ([{"inbound":[$tag],"outbound":"warp"}] +
+            [(.route.rules // [])[] | select((.inbound? // []) | index($tag) | not)])
+    ' "$CONFIG_FILE")
+    if save_and_check_config "$temp_json"; then
+        systemctl restart sing-box
+        if systemctl is-active --quiet sing-box; then
+            echo -e "${GREEN}✅ 节点 [$selected] 已设置为全部走 WARP。${PLAIN}"
+        else
+            echo -e "${RED}❌ 配置已写入，但 sing-box 重启失败，请查看日志。${PLAIN}"
+        fi
+    fi
+}
+
 add_warp_route() {
     ensure_config
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
@@ -1105,13 +1093,16 @@ view_warp_rules() {
     jq -r '
       [.route.rules[]? | select((.outbound? // "") == "warp")]
       | to_entries[]
-      | "  [\(.key+1)] " +
-        ([ (if .value.rule_set      then "规则集: "   + (.value.rule_set|join(",")) else empty end),
-           (if .value.domain_suffix  then "域名后缀: " + (.value.domain_suffix|join(",")) else empty end),
-           (if .value.domain         then "域名: "     + (.value.domain|join(",")) else empty end),
-           (if .value.domain_keyword then "关键词: "   + (.value.domain_keyword|join(",")) else empty end),
-           (if .value.ip_cidr        then "IP: "       + (.value.ip_cidr|join(",")) else empty end)
-         ] | join("  |  "))
+      | .value as $r
+      | ([
+          (if ($r.inbound?       // null) != null then "入站: "     + (($r.inbound       | if type == "array" then join(",") else tostring end)) else empty end),
+          (if ($r.rule_set?      // null) != null then "规则集: "   + (($r.rule_set      | if type == "array" then join(",") else tostring end)) else empty end),
+          (if ($r.domain_suffix? // null) != null then "域名后缀: " + (($r.domain_suffix | if type == "array" then join(",") else tostring end)) else empty end),
+          (if ($r.domain?        // null) != null then "域名: "     + (($r.domain        | if type == "array" then join(",") else tostring end)) else empty end),
+          (if ($r.domain_keyword? // null) != null then "关键词: "   + (($r.domain_keyword | if type == "array" then join(",") else tostring end)) else empty end),
+          (if ($r.ip_cidr?       // null) != null then "IP: "       + (($r.ip_cidr       | if type == "array" then join(",") else tostring end)) else empty end)
+        ] | map(select(. != "")) | join("  |  ")) as $detail
+      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量 → warp" else $detail end)
     ' "$CONFIG_FILE"
 }
 
@@ -1172,35 +1163,28 @@ view_warp() {
 
 menu_warp() {
     while true; do
-        clear
-        echo -e "=================================================="
-        echo -e "        WARP 出口管理 (Cloudflare WARP)"
-        echo -e "=================================================="
-        echo -e " 当前状态 : $([ "$(has_warp_endpoint)" -gt 0 ] && echo -e "${GREEN}🟢 已配置${PLAIN}" || echo -e "${YELLOW}🟡 未配置${PLAIN}")"
-        echo -e "--------------------------------------------------"
-        echo -e " 1. 添加 / 重置 WARP 出口 (自动注册账号)"
-        echo -e " 2. 查看 WARP 出口信息"
-        echo -e " ${CYAN}【分流规则】${PLAIN}"
-        echo -e " 3. AI 服务走 WARP   (ChatGPT/Claude/Gemini 等)"
-        echo -e " 4. 流媒体走 WARP     (Netflix/Disney/YouTube 等)"
-        echo -e " 5. 自定义域名走 WARP"
-        echo -e " 6. 查看已添加的分流规则"
-        echo -e " 7. 删除指定分流规则"
-        echo -e "--------------------------------------------------"
-        echo -e " 8. 删除 WARP 出口"
-        echo -e " 0. 返回主菜单"
-        echo -e "=================================================="
-        read -rp "请输入选项 [0-8]: " c
+        local warp_status
+        warp_status=$([ "$(has_warp_endpoint)" -gt 0 ] && echo -e "${GREEN}已配置${PLAIN}" || echo -e "${YELLOW}未配置${PLAIN}")
+        menu_header "WARP 出口" "Cloudflare WARP · 出口与分流规则" "$warp_status"
+        menu_section "出口"
+        menu_option 1 "添加 / 重置 WARP（自动注册账号）"
+        menu_option 2 "查看 WARP 出口信息"
+        menu_option 9 "删除 WARP 出口及相关规则"
+        menu_section "分流规则"
+        menu_option 3 "AI 服务走 WARP"
+        menu_option 4 "流媒体走 WARP"
+        menu_option 5 "自定义域名走 WARP"
+        menu_option 8 "指定节点全部走 WARP"
+        local rule_count
+        rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+        menu_option 6 "查看已添加的规则（${rule_count:-0} 条）"
+        menu_option 7 "删除指定规则"
+        menu_back
+        read_menu_choice "请选择 [0-9]"; c="$REPLY"
         case "$c" in
-            1) add_warp ;;
-            2) view_warp ;;
-            3) add_warp_ai ;;
-            4) add_warp_media ;;
-            5) add_warp_route ;;
-            6) view_warp_rules ;;
-            7) delete_warp_rule ;;
-            8) delete_warp ;;
-            0) return ;;
+            1) add_warp ;; 2) view_warp ;; 3) add_warp_ai ;; 4) add_warp_media ;;
+            5) add_warp_route ;; 6) view_warp_rules ;; 7) delete_warp_rule ;;
+            8) add_warp_node_route ;; 9) delete_warp ;; 0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
