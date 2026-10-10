@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.3.2  |  快捷指令: SB / sb
+#  版本: v3.4.0  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / DNS / 防火墙）
+#    • 网络加速（BBR / BBRv3 拥塞控制切换 + BBRv3 内核安装）
 #    • 配置校验 + 自动回滚 + 并发锁
 #  备份策略: 仅当“校验通过”才刷新唯一备份(.bak)，失败备份不动
 # ====================================================================
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.3.2"
+SCRIPT_VERSION="v3.4.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -852,20 +853,232 @@ menu_firewall() {
     done
 }
 
+# ==================== 网络加速（BBR / BBRv3 拥塞控制） ====================
+# 关键点："bbr" 只是内核里的一个算法名，跑的是 v1 还是 v3 由内核决定
+#（自编译 bbr3 内核 / XanMod / 打了 BBRv3 补丁的发行版内核）。
+# 判定依据只有两条硬证据：内核 release 名 + tcp_bbr 模块的 version 字段（bbr3 内核 = 3）。
+BBR_CONF="/etc/sysctl.d/99-zz-bbr-mode.conf"   # 字母序排在 99-vpsbox-bbr.conf 之后，最后生效
+BBR3_REPO="XDflight/bbr3-debs"                 # 第三方 BBRv3 内核 deb 源（与本机 6.1.187-bbr3 同源）
+
+bbr_kernel_label() {
+    local k mt
+    k=$(uname -r)
+    case "$k" in
+        *bbr3*|*bbrv3*|*xanmod*) echo "v3"; return ;;
+        *bbrplus*)               echo "plus"; return ;;
+    esac
+    mt=$(command -v modinfo >/dev/null 2>&1 && modinfo -F version tcp_bbr 2>/dev/null)
+    [ "$mt" = "3" ] && { echo "v3"; return; }
+    echo "v1"
+}
+
+bbr_kernel_desc() {
+    case "$(bbr_kernel_label)" in
+        v3)   echo -e "${YELLOW}BBRv3${PLAIN}" ;;
+        plus) echo -e "${YELLOW}BBRplus${PLAIN}" ;;
+        *)    echo -e "${GREEN}非 BBRv3（内核原生 bbr v1/v2）${PLAIN}" ;;
+    esac
+}
+
+bbr_default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
+
+bbr_os_family() {
+    local id like
+    id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+    like=$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}")
+    case "$id $like" in
+        *debian*|*ubuntu*) echo "debian" ;;
+        *rhel*|*centos*|*fedora*) echo "rhel" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+bbr_status_short() {
+    local iface
+    iface=$(bbr_default_iface)
+    echo -e "  内核      : ${YELLOW}$(uname -r)${PLAIN}    BBR 版本: $(bbr_kernel_desc)"
+    echo -e "  拥塞算法  : ${YELLOW}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${PLAIN}    默认队列: ${YELLOW}$(sysctl -n net.core.default_qdisc 2>/dev/null)${PLAIN}"
+    echo -e "  可用算法  : $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)"
+    [ -n "$iface" ] && echo -e "  ${iface} 实际队列: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
+}
+
+bbr_show_status() {
+    echo -e "${BLUE}=== 拥塞控制状态 ===${PLAIN}"
+    bbr_status_short
+    echo -e "\n  判定依据 : 内核 $(uname -r) / tcp_bbr 模块 version=$(command -v modinfo >/dev/null 2>&1 && modinfo -F version tcp_bbr 2>/dev/null || echo 未知)"
+    echo -e "  持久化   : ${BBR_CONF}"
+    if [ -f "$BBR_CONF" ]; then sed 's/^/    /' "$BBR_CONF"; else echo -e "    ${YELLOW}(本面板尚未写入该文件)${PLAIN}"; fi
+    echo -e "\n  ${YELLOW}说明：换内核后算法名仍是 bbr，v1/v3 由内核决定，不需要改这里的配置。${PLAIN}"
+}
+
+# 写入持久化 + 立即生效 + 回读校验；$1=算法 $2=队列 $3=显示名
+bbr_apply() {
+    local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+    if ! printf '%s\n' $avail | grep -qx "$cc"; then
+        echo -e "${RED}❌ 当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
+    {
+        echo "# ${label} —— 由 sb 管理面板写入 $(date '+%Y-%m-%d %H:%M')"
+        echo "net.core.default_qdisc = ${qdisc}"
+        echo "net.ipv4.tcp_congestion_control = ${cc}"
+    } > "$BBR_CONF"
+    chmod 644 "$BBR_CONF"
+
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    sysctl -q -w "net.core.default_qdisc=${qdisc}" "net.ipv4.tcp_congestion_control=${cc}" >/dev/null 2>&1
+    iface=$(bbr_default_iface)
+    if [ -n "$iface" ]; then
+        # 默认队列只影响新建的网卡队列，已在跑的网卡要手动替换才立即生效
+        tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1 \
+            || echo -e "${YELLOW}  ⚠️ ${iface} 根队列替换失败（不影响持久化，重启后生效）${PLAIN}"
+    fi
+
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [ "$cur_cc" = "$cc" ] && [ "$cur_qd" = "$qdisc" ]; then
+        echo -e "${GREEN}✅ 已切换到 ${label}${PLAIN}"
+        echo -e "   算法=${cur_cc}  默认队列=${cur_qd}  ${iface:-?} 实际队列=$(tc qdisc show dev "${iface:-eth0}" 2>/dev/null | awk 'NR==1{print $2}')"
+        echo -e "   持久化=${BBR_CONF}（重启后自动生效）"
+        echo -e "${YELLOW}   注意：已建立的 TCP 连接沿用旧算法，新连接才生效。${PLAIN}"
+    else
+        echo -e "${RED}❌ 回读校验不一致：算法=${cur_cc} 队列=${cur_qd}（期望 ${cc} / ${qdisc}）${PLAIN}"
+        return 1
+    fi
+}
+
+bbr_set_bbr() {
+    bbr_apply bbr fq "BBR + fq" || return 1
+    if [ "$(bbr_kernel_label)" = "v3" ]; then
+        echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq。${PLAIN}"
+    else
+        echo -e "${YELLOW}   提示：本机内核不是 BBRv3，想要 v3 请用菜单里的「安装 BBRv3 内核」。${PLAIN}"
+    fi
+}
+
+bbr_set_bbrv3() {
+    if [ "$(bbr_kernel_label)" = "v3" ]; then
+        bbr_apply bbr fq "BBRv3 + fq"
+        return
+    fi
+    echo -e "${YELLOW}当前内核 $(uname -r) 不含 BBRv3（依据：release 名 + tcp_bbr 模块 version）。${PLAIN}"
+    echo -e "拥塞算法只是选 ‘bbr’ 这个实现，v1 还是 v3 由内核决定 —— 得先换 BBRv3 内核。"
+    read -rp "是否现在安装 BBRv3 内核（${BBR3_REPO}）？[y/N]: " yes
+    case "$yes" in y|Y) bbr_install_kernel ;; *) echo -e "${YELLOW}已取消。${PLAIN}" ;; esac
+}
+
+bbr_list_kernels() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        echo -e "${BLUE}=== 已安装内核（dpkg）===${PLAIN}"
+        dpkg-query -W -f='${Package}  ${Version}\n' 'linux-image*' 2>/dev/null | grep -vE '\-common$' | sed 's/^/  /'
+    elif command -v rpm >/dev/null 2>&1; then
+        echo -e "${BLUE}=== 已安装内核（rpm）===${PLAIN}"
+        rpm -qa 2>/dev/null | grep -E '^kernel' | sort -V | sed 's/^/  /'
+    else
+        echo -e "${RED}未找到 dpkg / rpm，无法列出内核。${PLAIN}"; return
+    fi
+    echo -e "  当前运行 : ${GREEN}$(uname -r)${PLAIN}"
+}
+
+# 从 BBR3_REPO 安装 BBRv3 内核（deb 系；不自动重启）
+bbr_install_kernel() {
+    local arch fam resp tags sel tag ver url_img url_hdr tmp i
+    arch=$(uname -m)
+    [ "$arch" = "x86_64" ] || { echo -e "${RED}❌ ${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核或 XanMod。${PLAIN}"; return 1; }
+    fam=$(bbr_os_family)
+    [ "$fam" = "debian" ] || { echo -e "${RED}❌ 本功能只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"; return 1; }
+
+    echo -e "${BLUE}⏳ 正在从 ${BBR3_REPO} 获取可用版本...${PLAIN}"
+    resp=$(curl -sL --max-time 25 "https://api.github.com/repos/${BBR3_REPO}/releases?per_page=100" 2>/dev/null)
+    tags=$(jq -r '.[].tag_name' <<<"$resp" 2>/dev/null | grep -E -- '-bbr3-amd64$' | head -6)
+    if [ -z "$tags" ]; then
+        echo -e "${RED}❌ 取不到版本列表（GitHub API 限流 / 无外网）。退路：VPSBox 的 BBR 菜单，或手动 dpkg 安装 deb。${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${BLUE}可用 BBRv3 内核（新 → 旧）：${PLAIN}"
+    i=0
+    while read -r tag; do
+        [ -z "$tag" ] && continue
+        i=$((i+1))
+        echo -e "  ${GREEN}${i})${PLAIN} ${tag}"
+    done <<< "$tags"
+    read -rp "选择编号（回车取消）: " sel
+    [ -z "$sel" ] && { echo -e "${YELLOW}已取消。${PLAIN}"; return; }
+    case "$sel" in *[!0-9]*) echo -e "${RED}无效编号。${PLAIN}"; return 1 ;; esac
+    tag=$(printf '%s\n' "$tags" | sed -n "${sel}p")
+    [ -n "$tag" ] || { echo -e "${RED}无效编号。${PLAIN}"; return 1; }
+
+    url_img=$(jq -r --arg t "$tag" '.[] | select(.tag_name==$t) | .assets[].browser_download_url' <<<"$resp" 2>/dev/null | grep -E '/linux-image-[^/]*amd64\.deb$' | head -1)
+    url_hdr=$(jq -r --arg t "$tag" '.[] | select(.tag_name==$t) | .assets[].browser_download_url' <<<"$resp" 2>/dev/null | grep -E '/linux-headers-[^/]*amd64\.deb$' | head -1)
+    [ -n "$url_img" ] || { echo -e "${RED}❌ 该版本没有 amd64 image 资产。${PLAIN}"; return 1; }
+
+    tmp=$(mktemp -d /tmp/bbr3-XXXXXX)
+    echo -e "${BLUE}⏳ 下载 $(basename "$url_img") ...${PLAIN}"
+    curl -fL --max-time 600 -o "$tmp/$(basename "$url_img")" "$url_img" || { echo -e "${RED}❌ image 下载失败（文件留在 ${tmp}）。${PLAIN}"; return 1; }
+    if [ -n "$url_hdr" ]; then
+        echo -e "${BLUE}⏳ 下载 $(basename "$url_hdr") ...${PLAIN}"
+        curl -fL --max-time 600 -o "$tmp/$(basename "$url_hdr")" "$url_hdr" || echo -e "${YELLOW}  ⚠️ headers 下载失败，只装 image。${PLAIN}"
+    fi
+
+    echo -e "\n${YELLOW}即将 dpkg 安装 ${tag} 并更新 GRUB 默认项。${PLAIN}"
+    echo -e "${RED}注意：需要重启才生效；新内核起不来时用 VPS 控制台（VNC）选旧内核回退。${PLAIN}"
+    read -rp "确认安装？输入 yes 继续: " conf
+    [ "$conf" = "yes" ] || { echo -e "${YELLOW}已取消（deb 文件留在 ${tmp}）。${PLAIN}"; return; }
+
+    if dpkg -i "$tmp"/*.deb; then
+        command -v update-grub >/dev/null 2>&1 && update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null
+        echo -e "${GREEN}✅ 安装完成，重启后生效： ${YELLOW}reboot${PLAIN}"
+        echo -e "   重启回来后在「网络加速」里选一次「BBRv3 + fq」确认即可。"
+    else
+        echo -e "${RED}❌ dpkg 安装失败，尝试补齐依赖...${PLAIN}"
+        apt-get -f install -y && update-grub 2>/dev/null
+        echo -e "${YELLOW}若仍失败，deb 文件保留在 ${tmp} 可手动处理。${PLAIN}"
+    fi
+}
+
+menu_bbr() {
+    while true; do
+        menu_header "网络加速" "BBR / BBRv3 拥塞控制 + 内核"
+        bbr_status_short
+        menu_section "切换（立即生效 + 写入持久化）"
+        menu_option 1 "BBR + fq（内核自带；是 bbr3 内核即 BBRv3）"
+        menu_option 2 "BBRv3 + fq（校验内核，必要时装内核）"
+        menu_option 3 "CUBIC + fq_codel（恢复系统默认）"
+        menu_section "内核"
+        menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}）"
+        menu_option 5 "查看已安装内核"
+        menu_section "查看"
+        menu_option 6 "完整状态与判定依据"
+        menu_back
+        read_menu_choice "请选择 [0-6]"; c="$REPLY"
+        case "$c" in
+            1) bbr_set_bbr ;; 2) bbr_set_bbrv3 ;; 3) bbr_apply cubic fq_codel "CUBIC + fq_codel" ;;
+            4) bbr_install_kernel ;; 5) bbr_list_kernels ;; 6) bbr_show_status ;;
+            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+        esac
+        pause
+    done
+}
+
 menu_tools() {
     while true; do
-        menu_header "实用工具" "网络检测、DNS 与防火墙"
+        menu_header "实用工具" "网络检测、加速、DNS 与防火墙"
         menu_section "网络检测"
         menu_option 1 "流媒体解锁检测（快速）"
         menu_option 2 "流媒体解锁检测（完整社区脚本）"
         menu_section "系统网络"
         menu_option 3 "DNS 设置"
         menu_option 4 "防火墙设置（ufw）"
+        menu_option 5 "网络加速（BBR / BBRv3 + fq）"
         menu_back
-        read_menu_choice "请选择 [0-4]"; c="$REPLY"
+        read_menu_choice "请选择 [0-5]"; c="$REPLY"
         case "$c" in
             1) media_check_quick; pause ;; 2) media_check_full; pause ;;
-            3) menu_dns ;; 4) menu_firewall ;; 0) return ;;
+            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
     done

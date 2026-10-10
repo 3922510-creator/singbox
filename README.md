@@ -1,6 +1,6 @@
 # Sing-box 管理面板
 
-面向 Debian / Ubuntu / RHEL 系服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并提供配置校验、自动备份和失败回滚。
+面向 Debian / Ubuntu / RHEL 系服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
 
 ## 一键安装
 
@@ -39,6 +39,16 @@ sudo bash singbox.sh
 - 自定义域名、域名后缀、关键词和 IP 网段分流
 - 指定入站节点全部走 WARP
 - 查看和删除已添加的 WARP 规则
+
+### 网络加速（BBR / BBRv3）
+
+菜单入口：实用工具 → 网络加速
+
+- 一键切换 `BBR + fq` / `BBRv3 + fq`，或恢复系统默认 `CUBIC + fq_codel`
+- 即时生效：写入 `/etc/sysctl.d/99-zz-bbr-mode.conf` 持久化，同时替换网卡根队列（默认队列只对新网卡生效）
+- 自动判定内核是否 BBRv3（内核 release 名 + `tcp_bbr` 模块 version 字段），不靠猜
+- 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核，可自选版本，不自动重启
+- 查看已安装内核与完整状态判定依据
 
 ### 系统与网络工具
 
