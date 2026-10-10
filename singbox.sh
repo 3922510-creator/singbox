@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.4  |  快捷指令: SB / sb
+#  版本: v3.4.5  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.4"
+SCRIPT_VERSION="v3.4.5"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -596,7 +596,9 @@ sub_links() {
     echo -e "${CYAN}=== 客户端订阅（sing-box 一键导入） ===${PLAIN}"
     if [ ! -d "$SUB_DIR" ]; then
         echo -e "${YELLOW}订阅目录不存在：$SUB_DIR${PLAIN}"
-        echo -e "可用环境变量覆盖：SUB_DIR=... SUB_BASE_URL=... sb"
+        echo -e "  该目录需自己准备（每个子目录一个订阅，目录名即链接里的随机路径）。"
+        echo -e "  默认值只对应作者环境，用环境变量指定你自己的目录与访问前缀即可："
+        echo -e "  ${BLUE}SUB_DIR=/path/to/subs SUB_BASE_URL=http://你的IP:端口/sub sb${PLAIN}"
         return
     fi
 
