@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.3  |  快捷指令: SB / sb
+#  版本: v3.4.4  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -9,13 +9,14 @@
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / DNS / 防火墙）
 #    • 网络加速（BBR / BBRv3 拥塞控制切换 + BBRv3 内核安装）
+#    • 客户端订阅一键导入（sing-box 订阅 URL / import scheme）
 #    • 配置校验 + 自动回滚 + 并发锁
 #  备份策略: 仅当“校验通过”才刷新唯一备份(.bak)，失败备份不动
 # ====================================================================
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.3"
+SCRIPT_VERSION="v3.4.4"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -29,6 +30,12 @@ META_DIR="/etc/sing-box/.meta"
 REALITY_META="$META_DIR/reality.txt"
 WARP_META="$META_DIR/warp.json"
 LOCK_FILE="/var/run/sing-box-manager.lock"
+
+# ---------- 客户端订阅（一键导入）----------
+# 订阅文件目录：每个子目录 = 一个订阅，目录名就是链接里的随机路径（口令，勿外传）。
+# SUB_BASE_URL 是这些文件对外的访问前缀，需与反代/静态目录配置一致；两者都可用环境变量覆盖。
+SUB_DIR="${SUB_DIR:-/root/.nanobot/workspace/subs}"
+SUB_BASE_URL="${SUB_BASE_URL:-https://usage.ecio.cn/sub}"
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
 
@@ -158,6 +165,9 @@ rollback_config() {
 
 # ==================== 辅助工具函数 ====================
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# URL 百分号编码（用于把订阅 URL 拼进 sing-box:// scheme 的 query 参数）
+urlenc() { jq -rn --arg v "$1" '$v|@uri'; }
 
 port_in_use() {
     [ -f "$CONFIG_FILE" ] || return 1
@@ -577,6 +587,58 @@ delete_port_forward() {
         systemctl restart sing-box
         echo -e "${GREEN}✅ 转发 [${del_tag}] 已删除。${PLAIN}"
     fi
+}
+
+# ==================== 客户端订阅（一键导入） ====================
+# 订阅文件不由本脚本生成（默认在 $SUB_DIR/<随机名>/，由外部工具/面板投放）；
+# 这里只做展示与自检：订阅 URL、sing-box 一键导入 scheme、文件清单、线上可达性 + 配置校验。
+sub_links() {
+    echo -e "${CYAN}=== 客户端订阅（sing-box 一键导入） ===${PLAIN}"
+    if [ ! -d "$SUB_DIR" ]; then
+        echo -e "${YELLOW}订阅目录不存在：$SUB_DIR${PLAIN}"
+        echo -e "可用环境变量覆盖：SUB_DIR=... SUB_BASE_URL=... sb"
+        return
+    fi
+
+    local found=0 d name label url scheme files code
+    for d in "$SUB_DIR"/*/; do
+        [ -f "${d}config.json" ] || continue
+        found=1
+        name=$(basename "$d")
+        label=$(head -1 "$d/name.txt" 2>/dev/null); [ -n "$label" ] || label="$name"
+        url="$SUB_BASE_URL/$name/config.json"
+        scheme="sing-box://import-remote-profile?url=$(urlenc "$url")#$(urlenc "$label")"
+        files=$(ls -1 "$d" 2>/dev/null | grep -v '\.bak' | tr '\n' ' ')
+
+        echo -e "--------------------------------------------------"
+        echo -e "  订阅名    : ${BLUE}$name${PLAIN}"
+        echo -e "  本地文件  : ${d}config.json  ($(stat -c%s "${d}config.json") B, 更新于 $(date -r "${d}config.json" '+%F %T'))"
+        echo -e "  同目录    : ${files}"
+        echo -e "  订阅 URL  : ${YELLOW}$url${PLAIN}"
+        echo -e "  一键导入  : ${GREEN}$scheme${PLAIN}"
+
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null)
+        if [ "$code" = "200" ]; then
+            echo -e "  线上自检  : ${GREEN}✅ HTTP 200${PLAIN}"
+        else
+            echo -e "  线上自检  : ${RED}❌ HTTP ${code:-无响应}${PLAIN}（本地文件在，检查反代/静态服务）"
+        fi
+        if "$BIN_FILE" check -c "${d}config.json" >/dev/null 2>&1; then
+            echo -e "  配置校验  : ${GREEN}✅ sing-box check 通过${PLAIN}"
+        else
+            echo -e "  配置校验  : ${RED}❌ sing-box check 失败${PLAIN}"
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${YELLOW}$SUB_DIR 下没找到订阅（需存在 <名>/config.json）。${PLAIN}"
+        return
+    fi
+    echo -e "--------------------------------------------------"
+    echo -e "${BLUE}怎么用：${PLAIN}"
+    echo -e "  iOS「sing-box MT」→ Profile → 右上角 + → 从 URL 导入，粘贴上面的订阅 URL"
+    echo -e "  「一键导入」链接要放进 Safari 地址栏或备忘录里点（微信会拦自定义 scheme）"
+    echo -e "  Remote profile 客户端自带自动更新（默认 60 分钟），也可手动下拉刷新"
 }
 
 # ==================== 配置诊断与回滚 ====================
@@ -1159,11 +1221,12 @@ show_menu() {
     menu_section "配置与工具"
     menu_option 5 "配置诊断（查看、编辑、回滚）"
     menu_option 6 "实用工具（解锁检测、DNS、防火墙）"
+    menu_option 7 "客户端订阅（sing-box 一键导入链接）"
     printf '\n  %b0.%b 退出脚本\n\n' "$YELLOW" "$PLAIN"
-    read_menu_choice "请选择 [0-6]"; choice="$REPLY"
+    read_menu_choice "请选择 [0-7]"; choice="$REPLY"
     case "$choice" in
         1) menu_system ;; 2) menu_nodes ;; 3) menu_forward ;; 4) menu_warp ;;
-        5) diagnose_config ;; 6) menu_tools ;;
+        5) diagnose_config ;; 6) menu_tools ;; 7) sub_links; pause ;;
         0) exit 0 ;; *) echo -e "${RED}无效选项！${PLAIN}"; sleep 1 ;;
     esac
 }

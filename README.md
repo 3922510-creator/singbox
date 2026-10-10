@@ -1,6 +1,6 @@
 # Sing-box 管理面板
 
-面向 Debian / Ubuntu / RHEL 系服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
+面向 Debian / Ubuntu / RHEL 系服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换与客户端订阅一键导入，提供配置校验、自动备份和失败回滚。
 
 ## 一键安装
 
@@ -50,6 +50,15 @@ sudo bash singbox.sh
 - 自动判定内核是否 BBRv3（内核 release 名 + `tcp_bbr` 模块 version 字段），不靠猜
 - 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核，可自选版本，不自动重启
 - 查看已安装内核与完整状态判定依据
+
+### 客户端订阅（一键导入）
+
+菜单入口：主菜单 → 客户端订阅
+
+- 扫描订阅目录（默认 `/root/.nanobot/workspace/subs`，每个子目录一个订阅，目录名即链接里的随机路径），列出订阅文件、订阅 URL 与 `sing-box://import-remote-profile?url=...#名称` 一键导入链接
+- 显示名称可选：在订阅目录里放一个 `name.txt`，第一行即客户端里看到的 profile 名
+- 自检：线上可达性（HTTP 状态码，走一次真实请求）+ `sing-box check` 配置校验
+- 目录与对外前缀可用环境变量覆盖：`SUB_DIR=... SUB_BASE_URL=... sb`
 
 ### 系统与网络工具
 
