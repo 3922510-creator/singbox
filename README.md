@@ -46,6 +46,7 @@ sudo bash singbox.sh
 
 - 一键切换 `BBR + fq` / `BBRv3 + fq`，或恢复系统默认 `CUBIC + fq_codel`
 - 即时生效：写入 `/etc/sysctl.d/99-zz-bbr-mode.conf` 持久化，同时替换网卡根队列（默认队列只对新网卡生效）
+- 先 `tc` 实测内核支不支持目标队列，不支持就直接拒绝且**一点配置都不改**（避免把内核没编译的 qdisc 写进 sysctl.d），回读校验失败还会把配置文件恢复原样
 - 自动判定内核是否 BBRv3（内核 release 名 + `tcp_bbr` 模块 version 字段），不靠猜
 - 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核，可自选版本，不自动重启
 - 查看已安装内核与完整状态判定依据

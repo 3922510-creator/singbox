@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.0  |  快捷指令: SB / sb
+#  版本: v3.4.1  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.0"
+SCRIPT_VERSION="v3.4.1"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -912,15 +912,31 @@ bbr_show_status() {
 }
 
 # 写入持久化 + 立即生效 + 回读校验；$1=算法 $2=队列 $3=显示名
+# 先拿 tc 实测内核支不支持该队列：不支持就直接拒绝、一点都不改（否则把内核没编译的 qdisc
+# 写进 sysctl.d，开机会静默失败），回读不一致时还要把配置文件恢复原样。
 bbr_apply() {
-    local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd
+    local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd cur_qd_live bak=""
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
     if ! printf '%s\n' $avail | grep -qx "$cc"; then
         echo -e "${RED}❌ 当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
         return 1
     fi
 
+    iface=$(bbr_default_iface)
+    if [ -n "$iface" ]; then
+        cur_qd_live=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+        if [ "$cur_qd_live" != "$qdisc" ]; then
+            # 默认队列只影响新建的网卡队列，已在跑的网卡必须手动替换；顺便用它验证内核是否支持
+            if ! tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1; then
+                echo -e "${RED}❌ 当前内核没有 ${qdisc} 这个队列算法（tc 替换失败），配置未做任何改动。${PLAIN}"
+                echo -e "${YELLOW}   ${iface} 现用 ${cur_qd_live}；要 ${qdisc} 只能换一个带该算法（CONFIG_NET_SCH_FQ）的内核。${PLAIN}"
+                return 1
+            fi
+        fi
+    fi
+
     mkdir -p /etc/sysctl.d
+    [ -f "$BBR_CONF" ] && { bak=$(mktemp); cp -p "$BBR_CONF" "$bak"; }
     {
         echo "# ${label} —— 由 sb 管理面板写入 $(date '+%Y-%m-%d %H:%M')"
         echo "net.core.default_qdisc = ${qdisc}"
@@ -930,12 +946,6 @@ bbr_apply() {
 
     modprobe tcp_bbr >/dev/null 2>&1 || true
     sysctl -q -w "net.core.default_qdisc=${qdisc}" "net.ipv4.tcp_congestion_control=${cc}" >/dev/null 2>&1
-    iface=$(bbr_default_iface)
-    if [ -n "$iface" ]; then
-        # 默认队列只影响新建的网卡队列，已在跑的网卡要手动替换才立即生效
-        tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1 \
-            || echo -e "${YELLOW}  ⚠️ ${iface} 根队列替换失败（不影响持久化，重启后生效）${PLAIN}"
-    fi
 
     cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -945,7 +955,10 @@ bbr_apply() {
         echo -e "   持久化=${BBR_CONF}（重启后自动生效）"
         echo -e "${YELLOW}   注意：已建立的 TCP 连接沿用旧算法，新连接才生效。${PLAIN}"
     else
+        if [ -n "$bak" ]; then cp -p "$bak" "$BBR_CONF"; else rm -f "$BBR_CONF"; fi
+        rm -f "$bak"
         echo -e "${RED}❌ 回读校验不一致：算法=${cur_cc} 队列=${cur_qd}（期望 ${cc} / ${qdisc}）${PLAIN}"
+        echo -e "${YELLOW}   已把 ${BBR_CONF} 恢复原样。${PLAIN}"
         return 1
     fi
 }
