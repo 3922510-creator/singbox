@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.2  |  快捷指令: SB / sb
+#  版本: v3.4.3  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.2"
+SCRIPT_VERSION="v3.4.3"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -855,10 +855,12 @@ menu_firewall() {
 
 # ==================== 网络加速（BBR / BBRv3 拥塞控制） ====================
 # 关键点："bbr" 只是内核里的一个算法名，跑的是 v1 还是 v3 由内核决定
-#（自编译 bbr3 内核 / XanMod / 打了 BBRv3 补丁的发行版内核）。
+#（自编译 bbr3 内核 / 打了 BBRv3 补丁的发行版内核）。
 # 判定依据只有两条硬证据：内核 release 名 + tcp_bbr 模块的 version 字段（bbr3 内核 = 3）。
+# 队列统一用 fq_codel：XDflight/bbr3-debs 的内核是 defconfig 构建（CONFIG_NET_SCH_FQ 未开），
+# 所以「BBR + fq」只在内核实测支持时才切；要 fq 得换带 SCH_FQ 的内核源（XanMod 等）。
 BBR_CONF="/etc/sysctl.d/99-zz-bbr-mode.conf"   # 字母序排在 99-vpsbox-bbr.conf 之后，最后生效
-BBR3_REPO="XDflight/bbr3-debs"                 # 第三方 BBRv3 内核 deb 源（与本机 6.1.187-bbr3 同源）
+BBR3_REPO="XDflight/bbr3-debs"                 # BBRv3 内核 deb 源（与本机 6.1.187-bbr3 同源）
 
 bbr_kernel_label() {
     local k mt maj min
@@ -887,6 +889,19 @@ bbr_kernel_desc() {
     esac
 }
 
+# 内核有没有 fq 队列算法：先看模块树 / 内核 config，都判不出再在 lo 上试挂一次
+bbr_fq_available() {
+    local cfg
+    modinfo -k "$(uname -r)" sch_fq >/dev/null 2>&1 && return 0
+    cfg="/boot/config-$(uname -r)"
+    if [ -r "$cfg" ]; then
+        grep -qE '^CONFIG_NET_SCH_FQ=[ym]' "$cfg" && return 0
+        return 1
+    fi
+    tc qdisc add dev lo root fq >/dev/null 2>&1 && { tc qdisc del dev lo root >/dev/null 2>&1; return 0; }
+    return 1
+}
+
 bbr_default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
 
 bbr_os_family() {
@@ -906,6 +921,7 @@ bbr_status_short() {
     echo -e "  内核      : ${YELLOW}$(uname -r)${PLAIN}    BBR 版本: $(bbr_kernel_desc)"
     echo -e "  拥塞算法  : ${YELLOW}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${PLAIN}    默认队列: ${YELLOW}$(sysctl -n net.core.default_qdisc 2>/dev/null)${PLAIN}"
     echo -e "  可用算法  : $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)"
+    if bbr_fq_available; then echo -e "  fq 队列   : ${GREEN}可用${PLAIN}"; else echo -e "  fq 队列   : ${YELLOW}不可用（本机内核只有 fq_codel）${PLAIN}"; fi
     [ -n "$iface" ] && echo -e "  ${iface} 实际队列: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
 }
 
@@ -971,30 +987,54 @@ bbr_apply() {
 }
 
 bbr_set_bbr() {
-    bbr_apply bbr fq "BBR + fq" || return 1
+    bbr_apply bbr fq_codel "BBR + fq_codel" || return 1
     case "$(bbr_kernel_label)" in
-        v3)  echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq。${PLAIN}" ;;
+        v3)  echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq_codel。${PLAIN}" ;;
         v3u) echo -e "${YELLOW}   本机内核 ≥6.12，自带新版 BBR 代码，大概率就是 BBRv3。${PLAIN}" ;;
         *)   echo -e "${YELLOW}   提示：本机内核不是 BBRv3，想要 v3 请用菜单里的「安装 BBRv3 内核」。${PLAIN}" ;;
     esac
 }
 
-bbr_set_bbrv3() {
-    case "$(bbr_kernel_label)" in
-        v3)  bbr_apply bbr fq "BBRv3 + fq"; return ;;
-        v3u) echo -e "${YELLOW}内核 $(uname -r) 未打 BBRv3 版本戳，按 ≥6.12 自带新版 BBR 处理。${PLAIN}"
-             bbr_apply bbr fq "BBRv3 + fq"; return ;;
-    esac
-    echo -e "${YELLOW}当前内核 $(uname -r) 不含 BBRv3（依据：release 名 + tcp_bbr 模块 version）。${PLAIN}"
-    echo -e "拥塞算法只是选 ‘bbr’ 这个实现，v1 还是 v3 由内核决定 —— 得先换 BBRv3 内核。"
-    read -rp "是否现在安装 BBRv3 内核（${BBR3_REPO}）？[y/N]: " yes
-    case "$yes" in y|Y) bbr_install_kernel ;; *) echo -e "${YELLOW}已取消。${PLAIN}" ;; esac
+# 切「BBR + fq」：先确认内核真有 fq，没有就别切（否则只会报错/无效）
+bbr_set_bbr_fq() {
+    if ! bbr_fq_available; then
+        echo -e "${YELLOW}本机内核 $(uname -r) 没有 fq 队列算法，切 fq 没意义。${PLAIN}"
+        echo -e "   ${BBR3_REPO} 的内核是 defconfig 构建（CONFIG_NET_SCH_FQ 未开）；要 fq 得换带 fq 的内核源（XanMod / Fridream）。"
+        read -rp "  改切「BBR + fq_codel」？[Y/n]: " y
+        case "$y" in n|N) echo -e "${YELLOW}已取消。${PLAIN}"; return ;; esac
+        bbr_set_bbr; return
+    fi
+    bbr_apply bbr fq "BBR + fq" || return 1
+    [ "$(bbr_kernel_label)" = "v3" ] && echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq。${PLAIN}"
+    return 0
+}
+
+# 装完内核先离线核验新内核能力（fq / BBRv3），别等重启完才发现缺东西
+bbr_post_install_check() {
+    local cfg krel fq ver
+    cfg=$(ls -1 /boot/config-* 2>/dev/null | sort -V | tail -1)
+    [ -n "$cfg" ] || { echo -e "${YELLOW}  （没找到 /boot/config-*，跳过能力自检）${PLAIN}"; return 0; }
+    krel=${cfg#/boot/config-}
+    fq=$(grep -E '^CONFIG_NET_SCH_FQ=' "$cfg" | head -1 | cut -d= -f2)
+    ver=$(modinfo -k "$krel" -F version tcp_bbr 2>/dev/null)
+    echo -e "${BLUE}--- 最新内核能力自检（${krel}）---${PLAIN}"
+    if [ "$fq" = "y" ] || [ "$fq" = "m" ]; then
+        echo -e "  fq 队列 : ${GREEN}支持${PLAIN}（CONFIG_NET_SCH_FQ=${fq}）"
+    else
+        echo -e "  fq 队列 : ${YELLOW}不支持${PLAIN}（CONFIG_NET_SCH_FQ 未开）→ 用 fq_codel"
+    fi
+    if [ "$ver" = "3" ]; then
+        echo -e "  BBR     : ${GREEN}BBRv3${PLAIN}（tcp_bbr 模块 version=3）"
+    else
+        echo -e "  BBR     : ${YELLOW}非 BBRv3${PLAIN}（tcp_bbr version=${ver:-无}）"
+    fi
 }
 
 bbr_list_kernels() {
     if command -v dpkg-query >/dev/null 2>&1; then
         echo -e "${BLUE}=== 已安装内核（dpkg）===${PLAIN}"
-        dpkg-query -W -f='${Package}  ${Version}\n' 'linux-image*' 2>/dev/null | grep -vE '\-common$' | sed 's/^/  /'
+        dpkg-query -W -f='${db:Status-Abbrev}|${Package}|${Version}\n' 'linux-image*' 2>/dev/null \
+            | awk -F'|' '$1 ~ /^ii/ && $2 !~ /-common$/ {printf "  %s  %s\n", $2, $3}'
     elif command -v rpm >/dev/null 2>&1; then
         echo -e "${BLUE}=== 已安装内核（rpm）===${PLAIN}"
         rpm -qa 2>/dev/null | grep -E '^kernel' | sort -V | sed 's/^/  /'
@@ -1005,10 +1045,11 @@ bbr_list_kernels() {
 }
 
 # 从 BBR3_REPO 安装 BBRv3 内核（deb 系；不自动重启）
+# 注：这些包是 defconfig 构建，没有 CONFIG_NET_SCH_FQ → 装完用 fq_codel。
 bbr_install_kernel() {
     local arch fam resp tags sel tag ver url_img url_hdr tmp i
     arch=$(uname -m)
-    [ "$arch" = "x86_64" ] || { echo -e "${RED}❌ ${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核或 XanMod。${PLAIN}"; return 1; }
+    [ "$arch" = "x86_64" ] || { echo -e "${RED}❌ ${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核。${PLAIN}"; return 1; }
     fam=$(bbr_os_family)
     [ "$fam" = "debian" ] || { echo -e "${RED}❌ 本功能只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"; return 1; }
 
@@ -1047,13 +1088,15 @@ bbr_install_kernel() {
 
     echo -e "\n${YELLOW}即将 dpkg 安装 ${tag} 并更新 GRUB 默认项。${PLAIN}"
     echo -e "${RED}注意：需要重启才生效；新内核起不来时用 VPS 控制台（VNC）选旧内核回退。${PLAIN}"
+    echo -e "${YELLOW}  注：${BBR3_REPO} 的内核是 defconfig 构建 → 没有 fq（只有 fq_codel）。${PLAIN}"
     read -rp "确认安装？输入 yes 继续: " conf
     [ "$conf" = "yes" ] || { echo -e "${YELLOW}已取消（deb 文件留在 ${tmp}）。${PLAIN}"; return; }
 
     if dpkg -i "$tmp"/*.deb; then
         command -v update-grub >/dev/null 2>&1 && update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null
         echo -e "${GREEN}✅ 安装完成，重启后生效： ${YELLOW}reboot${PLAIN}"
-        echo -e "   重启回来后在「网络加速」里选一次「BBRv3 + fq」确认即可。"
+        bbr_post_install_check
+        echo -e "   重启回来后在「网络加速」里选一次「BBR + fq_codel」确认即可。"
     else
         echo -e "${RED}❌ dpkg 安装失败，尝试补齐依赖...${PLAIN}"
         apt-get -f install -y && update-grub 2>/dev/null
@@ -1066,8 +1109,8 @@ menu_bbr() {
         menu_header "网络加速" "BBR / BBRv3 拥塞控制 + 内核"
         bbr_status_short
         menu_section "切换（立即生效 + 写入持久化）"
-        menu_option 1 "BBR + fq（内核自带；是 bbr3 内核即 BBRv3）"
-        menu_option 2 "BBRv3 + fq（校验内核，必要时装内核）"
+        menu_option 1 "BBR + fq_codel（推荐；内核是 bbr3 就是 BBRv3）"
+        menu_option 2 "BBR + fq（先实测内核支不支持 fq，不支持就拒绝）"
         menu_option 3 "CUBIC + fq_codel（恢复系统默认）"
         menu_section "内核"
         menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}）"
@@ -1077,7 +1120,7 @@ menu_bbr() {
         menu_back
         read_menu_choice "请选择 [0-6]"; c="$REPLY"
         case "$c" in
-            1) bbr_set_bbr ;; 2) bbr_set_bbrv3 ;; 3) bbr_apply cubic fq_codel "CUBIC + fq_codel" ;;
+            1) bbr_set_bbr ;; 2) bbr_set_bbr_fq ;; 3) bbr_apply cubic fq_codel "CUBIC + fq_codel" ;;
             4) bbr_install_kernel ;; 5) bbr_list_kernels ;; 6) bbr_show_status ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
