@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.1  |  快捷指令: SB / sb
+#  版本: v3.4.2  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
@@ -15,7 +15,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.1"
+SCRIPT_VERSION="v3.4.2"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -861,7 +861,7 @@ BBR_CONF="/etc/sysctl.d/99-zz-bbr-mode.conf"   # 字母序排在 99-vpsbox-bbr.c
 BBR3_REPO="XDflight/bbr3-debs"                 # 第三方 BBRv3 内核 deb 源（与本机 6.1.187-bbr3 同源）
 
 bbr_kernel_label() {
-    local k mt
+    local k mt maj min
     k=$(uname -r)
     case "$k" in
         *bbr3*|*bbrv3*|*xanmod*) echo "v3"; return ;;
@@ -869,12 +869,19 @@ bbr_kernel_label() {
     esac
     mt=$(command -v modinfo >/dev/null 2>&1 && modinfo -F version tcp_bbr 2>/dev/null)
     [ "$mt" = "3" ] && { echo "v3"; return; }
+    # 主线内核自带新版 BBR 代码但不打版本戳（6.12 的 tcp_bbr.c 里就有 bbr_beta / bbr_ecn_alpha_gain
+    # 这类 v3 才有的符号），所以 ≥6.12 的主线内核只能报“疑似”，不算硬判定。
+    maj=${k%%.*}; min=$(printf '%s' "$k" | cut -d. -f2)
+    if [ -n "$maj" ] && [ -n "$min" ] && { [ "$maj" -gt 6 ] || { [ "$maj" -eq 6 ] && [ "$min" -ge 12 ]; }; } 2>/dev/null; then
+        echo "v3u"; return
+    fi
     echo "v1"
 }
 
 bbr_kernel_desc() {
     case "$(bbr_kernel_label)" in
         v3)   echo -e "${YELLOW}BBRv3${PLAIN}" ;;
+        v3u)  echo -e "${YELLOW}疑似 BBRv3${PLAIN}${GREEN}（≥6.12 主线自带新版 BBR，未打版本戳）${PLAIN}" ;;
         plus) echo -e "${YELLOW}BBRplus${PLAIN}" ;;
         *)    echo -e "${GREEN}非 BBRv3（内核原生 bbr v1/v2）${PLAIN}" ;;
     esac
@@ -965,18 +972,19 @@ bbr_apply() {
 
 bbr_set_bbr() {
     bbr_apply bbr fq "BBR + fq" || return 1
-    if [ "$(bbr_kernel_label)" = "v3" ]; then
-        echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq。${PLAIN}"
-    else
-        echo -e "${YELLOW}   提示：本机内核不是 BBRv3，想要 v3 请用菜单里的「安装 BBRv3 内核」。${PLAIN}"
-    fi
+    case "$(bbr_kernel_label)" in
+        v3)  echo -e "${YELLOW}   本机是 BBRv3 内核 → 实际生效的就是 BBRv3 + fq。${PLAIN}" ;;
+        v3u) echo -e "${YELLOW}   本机内核 ≥6.12，自带新版 BBR 代码，大概率就是 BBRv3。${PLAIN}" ;;
+        *)   echo -e "${YELLOW}   提示：本机内核不是 BBRv3，想要 v3 请用菜单里的「安装 BBRv3 内核」。${PLAIN}" ;;
+    esac
 }
 
 bbr_set_bbrv3() {
-    if [ "$(bbr_kernel_label)" = "v3" ]; then
-        bbr_apply bbr fq "BBRv3 + fq"
-        return
-    fi
+    case "$(bbr_kernel_label)" in
+        v3)  bbr_apply bbr fq "BBRv3 + fq"; return ;;
+        v3u) echo -e "${YELLOW}内核 $(uname -r) 未打 BBRv3 版本戳，按 ≥6.12 自带新版 BBR 处理。${PLAIN}"
+             bbr_apply bbr fq "BBRv3 + fq"; return ;;
+    esac
     echo -e "${YELLOW}当前内核 $(uname -r) 不含 BBRv3（依据：release 名 + tcp_bbr 模块 version）。${PLAIN}"
     echo -e "拥塞算法只是选 ‘bbr’ 这个实现，v1 还是 v3 由内核决定 —— 得先换 BBRv3 内核。"
     read -rp "是否现在安装 BBRv3 内核（${BBR3_REPO}）？[y/N]: " yes
