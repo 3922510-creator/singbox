@@ -1,6 +1,6 @@
 # Sing-box 管理面板
 
-面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
+面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality / AnyTLS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
 
 ## 一键安装
 
@@ -36,8 +36,13 @@ sudo bash singbox.sh
 ### 节点与转发
 
 - VLESS-Reality 节点添加、删除与管理
-- 自动生成分享链接和二维码
+- AnyTLS-Reality 节点添加、删除与管理（需 sing-box ≥ 1.12.0，低于该版本菜单会直接拒绝并提示升级）
+- 自动生成分享链接和二维码（VLESS 与 AnyTLS 节点一起按序号列出，选序号即可看对应二维码）
 - TCP / UDP 端口转发规则增删查
+
+> **AnyTLS + Reality 的客户端限制**：该组合目前只有 sing-box 内核的客户端支持（官方 sing-box、Karing、Hiddify、v2rayN 等）。
+> Shadowrocket 的 AnyTLS 是纯 TLS 模式（不带 REALITY），mihomo 明确不支持 AnyTLS+Reality（服务端与客户端都不支持），Xray 不支持 AnyTLS。
+> 想要全平台可用的节点用 VLESS-Reality，要抗 TLS-in-TLS 长度特征且只用 sing-box 内核客户端时用 AnyTLS-Reality。
 
 ### Cloudflare WARP 分流
 

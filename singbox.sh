@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.8  |  快捷指令: SB / sb
+#  版本: v3.5.0  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
-#    • VLESS-Reality 节点管理（二维码 / 分享链接）
+#    • VLESS-Reality / AnyTLS-Reality 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / DNS / 防火墙）
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.8"
+SCRIPT_VERSION="v3.5.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -29,7 +29,7 @@ SERVICE_FILE="/etc/systemd/system/sing-box.service"   # systemd 单元（systemd
 OPENRC_FILE="/etc/init.d/sing-box"                     # OpenRC 服务脚本（Alpine 等）
 SINGBOX_LOG="/var/log/sing-box.log"                    # 无 journald 时 sing-box 的输出落这里
 META_DIR="/etc/sing-box/.meta"
-REALITY_META="$META_DIR/reality.txt"
+REALITY_META="$META_DIR/reality.txt"                          # Reality 系（VLESS / AnyTLS）公钥记录: tag|public_key
 WARP_META="$META_DIR/warp.json"
 LOCK_FILE="/var/run/sing-box-manager.lock"
 
@@ -444,6 +444,22 @@ read_valid_port() {
     done
 }
 
+# 核心版本是否 >= $1（如 1.12.0）：用 awk 逐段比较，不依赖 GNU sort -V（Alpine 的 busybox sort 没有 -V）
+singbox_version_ge() {
+    local want="$1" cur
+    cur=$("$BIN_FILE" version 2>/dev/null | head -n1 | awk '{print $3}')
+    [ -n "$cur" ] || return 1
+    awk -v a="$cur" -v b="$want" 'BEGIN{
+        sub(/^v/, "", a); sub(/^v/, "", b)
+        split(a, x, "."); split(b, y, ".")
+        for (i = 1; i <= 3; i++) {
+            if ((x[i] + 0) > (y[i] + 0)) exit 0
+            if ((x[i] + 0) < (y[i] + 0)) exit 1
+        }
+        exit 0
+    }'
+}
+
 save_reality_meta()   { mkdir -p "$META_DIR"; echo "$1|$2" >> "$REALITY_META"; }
 get_reality_pubkey()  { [ -f "$REALITY_META" ] && grep -F "$1|" "$REALITY_META" | tail -1 | cut -d'|' -f2; }
 remove_reality_meta() {
@@ -711,6 +727,78 @@ add_reality_node() {
     fi
 }
 
+add_anytls_node() {
+    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
+    ensure_config
+    if ! singbox_version_ge 1.12.0; then
+        echo -e "${RED}❌ 当前核心不支持 AnyTLS（需要 sing-box ≥ 1.12.0）。${PLAIN}"
+        echo -e "${YELLOW}请先到「系统管理 → 安装 / 更新 Sing-box 核心」升级再来。${PLAIN}"
+        return
+    fi
+
+    echo -e "${CYAN}=== 添加 AnyTLS-Reality 节点 ===${PLAIN}"
+    local port
+    port=$(read_valid_port "监听端口 [默认 8444]: " 8444 1)
+
+    read -rp "伪装域名 SNI [默认 yahoo.com]: " sni
+    sni=${sni:-yahoo.com}
+
+    echo -e "${BLUE}⏳ 生成密钥对与密码...${PLAIN}"
+    local key_output private_key public_key password short_id
+    key_output=$("$BIN_FILE" generate reality-keypair)
+    private_key=$(echo "$key_output" | grep "PrivateKey" | awk '{print $2}' | tr -d '"')
+    public_key=$(echo  "$key_output" | grep "PublicKey"  | awk '{print $2}' | tr -d '"')
+    # 32 位十六进制：不含需要 URL 转义的字符，可直接拼进 anytls:// 分享链接
+    password=$("$BIN_FILE" generate rand 16 --hex)
+    short_id=$("$BIN_FILE" generate rand 8 --hex)
+
+    local tag="anytls-reality-$port"
+    local temp_json
+    temp_json=$(jq --argjson port "$port" --arg pw "$password" --arg pk "$private_key" \
+                   --arg sni "$sni" --arg sid "$short_id" --arg tag "$tag" \
+                   '.inbounds += [{
+                       "type": "anytls", "tag": $tag, "listen": "::", "listen_port": $port,
+                       "users": [{"password": $pw}],
+                       "tls": {
+                           "enabled": true, "server_name": $sni,
+                           "reality": {
+                               "enabled": true, "private_key": $pk, "short_id": [$sid],
+                               "handshake": {"server": $sni, "server_port": 443}
+                           }
+                       }
+                   }]' "$CONFIG_FILE")
+
+    if save_and_check_config "$temp_json"; then
+        save_reality_meta "$tag" "$public_key"
+        open_firewall_port "$port"
+        svc_restart
+        local ip=$(get_public_ip)
+        local link="anytls://$password@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#AnyTLS-$port"
+        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
+        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "服务器 IP  : ${BLUE}$ip${PLAIN}"
+        echo -e "端口       : ${BLUE}$port${PLAIN}"
+        echo -e "密码       : ${BLUE}$password${PLAIN}"
+        echo -e "公钥 (PK)  : ${BLUE}$public_key${PLAIN}"
+        echo -e "ShortId    : ${BLUE}$short_id${PLAIN}"
+        echo -e "SNI        : ${BLUE}$sni${PLAIN}"
+        echo -e "分享链接   : ${YELLOW}$link${PLAIN}"
+        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "${YELLOW}💡 客户端要求：AnyTLS + Reality 目前只有 sing-box 内核客户端支持${PLAIN}"
+        echo -e "${YELLOW}   （官方 sing-box / Karing / Hiddify / v2rayN）；小火箭的 AnyTLS 是纯${PLAIN}"
+        echo -e "${YELLOW}   TLS 模式（不带 Reality），mihomo 不支持该组合。${PLAIN}"
+
+        if command -v qrencode &>/dev/null; then
+            read -rp "是否显示二维码？[y/N]: " show_qr
+            if [[ "$show_qr" =~ ^[Yy]$ ]]; then
+                echo -e "${BLUE}二维码:${PLAIN}"
+                qrencode -t ANSIUTF8 "$link"
+            fi
+        fi
+    fi
+}
+
 view_node_links() {
     ensure_config
     local ip=$(get_public_ip)
@@ -718,13 +806,15 @@ view_node_links() {
     echo -e "${BLUE}服务器 IP: $ip${PLAIN}"
     echo -e "--------------------------------------------------"
 
-    local total
-    total=$(count_by_type "vless")
-    if [ "$total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有配置任何 VLESS-Reality 节点。${PLAIN}"
+    local vless_total anytls_total
+    vless_total=$(count_by_type "vless")
+    anytls_total=$(count_by_type "anytls")
+    if [ "$vless_total" -eq 0 ] && [ "$anytls_total" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有配置任何 Reality 节点（VLESS / AnyTLS）。${PLAIN}"
         return
     fi
 
+    local total="$vless_total"
     local links=() tags=() i=0 idx=0 total_all
     total_all=$(inbound_count)
     while [ $i -lt "$total_all" ]; do
@@ -753,6 +843,36 @@ view_node_links() {
         i=$((i+1))
     done
 
+    if [ "$anytls_total" -gt 0 ]; then
+        i=0
+        while [ $i -lt "$total_all" ]; do
+            local atype
+            atype=$(inbound_field "$i" "type")
+            if [ "$atype" == "anytls" ]; then
+                idx=$((idx+1))
+                local pw sni sid tag port pbk link
+                pw=$(inbound_field   "$i" "users[0].password")
+                sni=$(inbound_field  "$i" "tls.server_name")
+                sid=$(inbound_field  "$i" "tls.reality.short_id[0]")
+                tag=$(inbound_field  "$i" "tag")
+                port=$(inbound_field "$i" "listen_port")
+                pbk=$(get_reality_pubkey "$tag")
+                link="anytls://$pw@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid#$tag"
+
+                links+=("$link")
+                tags+=("$tag")
+
+                echo -e "  [${GREEN}$idx${PLAIN}] ${GREEN}AnyTLS-Reality${PLAIN} | ${BLUE}$tag${PLAIN} | 端口: $port"
+                echo -e "      SNI : $sni  |  ShortId: $sid"
+                echo -e "      公钥: ${pbk:-未记录}"
+                echo -e "      密码: $pw"
+                echo -e "      链接: ${YELLOW}$link${PLAIN}"
+                echo -e "--------------------------------------------------"
+            fi
+            i=$((i+1))
+        done
+    fi
+
     if command -v qrencode &>/dev/null; then
         read -rp "输入要显示二维码的序号 (0 跳过): " qr_idx
         if [[ "$qr_idx" =~ ^[0-9]+$ ]] && [ "$qr_idx" -ge 1 ] && [ "$qr_idx" -le "${#links[@]}" ]; then
@@ -765,15 +885,35 @@ view_node_links() {
 
 delete_node() {
     ensure_config
-    local total
-    total=$(count_by_type "vless")
-    if [ "$total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有 VLESS-Reality 节点。${PLAIN}"; return
+    local vless_total anytls_total node_type
+    vless_total=$(count_by_type "vless")
+    anytls_total=$(count_by_type "anytls")
+    if [ "$vless_total" -eq 0 ] && [ "$anytls_total" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有可删除的节点。${PLAIN}"; return
     fi
 
-    echo -e "${CYAN}=== 删除 VLESS-Reality 节点 ===${PLAIN}"
+    # 两种节点都在时让用户先选类型；只有一种时直接用那一种
+    node_type="vless"
+    if [ "$vless_total" -gt 0 ] && [ "$anytls_total" -gt 0 ]; then
+        echo -e "${CYAN}=== 删除节点：请选择类型 ===${PLAIN}"
+        echo -e "  [${GREEN}1${PLAIN}] VLESS-Reality（$vless_total 个）"
+        echo -e "  [${GREEN}2${PLAIN}] AnyTLS-Reality（$anytls_total 个）"
+        local type_choice
+        read -rp "请选择 (0 取消): " type_choice
+        [[ "$type_choice" == "0" ]] && return
+        case "$type_choice" in
+            1) node_type="vless" ;;
+            2) node_type="anytls" ;;
+            *) echo -e "${RED}无效选项！${PLAIN}"; return ;;
+        esac
+        echo ""
+    elif [ "$vless_total" -eq 0 ]; then
+        node_type="anytls"
+    fi
+
+    echo -e "${CYAN}=== 删除 ${node_type} 节点 ===${PLAIN}"
     local real_idx
-    real_idx=$(prompt_delete_index "节点" "vless")
+    real_idx=$(prompt_delete_index "节点" "$node_type")
     [ -z "$real_idx" ] && return
 
     local del_tag
@@ -891,7 +1031,7 @@ diagnose_config() {
             echo -e " 文件大小: ${BLUE}${size}${PLAIN} bytes"
             if jq empty "$CONFIG_FILE" 2>/dev/null; then
                 echo -e " JSON状态: ${GREEN}✅ 语法正确${PLAIN}"
-                echo -e " 入站总数: ${BLUE}$(inbound_count)${PLAIN}  (VLESS: $(count_by_type vless), 转发: $(count_by_type direct))"
+                echo -e " 入站总数: ${BLUE}$(inbound_count)${PLAIN}  (VLESS: $(count_by_type vless), AnyTLS: $(count_by_type anytls), 转发: $(count_by_type direct))"
             else
                 echo -e " JSON状态: ${RED}❌ 语法错误${PLAIN}"
             fi
@@ -961,13 +1101,17 @@ menu_system() {
 
 menu_nodes() {
     while true; do
-        menu_header "节点管理" "VLESS-Reality 节点与分享信息"
+        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality 节点与分享信息"
         menu_option 1 "添加 VLESS-Reality 节点"
-        menu_option 2 "查看分享链接 / 二维码"
-        menu_option 3 "删除节点"
+        menu_option 2 "添加 AnyTLS-Reality 节点"
+        menu_option 3 "查看分享链接 / 二维码（全部节点）"
+        menu_option 4 "删除节点"
         menu_back
-        read_menu_choice "请选择 [0-3]"; c="$REPLY"
-        case "$c" in 1) add_reality_node ;; 2) view_node_links ;; 3) delete_node ;; 0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;; esac
+        read_menu_choice "请选择 [0-4]"; c="$REPLY"
+        case "$c" in
+            1) add_reality_node ;; 2) add_anytls_node ;; 3) view_node_links ;; 4) delete_node ;;
+            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+        esac
         pause
     done
 }
@@ -1485,7 +1629,7 @@ show_menu() {
     menu_header "Sing-box 管理面板" "Reality / 转发 / WARP 分流  ·  ${SCRIPT_VERSION}" "$(get_singbox_status)"
     menu_section "核心管理"
     menu_option 1 "系统管理（安装、服务、日志、卸载）"
-    menu_option 2 "节点管理（VLESS-Reality、链接、二维码）"
+    menu_option 2 "节点管理（VLESS / AnyTLS-Reality、链接、二维码）"
     menu_option 3 "端口转发（TCP / UDP）"
     menu_option 4 "WARP 出口与分流"
     menu_section "配置与工具"
