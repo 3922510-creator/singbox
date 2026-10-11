@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.5.1  |  快捷指令: SB / sb
+#  版本: v3.6.0  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.5.1"
+SCRIPT_VERSION="v3.6.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -626,7 +626,7 @@ ensure_service_def_fresh() {
     [ "$INIT_SYS" = "openrc" ] || return 0
     [ -f "$OPENRC_FILE" ] || return 0
     grep -q "sb-service-rev=$SERVICE_DEF_REV" "$OPENRC_FILE" 2>/dev/null && return 0
-    local bak="${OPENRC_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
+    local bak; bak="${OPENRC_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
     cp -a "$OPENRC_FILE" "$bak" 2>/dev/null
     install_service_file >/dev/null 2>&1
     echo -e "${YELLOW}ℹ 已更新 OpenRC 服务定义（旧版缺陷：进程崩溃后不自愈、启动可能假成功）${PLAIN}"
@@ -703,7 +703,7 @@ add_reality_node() {
         save_reality_meta "$tag" "$public_key"
         open_firewall_port "$port"
         svc_restart
-        local ip=$(get_public_ip)
+        local ip; ip=$(get_public_ip)
         local link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#Reality-$port"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
@@ -772,7 +772,7 @@ add_anytls_node() {
         save_reality_meta "$tag" "$public_key"
         open_firewall_port "$port"
         svc_restart
-        local ip=$(get_public_ip)
+        local ip; ip=$(get_public_ip)
         local link="anytls://$password@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#AnyTLS-$port"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
@@ -801,7 +801,7 @@ add_anytls_node() {
 
 view_node_links() {
     ensure_config
-    local ip=$(get_public_ip)
+    local ip; ip=$(get_public_ip)
     echo -e "${CYAN}=== 节点分享链接 ===${PLAIN}"
     echo -e "${BLUE}服务器 IP: $ip${PLAIN}"
     echo -e "--------------------------------------------------"
@@ -1580,9 +1580,174 @@ bbr_install_kernel() {
     fi
 }
 
+# ==================== TCP 缓冲区调优 ====================
+# 只调「上限」(rmem_max/wmem_max 与 tcp_rmem/tcp_wmem 的 max)，min/default 保持内核自动调优默认，
+# 也不动 fq_codel 队列。推荐值按 BDP(带宽×RTT) 估算并用物理内存兜底，避开 OU-SB 那种
+# 把 default 一起改小、反复 `>>` 追加、无基线无回滚的坑。
+TCP_BUF_CONF="/etc/sysctl.d/99-zz-tcp-buf.conf"
+TCP_BUF_BASELINE="/etc/sysctl.d/.tcp-buf-baseline"   # 隐藏文件（非 .conf，sysctl 不加载）：首次改前的内核原值
+
+tcp_mem_total_mb() { awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 1024; }
+tcp_bytes_to_mb()  { awk -v b="${1:-0}" 'BEGIN{printf "%.1f", b/1048576}'; }
+
+# 推荐上限(MB)：参考链路 BDP + 物理内存兜底
+tcp_buf_recommend_mb() {
+    local ram rec cap
+    ram=$(tcp_mem_total_mb)
+    # 参考 BDP：~200Mbps × 150ms ÷ 8 ≈ 3.75MB，取 2× 余量 ≈ 8MB；大内存放宽到 16MB
+    if [ "$ram" -ge 4096 ]; then rec=16; else rec=8; fi
+    # 物理内存兜底：单条上限不超过内存的 1/32（即便开很多连接也安全）
+    cap=$(( ram / 32 )); [ "$cap" -lt 4 ] && cap=4
+    [ "$rec" -gt "$cap" ] && rec=$cap
+    echo "$rec"
+}
+
+tcp_buf_status() {
+    local rm wm tr tw ovr
+    rm=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    wm=$(sysctl -n net.core.wmem_max 2>/dev/null)
+    tr=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)
+    tw=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)
+    if [ -f "$TCP_BUF_CONF" ]; then ovr="${GREEN}已写入 ${TCP_BUF_CONF}${PLAIN}"; else ovr="${YELLOW}无（用内核默认）${PLAIN}"; fi
+    echo -e "  rmem_max / wmem_max  : ${YELLOW}$(tcp_bytes_to_mb "$rm") MB / $(tcp_bytes_to_mb "$wm") MB${PLAIN}"
+    echo -e "  tcp_rmem(min/def/max): ${YELLOW}${tr}${PLAIN}"
+    echo -e "  tcp_wmem(min/def/max): ${YELLOW}${tw}${PLAIN}"
+    echo -e "  物理内存 : ${YELLOW}$(tcp_mem_total_mb) MB${PLAIN}    面板覆盖 : ${ovr}"
+}
+
+# 首次改前把当前 4 个值存成基线，供「恢复」用（已存在就不覆盖）
+tcp_buf_save_baseline() {
+    [ -f "$TCP_BUF_BASELINE" ] && return 0
+    {
+        echo "# sb 面板 TCP 缓冲区基线（首次调优前的内核原值）$(date '+%Y-%m-%d %H:%M')"
+        echo "rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null)"
+        echo "wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null)"
+        echo "tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)"
+        echo "tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)"
+    } > "$TCP_BUF_BASELINE"
+    chmod 600 "$TCP_BUF_BASELINE"
+}
+
+# $1 = 目标上限 MB；只抬 max，保留 min/default = 当前内核自动调优值
+tcp_buf_apply() {
+    local mb="$1" ram max cur_rm cur_wm def_r def_w bak=""
+    case "$mb" in ''|*[!0-9]*) echo -e "${RED}❌ 请输入纯数字 MB。${PLAIN}"; return 1 ;; esac
+    if [ "$mb" -lt 1 ] || [ "$mb" -gt 512 ]; then
+        echo -e "${RED}❌ 请输入 1-512 之间的 MB。${PLAIN}"; return 1
+    fi
+    ram=$(tcp_mem_total_mb); max=$(( mb * 1024 * 1024 ))
+    # 内存护栏：单条上限 > 内存 1/8 时要人确认（连接多可能吃光内存）
+    if [ "$max" -gt $(( ram * 1024 * 1024 / 8 )) ]; then
+        echo -e "${YELLOW}⚠ ${mb}MB 超过物理内存(${ram}MB)的 1/8，连接多时有 OOM 风险。${PLAIN}"
+        read -rp "  仍要继续？[y/N]: " y; case "$y" in y|Y) ;; *) echo -e "${YELLOW}已取消。${PLAIN}"; return 1 ;; esac
+    fi
+    def_r=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $1, $2}'); [ -n "$def_r" ] || def_r="4096 131072"
+    def_w=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $1, $2}'); [ -n "$def_w" ] || def_w="4096 16384"
+
+    tcp_buf_save_baseline
+    mkdir -p /etc/sysctl.d
+    [ -f "$TCP_BUF_CONF" ] && { bak=$(mktemp); cp -p "$TCP_BUF_CONF" "$bak"; }
+    {
+        echo "# TCP 缓冲区上限 ${mb}MB —— 由 sb 管理面板写入 $(date '+%Y-%m-%d %H:%M')"
+        echo "net.core.rmem_max = ${max}"
+        echo "net.core.wmem_max = ${max}"
+        echo "net.ipv4.tcp_rmem = ${def_r} ${max}"
+        echo "net.ipv4.tcp_wmem = ${def_w} ${max}"
+    } > "$TCP_BUF_CONF"
+    chmod 644 "$TCP_BUF_CONF"
+
+    sysctl -q -w "net.core.rmem_max=${max}" "net.core.wmem_max=${max}" \
+        "net.ipv4.tcp_rmem=${def_r} ${max}" "net.ipv4.tcp_wmem=${def_w} ${max}" >/dev/null 2>&1
+
+    cur_rm=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    cur_wm=$(sysctl -n net.core.wmem_max 2>/dev/null)
+    if [ "$cur_rm" = "$max" ] && [ "$cur_wm" = "$max" ]; then
+        rm -f "$bak"
+        echo -e "${GREEN}✅ TCP 缓冲区上限已设为 ${mb} MB（min/default 保持内核默认，队列不变）${PLAIN}"
+        echo -e "   持久化=${TCP_BUF_CONF}（重启后自动生效）"
+        echo -e "${YELLOW}   注意：只影响新建连接；代理转发瓶颈通常在 CPU/队列，缓冲区够用即可。${PLAIN}"
+    else
+        if [ -n "$bak" ]; then cp -p "$bak" "$TCP_BUF_CONF"; else rm -f "$TCP_BUF_CONF"; fi
+        rm -f "$bak"
+        echo -e "${RED}❌ 回读不一致：rmem_max=${cur_rm} wmem_max=${cur_wm}（期望 ${max}）→ 已回滚配置。${PLAIN}"
+        return 1
+    fi
+}
+
+# 带宽(Mbps) × RTT(ms) 估算 BDP → 推荐 MB
+tcp_buf_estimate() {
+    local bw rtt bdp mb
+    read -rp "  估算带宽 (Mbps, 回车默认 200): " bw; bw=${bw:-200}
+    read -rp "  往返延迟 RTT (ms, 回车默认 150): " rtt; rtt=${rtt:-150}
+    case "${bw}${rtt}" in *[!0-9]*) echo -e "${RED}❌ 带宽/RTT 需为纯数字。${PLAIN}"; return 1 ;; esac
+    { [ "$bw" -gt 0 ] && [ "$rtt" -gt 0 ]; } || { echo -e "${RED}❌ 带宽/RTT 需大于 0。${PLAIN}"; return 1; }
+    # BDP(字节) = 带宽(bit/s) × RTT(s) ÷ 8；取 2× 余量后向上取整到整数 MB
+    bdp=$(( bw * 1000000 / 8 * rtt / 1000 ))
+    mb=$(( (bdp * 2 + 1048575) / 1048576 )); [ "$mb" -lt 1 ] && mb=1
+    echo -e "  BDP ≈ $(tcp_bytes_to_mb "$bdp") MB → 含 2× 余量推荐 ${GREEN}${mb} MB${PLAIN}"
+    read -rp "  按此值应用？[Y/n]: " y; case "$y" in n|N) echo -e "${YELLOW}已取消。${PLAIN}"; return ;; esac
+    tcp_buf_apply "$mb"
+}
+
+tcp_buf_restore() {
+    local b_rm b_wm b_tr b_tw
+    if [ -f "$TCP_BUF_BASELINE" ]; then
+        b_rm=$(grep '^rmem_max=' "$TCP_BUF_BASELINE" | cut -d= -f2-)
+        b_wm=$(grep '^wmem_max=' "$TCP_BUF_BASELINE" | cut -d= -f2-)
+        b_tr=$(grep '^tcp_rmem=' "$TCP_BUF_BASELINE" | cut -d= -f2-)
+        b_tw=$(grep '^tcp_wmem=' "$TCP_BUF_BASELINE" | cut -d= -f2-)
+        rm -f "$TCP_BUF_CONF"
+        [ -n "$b_rm" ] && sysctl -q -w "net.core.rmem_max=${b_rm}" >/dev/null 2>&1
+        [ -n "$b_wm" ] && sysctl -q -w "net.core.wmem_max=${b_wm}" >/dev/null 2>&1
+        [ -n "$b_tr" ] && sysctl -q -w "net.ipv4.tcp_rmem=${b_tr}" >/dev/null 2>&1
+        [ -n "$b_tw" ] && sysctl -q -w "net.ipv4.tcp_wmem=${b_tw}" >/dev/null 2>&1
+        rm -f "$TCP_BUF_BASELINE"
+        echo -e "${GREEN}✅ 已恢复到首次调优前的内核原值，并删除面板覆盖。${PLAIN}"
+    elif [ -f "$TCP_BUF_CONF" ]; then
+        rm -f "$TCP_BUF_CONF"
+        echo -e "${YELLOW}已删除面板覆盖 ${TCP_BUF_CONF}（无基线记录）。${PLAIN}"
+        echo -e "${YELLOW}运行时值将在重启后由内核重新自动计算；或手动 sysctl 调整。${PLAIN}"
+    else
+        echo -e "${YELLOW}本面板未写入任何 TCP 缓冲区覆盖，无需恢复。${PLAIN}"
+    fi
+}
+
+menu_tcp_buf() {
+    local rec c mb
+    while true; do
+        menu_header "TCP 缓冲区调优" "只抬 socket 缓冲上限，不动 fq_codel 队列"
+        tcp_buf_status
+        rec=$(tcp_buf_recommend_mb)
+        echo -e "\n  ${BLUE}推荐依据${PLAIN}：BDP = 带宽(bit/s) × RTT(s) ÷ 8。本机参考 ~200Mbps/150ms"
+        echo -e "  → BDP≈3.75MB，含 2× 余量 ≈ 8MB 足够；跨区大带宽可到 16MB。"
+        menu_section "设置上限"
+        menu_option 1 "推荐值（${rec} MB，按内存兜底）"
+        menu_option 2 "8 MB（均衡，~200Mbps/150ms）"
+        menu_option 3 "16 MB（高带宽 / 高延迟）"
+        menu_option 4 "32 MB（大内存 + 长肥管道）"
+        menu_option 5 "自定义 MB"
+        menu_option 6 "按 带宽×RTT 估算"
+        menu_section "恢复"
+        menu_option 7 "恢复内核默认（删除本面板覆盖）"
+        menu_back
+        read_menu_choice "请选择 [0-7]"; c="$REPLY"
+        case "$c" in
+            1) tcp_buf_apply "$rec" ;;
+            2) tcp_buf_apply 8 ;;
+            3) tcp_buf_apply 16 ;;
+            4) tcp_buf_apply 32 ;;
+            5) read -rp "  输入缓冲区上限 (MB, 1-512): " mb; tcp_buf_apply "$mb" ;;
+            6) tcp_buf_estimate ;;
+            7) tcp_buf_restore ;;
+            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+        esac
+        pause
+    done
+}
+
 menu_bbr() {
     while true; do
-        menu_header "网络加速" "BBR / BBRv3 拥塞控制 + 内核"
+        menu_header "网络加速" "BBR / BBRv3 拥塞控制 + 内核 + TCP 缓冲区"
         bbr_status_short
         menu_section "切换（立即生效 + 写入持久化）"
         menu_option 1 "BBR + fq_codel（推荐；内核是 bbr3 就是 BBRv3）"
@@ -1591,13 +1756,15 @@ menu_bbr() {
         menu_section "内核"
         menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}，仅 deb 系）"
         menu_option 5 "查看已安装内核"
+        menu_section "TCP 调优"
+        menu_option 6 "TCP 缓冲区调优（按 BDP 推荐 / 预设 / 自定义）"
         menu_section "查看"
-        menu_option 6 "完整状态与判定依据"
+        menu_option 7 "完整状态与判定依据"
         menu_back
-        read_menu_choice "请选择 [0-6]"; c="$REPLY"
+        read_menu_choice "请选择 [0-7]"; c="$REPLY"
         case "$c" in
             1) bbr_set_bbr ;; 2) bbr_set_bbr_fq ;; 3) bbr_apply cubic fq_codel "CUBIC + fq_codel" ;;
-            4) bbr_install_kernel ;; 5) bbr_list_kernels ;; 6) bbr_show_status ;;
+            4) bbr_install_kernel ;; 5) bbr_list_kernels ;; 6) menu_tcp_buf ;; 7) bbr_show_status ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
