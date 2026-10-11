@@ -81,7 +81,9 @@ svc_state_raw() {
 svc_active() {
     case "$INIT_SYS" in
         systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
-        openrc)  svc_state_raw | grep -qE '^(started|starting)$' ;;
+        openrc)  # 不用管道（顶部有 set -o pipefail：grep -q 命中即退出会让上游收 SIGPIPE，
+                 # 整条管道被判失败，判断会随机为假）
+                 case "$(svc_state_raw)" in started|starting) return 0 ;; *) return 1 ;; esac ;;
         *)       pgrep -f "$BIN_FILE run" >/dev/null 2>&1 ;;
     esac
 }
@@ -148,11 +150,11 @@ svc_status() {
                  else
                      echo -e "${YELLOW}自愈   : 未启用（服务定义是旧版，下次运行面板会自动升级）${PLAIN}"
                  fi
-                 if rc-update show default 2>/dev/null | grep -q "sing-box"; then
-                     echo "自启动 : 已启用（default）"
-                 else
-                     echo "自启动 : 未启用（rc-update add sing-box default）"
-                 fi ;;
+                 # 注意：rc-update show 的列表走 stderr；且顶部 pipefail 下不能配合 grep -q
+                 case "$(rc-update show default 2>&1)" in
+                     *sing-box*) echo "自启动 : 已启用（default）" ;;
+                     *)          echo "自启动 : 未启用（rc-update add sing-box default）" ;;
+                 esac ;;
         *)       echo "（无 systemd / OpenRC，由 nohup 直接托管）"
                  if svc_active; then echo "状态   : 运行中（PID $(cat /var/run/sing-box.pid 2>/dev/null)）"; else echo "状态   : 已停止"; fi ;;
     esac
@@ -178,7 +180,7 @@ svc_active_name() {
     local name="$1"
     case "$INIT_SYS" in
         systemd) systemctl is-active --quiet "$name" 2>/dev/null ;;
-        openrc)  rc-service "$name" status 2>/dev/null | grep -q "started" ;;
+        openrc)  case "$(rc-service "$name" status 2>&1)" in *started*) return 0 ;; *) return 1 ;; esac ;;
         *)       return 1 ;;
     esac
 }
@@ -375,13 +377,13 @@ get_public_ip() {
 
 open_firewall_port() {
     local port="$1"
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+    if command -v ufw &>/dev/null && case "$(ufw status 2>/dev/null)" in *active*) true ;; *) false ;; esac; then
         ufw allow "$port"/tcp &>/dev/null; ufw allow "$port"/udp &>/dev/null
     elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
         firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null
         firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null
         firewall-cmd --reload &>/dev/null
-    elif command -v iptables &>/dev/null && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
+    elif command -v iptables &>/dev/null && case "$(iptables -S INPUT 2>/dev/null)" in *'-P INPUT DROP'*) true ;; *) false ;; esac; then
         # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
         iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
@@ -1262,7 +1264,7 @@ bbr_apply() {
     local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd cur_qd_live bak="" have_tc=0
     bbr_require_tc && have_tc=1
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
-    if ! printf '%s\n' $avail | grep -qx "$cc"; then
+    if ! printf '%s\n' $avail | grep -x -- "$cc" >/dev/null; then
         echo -e "${RED}❌ 当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
         return 1
     fi
