@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.6  |  快捷指令: SB / sb
+#  版本: v3.4.7  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
+#    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
 #    • VLESS-Reality 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
@@ -15,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.6"
+SCRIPT_VERSION="v3.4.7"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -24,11 +25,38 @@ BLUE="\033[36m"; CYAN="\033[35m"; PLAIN="\033[0m"
 # ---------- 路径 ----------
 CONFIG_FILE="/etc/sing-box/config.json"
 BIN_FILE="/usr/local/bin/sing-box"
-SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SERVICE_FILE="/etc/systemd/system/sing-box.service"   # systemd 单元（systemd 系统）
+OPENRC_FILE="/etc/init.d/sing-box"                     # OpenRC 服务脚本（Alpine 等）
+SINGBOX_LOG="/var/log/sing-box.log"                    # 无 journald 时 sing-box 的输出落这里
 META_DIR="/etc/sing-box/.meta"
 REALITY_META="$META_DIR/reality.txt"
 WARP_META="$META_DIR/warp.json"
 LOCK_FILE="/var/run/sing-box-manager.lock"
+
+# ---------- 平台检测（发行版家族 + init 系统）----------
+# 脚本主体不直接写 systemctl/apk：统一走下面的 OS_FAMILY 与 svc_* 抽象，
+# 这样同一份脚本在 systemd（Debian/Ubuntu/RHEL）和 OpenRC（Alpine）上都能跑。
+OS_FAMILY="unknown"
+OS_ID=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+OS_LIKE=$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}")
+case "$OS_ID $OS_LIKE" in
+    *alpine*)                                             OS_FAMILY="alpine" ;;
+    *debian*|*ubuntu*|*kali*|*armbian*|*raspbian*)        OS_FAMILY="debian" ;;
+    *rhel*|*centos*|*fedora*|*rocky*|*almalinux*|*amzn*)  OS_FAMILY="redhat" ;;
+esac
+if [ "$OS_FAMILY" = "unknown" ]; then
+    [ -f /etc/alpine-release ] && OS_FAMILY="alpine"
+    [ -f /etc/debian_version ] && OS_FAMILY="debian"
+    [ -f /etc/redhat-release ] && OS_FAMILY="redhat"
+fi
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    INIT_SYS="systemd"
+elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYS="openrc"
+else
+    INIT_SYS="none"     # 容器里没有 init：退化成 nohup 托管（重启后要手动拉起）
+fi
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
 
@@ -36,6 +64,89 @@ LOCK_FILE="/var/run/sing-box-manager.lock"
 # read 会立即读到 EOF 导致菜单空转或直接退出（表现为“执行完就断连”）。
 # 强制把 stdin 重定向到终端，保证交互菜单始终从 TTY 读取。
 if [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
+
+# ==================== 服务控制抽象（systemd / OpenRC / 无 init）====================
+# 全脚本统一用这几个函数管 sing-box 服务（日志同理），不再散落 systemctl/journalctl。
+svc_active() {
+    case "$INIT_SYS" in
+        systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
+        openrc)  rc-service sing-box status 2>/dev/null | grep -q "started" ;;
+        *)       pgrep -f "$BIN_FILE run" >/dev/null 2>&1 ;;
+    esac
+}
+
+svc_ctl() {
+    local act="$1"
+    case "$INIT_SYS" in
+        systemd) systemctl "$act" sing-box ;;
+        openrc)  rc-service sing-box "$act" ;;
+        *)
+            # 无 init 系统：直接 nohup 托管（Alpine 容器 / 精简 rootfs 场景）
+            case "$act" in
+                stop)    pkill -f "$BIN_FILE run" 2>/dev/null; return 0 ;;
+                start|restart)
+                    [ "$act" = "restart" ] && { pkill -f "$BIN_FILE run" 2>/dev/null; sleep 1; }
+                    nohup "$BIN_FILE" run -C /etc/sing-box >>"$SINGBOX_LOG" 2>&1 &
+                    echo $! > /var/run/sing-box.pid ;;
+            esac ;;
+    esac
+}
+svc_start()   { svc_ctl start; }
+svc_stop()    { svc_ctl stop; }
+svc_restart() { svc_ctl restart; }
+
+svc_enable() {
+    case "$INIT_SYS" in
+        systemd) systemctl enable sing-box &>/dev/null ;;
+        openrc)  rc-update add sing-box default &>/dev/null ;;
+    esac
+}
+svc_disable() {
+    case "$INIT_SYS" in
+        systemd) systemctl disable sing-box &>/dev/null ;;
+        openrc)  rc-update del sing-box default &>/dev/null ;;
+    esac
+}
+svc_daemon_reload() { [ "$INIT_SYS" = "systemd" ] && systemctl daemon-reload; }
+
+svc_status() {
+    case "$INIT_SYS" in
+        systemd) systemctl status sing-box --no-pager ;;
+        openrc)  rc-service sing-box status
+                 if rc-update show default 2>/dev/null | grep -q "sing-box"; then
+                     echo "自启动 : 已启用（default）"
+                 else
+                     echo "自启动 : 未启用（rc-update add sing-box default）"
+                 fi ;;
+        *)       echo "（无 systemd / OpenRC，由 nohup 直接托管）"
+                 if svc_active; then echo "状态   : 运行中（PID $(cat /var/run/sing-box.pid 2>/dev/null)）"; else echo "状态   : 已停止"; fi ;;
+    esac
+}
+
+svc_logs() {
+    local n="${1:-100}"
+    case "$INIT_SYS" in
+        systemd) journalctl -u sing-box -n "$n" --no-pager ;;
+        *)       if [ -f "$SINGBOX_LOG" ]; then tail -n "$n" "$SINGBOX_LOG"
+                 else echo -e "${YELLOW}暂无日志（${SINGBOX_LOG} 不存在）${PLAIN}"; fi ;;
+    esac
+}
+svc_logs_follow() {
+    case "$INIT_SYS" in
+        systemd) journalctl -u sing-box -f ;;
+        *)       tail -f "$SINGBOX_LOG" ;;
+    esac
+}
+
+# 任意服务是否在运行（firewalld / ufw 这类第三方服务用）
+svc_active_name() {
+    local name="$1"
+    case "$INIT_SYS" in
+        systemd) systemctl is-active --quiet "$name" 2>/dev/null ;;
+        openrc)  rc-service "$name" status 2>/dev/null | grep -q "started" ;;
+        *)       return 1 ;;
+    esac
+}
 
 # ---------- 通用交互 ----------
 pause() { echo ""; read -rp "按回车键继续..." _; }
@@ -70,17 +181,37 @@ acquire_lock
 # ==================== 依赖安装 ====================
 install_dependencies() {
     local missing=0
-    for cmd in curl jq wget qrencode flock; do
+    for cmd in curl jq wget qrencode flock bash; do
         command -v "$cmd" &>/dev/null || missing=1
     done
     [ $missing -eq 0 ] && return
 
-    echo -e "${BLUE}正在安装必要依赖 (curl jq wget qrencode flock)...${PLAIN}"
-    if [ -f /etc/debian_version ]; then
-        apt-get update -qq && apt-get install -y -qq curl jq wget ufw qrencode util-linux
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y -q curl jq wget firewalld qrencode util-linux
-    fi
+    echo -e "${BLUE}正在安装必要依赖 (curl jq wget qrencode flock bash)...${PLAIN}"
+    case "$OS_FAMILY" in
+        debian) apt-get update -qq && apt-get install -y -qq curl jq wget ufw qrencode util-linux bash ;;
+        redhat) yum install -y -q curl jq wget firewalld qrencode util-linux bash ;;
+        alpine)
+            apk update -q 2>/dev/null
+            apk add --no-cache curl jq wget util-linux bash ca-certificates kmod iproute2
+            apk_ensure_community
+            # Alpine 的 qrencode 由 libqrencode-tools 提供（community 仓库）；只用于显示二维码
+            apk add --no-cache libqrencode-tools 2>/dev/null \
+                || echo -e "${YELLOW}提示：qrencode（二维码）未能安装，其余功能不受影响${PLAIN}"
+            ;;
+        *)      echo -e "${RED}未知发行版（${OS_ID:-unknown}），请手动安装：curl jq wget qrencode flock bash${PLAIN}"
+                return 1 ;;
+    esac
+}
+
+# Alpine 默认可能只启用了 main 仓库；community 里才有 qrencode 等包，缺了就补一行
+apk_ensure_community() {
+    local repos=/etc/apk/repositories base
+    [ -f "$repos" ] || return 0
+    grep -qE '/community$' "$repos" && return 0
+    base=$(sed -n 's#^\([^#]*\)/main$#\1#p' "$repos" | head -1)
+    [ -n "$base" ] || return 0
+    printf '%s/community\n' "$base" >> "$repos"
+    echo -e "${BLUE}已为 Alpine 启用 community 仓库：${base}/community${PLAIN}"
 }
 
 # ==================== 安全读取与配置管理 ====================
@@ -152,7 +283,7 @@ rollback_config() {
         return 1
     fi
     install -m 600 "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-    systemctl restart sing-box
+    svc_restart
     echo -e "${GREEN}✅ 已回滚到上一次有效配置并重启服务。${PLAIN}"
 }
 
@@ -178,10 +309,15 @@ open_firewall_port() {
     local port="$1"
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
         ufw allow "$port"/tcp &>/dev/null; ufw allow "$port"/udp &>/dev/null
-    elif command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
+    elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
         firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null
         firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null
         firewall-cmd --reload &>/dev/null
+    elif command -v iptables &>/dev/null && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
+        # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        echo -e "${YELLOW}💡 已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
     fi
 }
 
@@ -189,7 +325,7 @@ get_singbox_status() {
     if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}🔴 未安装${PLAIN}"; return; fi
     local ver
     ver=$($BIN_FILE version 2>/dev/null | head -n1 | awk '{print $3}')
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
+    if svc_active; then
         echo -e "${GREEN}🟢 运行中 [v${ver}]${PLAIN}"
     else
         echo -e "${YELLOW}🟡 已停止 [v${ver}]${PLAIN}"
@@ -199,13 +335,13 @@ get_singbox_status() {
 restart_service() {
     if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}尚未安装 Sing-box！${PLAIN}"; return 1; fi
     echo -e "${BLUE}⏳ 正在重启 sing-box...${PLAIN}"
-    systemctl restart sing-box
+    svc_restart
     sleep 1
-    if systemctl is-active --quiet sing-box; then
+    if svc_active; then
         echo -e "${GREEN}✅ 重启成功！当前状态: $(get_singbox_status)${PLAIN}"
     else
         echo -e "${RED}❌ 重启失败！请查看日志排查：${PLAIN}"
-        journalctl -u sing-box -n 20 --no-pager
+        svc_logs 20
     fi
 }
 
@@ -290,8 +426,38 @@ install_singbox() {
     chmod +x "$BIN_FILE"
     rm -rf /tmp/sing-box*
 
-    if [ ! -f "$SERVICE_FILE" ]; then
-        cat > "$SERVICE_FILE" <<EOF
+    # 官方发布的 linux 二进制是 glibc 构建（interpreter /lib64/ld-linux-x86-64.so.2），
+    # Alpine 是 musl：不装兼容层直接跑会报 “not found”。这里实测一下，不行就补 gcompat。
+    if ! "$BIN_FILE" version >/dev/null 2>&1; then
+        if [ "$OS_FAMILY" = "alpine" ]; then
+            echo -e "${YELLOW}⚠ 官方二进制是 glibc 构建，Alpine（musl）需要 gcompat 兼容层，正在安装...${PLAIN}"
+            apk add --no-cache gcompat libc6-compat
+        fi
+    fi
+    if ! "$BIN_FILE" version >/dev/null 2>&1; then
+        echo -e "${RED}❌ 二进制无法在当前系统上运行：${BIN_FILE}${PLAIN}"
+        "$BIN_FILE" version 2>&1 | head -3
+        if [ "$OS_FAMILY" = "alpine" ]; then
+            echo -e "${YELLOW}   Alpine 两条路：① apk add gcompat libc6-compat；② 用发行版自带包 apk add sing-box（musl 原生，版本略旧）${PLAIN}"
+        fi
+        return 1
+    fi
+
+    if [ "$INIT_SYS" != "systemd" ] || [ ! -f "$SERVICE_FILE" ]; then
+        install_service_file
+    fi
+    ensure_config
+    svc_restart
+    echo -e "${GREEN}✅ 安装/更新成功！版本: ${tag}${PLAIN}"
+}
+
+# 按 init 系统写服务定义：systemd → unit 文件；OpenRC → /etc/init.d + rc-update；
+# 两者都没有（容器/精简 rootfs）则给提示，由 svc_ctl 用 nohup 托管。
+install_service_file() {
+    case "$INIT_SYS" in
+        systemd)
+            [ -f "$SERVICE_FILE" ] && return 0
+            cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Sing-box Service
 After=network.target nss-lookup.target
@@ -308,29 +474,59 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable sing-box &>/dev/null
-    fi
-    ensure_config
-    systemctl restart sing-box
-    echo -e "${GREEN}✅ 安装/更新成功！版本: ${tag}${PLAIN}"
+            svc_daemon_reload
+            svc_enable
+            ;;
+        openrc)
+            cat > "$OPENRC_FILE" <<EOF
+#!/sbin/openrc-run
+# Sing-box 服务（OpenRC / Alpine）
+# 由 sb 管理面板生成；手动改完请 rc-service sing-box restart
+
+description="Sing-box Service"
+
+command="$BIN_FILE"
+command_args="run -C /etc/sing-box"
+command_user="root:root"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="$SINGBOX_LOG"
+error_log="$SINGBOX_LOG"
+respawn_delay="10"
+
+need_root="yes"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+            chmod +x "$OPENRC_FILE"
+            svc_enable
+            echo -e "${GREEN}已生成 OpenRC 服务：${OPENRC_FILE}（开机自启已加入 default runlevel）${PLAIN}"
+            ;;
+        *)
+            echo -e "${YELLOW}⚠ 未检测到 systemd / OpenRC：sing-box 将由 nohup 直接托管（重启后需手动拉起）。${PLAIN}"
+            echo -e "   手动启动：nohup $BIN_FILE run -C /etc/sing-box >> $SINGBOX_LOG 2>&1 &"
+            ;;
+    esac
 }
 
 uninstall_singbox() {
     read -rp "⚠️ 确定完全卸载 Sing-box 及其配置吗？[y/N]: " c
     [[ ! "$c" =~ ^[Yy]$ ]] && return
-    systemctl stop sing-box &>/dev/null
-    systemctl disable sing-box &>/dev/null
-    rm -f "$SERVICE_FILE" "$BIN_FILE"
+    svc_stop &>/dev/null
+    svc_disable
+    rm -f "$SERVICE_FILE" "$OPENRC_FILE" "$BIN_FILE"
     rm -rf /etc/sing-box /tmp/sing-box* /tmp/sing-box-test.json
-    systemctl daemon-reload
+    svc_daemon_reload
     echo -e "${GREEN}✅ 已完全卸载。${PLAIN}"
 }
 
 show_service_status() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}尚未安装 Sing-box！${PLAIN}" && return
     echo -e "${CYAN}=== Sing-box 服务状态 ===${PLAIN}"
-    systemctl status sing-box --no-pager
+    svc_status
 }
 
 show_full_config() {
@@ -340,10 +536,10 @@ show_full_config() {
 
 view_logs() {
     echo -e "${CYAN}=== Sing-box 日志 (最近 100 行) ===${PLAIN}"
-    journalctl -u sing-box -n 100 --no-pager
+    svc_logs 100
     echo -e "--------------------------------------------------"
     read -rp "是否进入实时日志? (Ctrl+C 退出) [y/N]: " f
-    [[ "$f" =~ ^[Yy]$ ]] && journalctl -u sing-box -f
+    [[ "$f" =~ ^[Yy]$ ]] && svc_logs_follow
 }
 
 # ==================== 节点操作 ====================
@@ -385,7 +581,7 @@ add_reality_node() {
     if save_and_check_config "$temp_json"; then
         save_reality_meta "$tag" "$public_key"
         open_firewall_port "$port"
-        systemctl restart sing-box
+        svc_restart
         local ip=$(get_public_ip)
         local link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#Reality-$port"
         echo -e "${GREEN}====================================================${PLAIN}"
@@ -483,7 +679,7 @@ delete_node() {
 
     if save_and_check_config "$temp_json"; then
         remove_reality_meta "$del_tag"
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 节点 [${del_tag}] 已删除。${PLAIN}"
     fi
 }
@@ -515,7 +711,7 @@ add_port_forward() {
 
     if save_and_check_config "$temp_json"; then
         open_firewall_port "$local_port"
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 转发成功：本机 [${local_port}] → ${remote_ip}:${remote_port}${PLAIN}"
     fi
 }
@@ -574,7 +770,7 @@ delete_port_forward() {
                    "$CONFIG_FILE")
 
     if save_and_check_config "$temp_json"; then
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 转发 [${del_tag}] 已删除。${PLAIN}"
     fi
 }
@@ -611,7 +807,7 @@ diagnose_config() {
             2) echo -e "${CYAN}--- Reality 元数据 ---${PLAIN}"; [ -f "$REALITY_META" ] && cat "$REALITY_META" || echo -e "${YELLOW}无${PLAIN}" ;;
             3) local editor="vi"; command -v nano &>/dev/null && editor="nano"; $editor "$CONFIG_FILE"
                if jq empty "$CONFIG_FILE" 2>/dev/null; then
-                   systemctl restart sing-box
+                   svc_restart
                    echo -e "${GREEN}✅ 配置有效，已重启服务${PLAIN}"
                else
                    echo -e "${RED}❌ 配置仍无效！${PLAIN}"
@@ -649,8 +845,8 @@ menu_system() {
         menu_back
         read_menu_choice "请选择 [0-8]"; c="$REPLY"
         case "$c" in
-            1) install_singbox ;; 2) systemctl start sing-box && echo -e "${GREEN}✅ 已启动${PLAIN}" ;;
-            3) systemctl stop sing-box && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
+            1) install_singbox ;; 2) svc_start && echo -e "${GREEN}✅ 已启动${PLAIN}" ;;
+            3) svc_stop && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
             5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
@@ -707,7 +903,7 @@ media_check_quick() {
 
     # ChatGPT / OpenAI
     local loc comp gpt
-    loc=$(curl -s --max-time 10 "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null | grep -oP 'loc=\K\w+')
+    loc=$(curl -s --max-time 10 "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null | sed -n 's/^loc=\([A-Za-z]*\).*/\1/p' | head -1)
     comp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "https://api.openai.com/compliance/cookie_requirements" -H "authorization: Bearer x" 2>/dev/null)
     if [[ -n "$loc" && "$comp" == "200" ]]; then
         gpt="${GREEN}✅ 可用${PLAIN} (地区: $loc)"
@@ -720,7 +916,7 @@ media_check_quick() {
 
     # YouTube Premium 地区
     local yt ytc
-    ytc=$(curl -s --max-time 12 -A "$_UA" -H "Accept-Language: en-US" "https://www.youtube.com/premium" 2>/dev/null | grep -oP '"GL":"\K[A-Z]{2}' | head -1)
+    ytc=$(curl -s --max-time 12 -A "$_UA" -H "Accept-Language: en-US" "https://www.youtube.com/premium" 2>/dev/null | sed -n 's/.*"GL":"\([A-Z][A-Z]\)".*/\1/p' | head -1)
     if [[ -n "$ytc" ]]; then yt="${GREEN}✅ 可用${PLAIN} (地区: $ytc)"; else yt="${RED}❌ 不可用/超时${PLAIN}"; fi
     printf ' %-12s: %b\n' "YouTube" "$yt"
 
@@ -742,7 +938,7 @@ media_check_quick() {
 
     # TikTok 地区
     local tt ttc
-    ttc=$(curl -s --max-time 12 -A "$_UA" "https://www.tiktok.com/" 2>/dev/null | grep -oP '"region":"\K[A-Z]{2}' | head -1)
+    ttc=$(curl -s --max-time 12 -A "$_UA" "https://www.tiktok.com/" 2>/dev/null | sed -n 's/.*"region":"\([A-Z][A-Z]\)".*/\1/p' | head -1)
     if [[ -n "$ttc" ]]; then tt="${GREEN}✅ 可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}⚠ 未获取到地区${PLAIN}"; fi
     printf ' %-12s: %b\n' "TikTok" "$tt"
     echo -e "--------------------------------------------------"
@@ -763,7 +959,7 @@ DNS_BACKUP="$META_DIR/resolv.conf.bak"
 show_dns() {
     echo -e "${CYAN}=== 当前 DNS (/etc/resolv.conf) ===${PLAIN}"
     grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}未配置 nameserver${PLAIN}"
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if [ "$INIT_SYS" = "systemd" ] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         echo -e "${YELLOW}⚠ 检测到 systemd-resolved 正在运行，直改 resolv.conf 可能被覆盖。${PLAIN}"
     fi
 }
@@ -811,8 +1007,20 @@ menu_dns() {
 # ---------- 防火墙 (ufw) 设置 ----------
 menu_firewall() {
     if ! command -v ufw &>/dev/null; then
-        echo -e "${YELLOW}未安装 ufw，正在安装...${PLAIN}"
-        if [ -f /etc/debian_version ]; then apt-get install -y -qq ufw; else yum install -y -q ufw 2>/dev/null; fi
+        echo -e "${YELLOW}未安装 ufw，正在尝试安装...${PLAIN}"
+        case "$OS_FAMILY" in
+            debian) apt-get update -qq && apt-get install -y -qq ufw ;;
+            redhat) yum install -y -q firewalld 2>/dev/null ;;
+            alpine) apk add --no-cache ufw iptables ip6tables >/dev/null 2>&1 ;;
+            *)      : ;;
+        esac
+    fi
+    if ! command -v ufw &>/dev/null; then
+        echo -e "${YELLOW}当前系统没有 ufw。${PLAIN}"
+        echo -e "  Alpine : apk add ufw iptables && rc-update add ufw default && rc-service ufw start"
+        echo -e "  其它   : 手动安装 ufw，或直接用 iptables / nftables 放行端口"
+        echo -e "${YELLOW}注：Alpine 默认不启用任何防火墙（端口本来就全开），一般无需额外放行。${PLAIN}"
+        return
     fi
     while true; do
         menu_header "防火墙设置" "ufw 端口与安全策略"
@@ -892,12 +1100,13 @@ bbr_kernel_desc() {
 # 内核有没有 fq 队列算法：先看模块树 / 内核 config，都判不出再在 lo 上试挂一次
 bbr_fq_available() {
     local cfg
-    modinfo -k "$(uname -r)" sch_fq >/dev/null 2>&1 && return 0
-    cfg="/boot/config-$(uname -r)"
+    command -v modinfo >/dev/null 2>&1 && modinfo -k "$(uname -r)" sch_fq >/dev/null 2>&1 && return 0
+    cfg="/boot/config-$(uname -r)"                 # Debian/Ubuntu 有；Alpine 无此文件，直接跳到 tc 实测
     if [ -r "$cfg" ]; then
         grep -qE '^CONFIG_NET_SCH_FQ=[ym]' "$cfg" && return 0
         return 1
     fi
+    command -v tc >/dev/null 2>&1 || bbr_require_tc
     tc qdisc add dev lo root fq >/dev/null 2>&1 && { tc qdisc del dev lo root >/dev/null 2>&1; return 0; }
     return 1
 }
@@ -905,14 +1114,21 @@ bbr_fq_available() {
 bbr_default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
 
 bbr_os_family() {
-    local id like
-    id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
-    like=$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}")
-    case "$id $like" in
-        *debian*|*ubuntu*) echo "debian" ;;
-        *rhel*|*centos*|*fedora*) echo "rhel" ;;
-        *) echo "unknown" ;;
+    case "$OS_FAMILY" in
+        debian) echo "debian" ;;
+        redhat) echo "rhel" ;;
+        *)      echo "${OS_FAMILY:-unknown}" ;;
     esac
+}
+
+# 队列操作要 tc（iproute2）；Alpine 基础系统不自带，按需装一次
+bbr_require_tc() {
+    command -v tc >/dev/null 2>&1 && return 0
+    if [ "$OS_FAMILY" = "alpine" ]; then
+        echo -e "${BLUE}⏳ 安装 iproute2（提供 tc）...${PLAIN}"
+        apk add --no-cache iproute2 >/dev/null 2>&1
+    fi
+    command -v tc >/dev/null 2>&1
 }
 
 bbr_status_short() {
@@ -922,7 +1138,9 @@ bbr_status_short() {
     echo -e "  拥塞算法  : ${YELLOW}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${PLAIN}    默认队列: ${YELLOW}$(sysctl -n net.core.default_qdisc 2>/dev/null)${PLAIN}"
     echo -e "  可用算法  : $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)"
     if bbr_fq_available; then echo -e "  fq 队列   : ${GREEN}可用${PLAIN}"; else echo -e "  fq 队列   : ${YELLOW}不可用（本机内核只有 fq_codel）${PLAIN}"; fi
-    [ -n "$iface" ] && echo -e "  ${iface} 实际队列: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
+    if [ -n "$iface" ] && command -v tc >/dev/null 2>&1; then
+        echo -e "  ${iface} 实际队列: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
+    fi
 }
 
 bbr_show_status() {
@@ -938,7 +1156,8 @@ bbr_show_status() {
 # 先拿 tc 实测内核支不支持该队列：不支持就直接拒绝、一点都不改（否则把内核没编译的 qdisc
 # 写进 sysctl.d，开机会静默失败），回读不一致时还要把配置文件恢复原样。
 bbr_apply() {
-    local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd cur_qd_live bak=""
+    local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd cur_qd_live bak="" have_tc=0
+    bbr_require_tc && have_tc=1
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
     if ! printf '%s\n' $avail | grep -qx "$cc"; then
         echo -e "${RED}❌ 当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
@@ -946,7 +1165,7 @@ bbr_apply() {
     fi
 
     iface=$(bbr_default_iface)
-    if [ -n "$iface" ]; then
+    if [ -n "$iface" ] && [ "$have_tc" = "1" ]; then
         cur_qd_live=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1{print $2}')
         if [ "$cur_qd_live" != "$qdisc" ]; then
             # 默认队列只影响新建的网卡队列，已在跑的网卡必须手动替换；顺便用它验证内核是否支持
@@ -957,6 +1176,8 @@ bbr_apply() {
             fi
         fi
     fi
+
+    [ "$have_tc" = "0" ] && echo -e "${YELLOW}⚠ 没有 tc（iproute2 未装）→ 跳过队列实测/替换，只写 sysctl 持久化。${PLAIN}"
 
     mkdir -p /etc/sysctl.d
     [ -f "$BBR_CONF" ] && { bak=$(mktemp); cp -p "$BBR_CONF" "$bak"; }
@@ -973,8 +1194,10 @@ bbr_apply() {
     cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     if [ "$cur_cc" = "$cc" ] && [ "$cur_qd" = "$qdisc" ]; then
+        local live="n/a"
+        [ "$have_tc" = "1" ] && live=$(tc qdisc show dev "${iface:-eth0}" 2>/dev/null | awk 'NR==1{print $2}')
         echo -e "${GREEN}✅ 已切换到 ${label}${PLAIN}"
-        echo -e "   算法=${cur_cc}  默认队列=${cur_qd}  ${iface:-?} 实际队列=$(tc qdisc show dev "${iface:-eth0}" 2>/dev/null | awk 'NR==1{print $2}')"
+        echo -e "   算法=${cur_cc}  默认队列=${cur_qd}  ${iface:-?} 实际队列=${live}"
         echo -e "   持久化=${BBR_CONF}（重启后自动生效）"
         echo -e "${YELLOW}   注意：已建立的 TCP 连接沿用旧算法，新连接才生效。${PLAIN}"
     else
@@ -1012,7 +1235,7 @@ bbr_set_bbr_fq() {
 # 装完内核先离线核验新内核能力（fq / BBRv3），别等重启完才发现缺东西
 bbr_post_install_check() {
     local cfg krel fq ver
-    cfg=$(ls -1 /boot/config-* 2>/dev/null | sort -V | tail -1)
+    cfg=$(ls -1t /boot/config-* 2>/dev/null | head -1)      # 最新装的内核 = 本次装的那个
     [ -n "$cfg" ] || { echo -e "${YELLOW}  （没找到 /boot/config-*，跳过能力自检）${PLAIN}"; return 0; }
     krel=${cfg#/boot/config-}
     fq=$(grep -E '^CONFIG_NET_SCH_FQ=' "$cfg" | head -1 | cut -d= -f2)
@@ -1051,7 +1274,11 @@ bbr_install_kernel() {
     arch=$(uname -m)
     [ "$arch" = "x86_64" ] || { echo -e "${RED}❌ ${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核。${PLAIN}"; return 1; }
     fam=$(bbr_os_family)
-    [ "$fam" = "debian" ] || { echo -e "${RED}❌ 本功能只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"; return 1; }
+    [ "$fam" = "debian" ] || {
+        echo -e "${RED}❌ BBRv3 内核安装只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"
+        [ "$fam" = "alpine" ] && echo -e "${YELLOW}   Alpine 请用官方内核：apk add linux-lts（或 linux-virt / linux-edge），重启后在菜单里选一次「BBR + fq_codel」。${PLAIN}"
+        return 1
+    }
 
     echo -e "${BLUE}⏳ 正在从 ${BBR3_REPO} 获取可用版本...${PLAIN}"
     resp=$(curl -sL --max-time 25 "https://api.github.com/repos/${BBR3_REPO}/releases?per_page=100" 2>/dev/null)
@@ -1113,7 +1340,7 @@ menu_bbr() {
         menu_option 2 "BBR + fq（先实测内核支不支持 fq，不支持就拒绝）"
         menu_option 3 "CUBIC + fq_codel（恢复系统默认）"
         menu_section "内核"
-        menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}）"
+        menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}，仅 deb 系）"
         menu_option 5 "查看已安装内核"
         menu_section "查看"
         menu_option 6 "完整状态与判定依据"
@@ -1202,9 +1429,9 @@ register_warp_account() {
     out=$("$tmp" 2>/dev/null)
     rm -f "$tmp"
 
-    pk=$(grep -oP '^private_key:\s*\K.*' <<<"$out")
-    v6=$(grep -oP '^v6:\s*\K.*' <<<"$out")
-    reserved=$(grep -oP '^reserved:\s*\K.*' <<<"$out" | tr -d ' ')
+    pk=$(sed -n 's/^private_key:[[:space:]]*//p' <<<"$out")
+    v6=$(sed -n 's/^v6:[[:space:]]*//p' <<<"$out")
+    reserved=$(sed -n 's/^reserved:[[:space:]]*//p' <<<"$out" | tr -d ' ')
     if [[ -z "$pk" || -z "$v6" || -z "$reserved" ]]; then
         echo -e "${RED}❌ WARP 账号注册失败或返回异常${PLAIN}" >&2; return 1
     fi
@@ -1247,7 +1474,7 @@ add_warp() {
 
     if save_and_check_config "$temp_json"; then
         save_warp_meta "$meta"
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ WARP 出口添加成功！${PLAIN}"
         echo -e "  出口标签 : ${BLUE}warp${PLAIN}（wireguard endpoint）"
         echo -e "  WARP IPv6: ${BLUE}$ip6${PLAIN}"
@@ -1289,8 +1516,8 @@ add_warp_node_route() {
             [(.route.rules // [])[] | select((.inbound? // []) | index($tag) | not)])
     ' "$CONFIG_FILE")
     if save_and_check_config "$temp_json"; then
-        systemctl restart sing-box
-        if systemctl is-active --quiet sing-box; then
+        svc_restart
+        if svc_active; then
             echo -e "${GREEN}✅ 节点 [$selected] 已设置为全部走 WARP。${PLAIN}"
         else
             echo -e "${RED}❌ 配置已写入，但 sing-box 重启失败，请查看日志。${PLAIN}"
@@ -1316,7 +1543,7 @@ add_warp_route() {
         | .route.rules = (.route.rules // [])
         | .route.rules += [{"domain_suffix": $doms, "outbound": "warp"}]' "$CONFIG_FILE")
     if save_and_check_config "$temp_json"; then
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 已添加分流规则：$doms → warp${PLAIN}"
     fi
 }
@@ -1346,7 +1573,7 @@ add_ruleset_to_warp() {
         | .route.rules += [{"rule_set": $tags, "outbound": "warp"}]' "$CONFIG_FILE")
 
     if save_and_check_config "$temp_json"; then
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 已添加「$label」分流规则 → warp${PLAIN}"
         echo -e "  规则集: $(printf 'geosite-%s ' "${sites[@]}")"
         echo -e "${YELLOW}💡 首次启动会自动下载规则集，若无法下载请确认服务器能访问 GitHub。${PLAIN}"
@@ -1404,7 +1631,7 @@ delete_warp_rule() {
     local temp_json
     temp_json=$(jq --argjson i "$abs" '.route.rules |= (.[:$i] + .[$i+1:])' "$CONFIG_FILE")
     if save_and_check_config "$temp_json"; then
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ 已删除第 $idx 条 warp 分流规则。${PLAIN}"
     fi
 }
@@ -1420,7 +1647,7 @@ delete_warp() {
         | if .route then .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")]) else . end' "$CONFIG_FILE")
     if save_and_check_config "$temp_json"; then
         rm -f "$WARP_META"
-        systemctl restart sing-box
+        svc_restart
         echo -e "${GREEN}✅ WARP 出口已删除（含指向 warp 的路由规则）。${PLAIN}"
     fi
 }

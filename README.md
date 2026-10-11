@@ -1,12 +1,21 @@
 # Sing-box 管理面板
 
-面向 Debian / Ubuntu / RHEL 系服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
+面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
 
 ## 一键安装
 
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh)
 ```
+
+Alpine（自带 ash、没有 bash）用这一行：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh | sh
+```
+
+安装器是 POSIX sh 写的，会把 `bash`、`curl`、`jq`、`qrencode` 等依赖一并装好（Alpine 上自动用 `apk`，需要时自动补 `community` 仓库）。
+Alpine 上安装/更新核心时，脚本会实测官方二进制能否运行，不能就自动 `apk add gcompat libc6-compat`（官方 release 是 glibc 构建，Alpine 是 musl）。
 
 安装完成后运行：
 
@@ -48,7 +57,7 @@ sudo bash singbox.sh
 - 即时生效：写入 `/etc/sysctl.d/99-zz-bbr-mode.conf` 持久化，同时替换网卡根队列（默认队列只对新网卡生效）
 - 先 `tc` 实测内核支不支持目标队列，不支持就直接拒绝且**一点配置都不改**（避免把内核没编译的 qdisc 写进 sysctl.d），回读校验失败还会把配置文件恢复原样
 - 自动判定内核是否 BBRv3（内核 release 名 + `tcp_bbr` 模块 version 字段），不靠猜
-- 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核，可自选版本，不自动重启
+- 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核（仅 deb 系；Alpine 用官方内核），可自选版本，不自动重启
 - 查看已安装内核与完整状态判定依据
 
 ### 系统与网络工具
@@ -70,10 +79,23 @@ sudo bash singbox.sh
 
 ## 系统要求
 
-- Debian / Ubuntu 或 RHEL 系 Linux
+- Debian / Ubuntu / RHEL 系，或 Alpine（OpenRC）；init 系统自动识别
 - root 权限
 - 建议使用支持 UTF-8 的终端
-- 安装脚本会自动安装 `curl`、`jq`、`wget`、`qrencode`、`ufw` 等依赖
+- 安装脚本会自动安装 `curl`、`jq`、`wget`、`qrencode`、`bash` 等依赖
+
+## 各发行版差异
+
+| 项目 | Debian / Ubuntu / RHEL | Alpine |
+| --- | --- | --- |
+| 服务管理 | systemd (`systemctl`) | OpenRC (`rc-service` / `rc-update`)，服务文件 `/etc/init.d/sing-box` |
+| 官方二进制 | 直接可用 | 需 `gcompat` + `libc6-compat`（脚本实测不能跑就自动装）；备选 `apk add sing-box`（musl 原生，版本略旧） |
+| 日志 | `journalctl -u sing-box` | `/var/log/sing-box.log` |
+| 包管理 | `apt` / `yum` | `apk`（二维码在 `libqrencode-tools`，需 community 仓库） |
+| 防火墙 | ufw / firewalld | 默认无防火墙；若自建了 DROP 规则，添加节点时会用 `iptables` 放行 |
+| BBR 切换 | 支持 | 支持（首次自动 `apk add iproute2` 拿到 `tc`） |
+| BBRv3 内核安装 | 支持（deb） | 不支持，用官方内核：`apk add linux-lts` 等 |
+| 无 init 的容器 | — | 自动降级为 `nohup` 托管，重启后需手动拉起 |
 
 ## 更新
 
@@ -85,8 +107,8 @@ bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/i
 
 ## 项目文件
 
-- `singbox.sh`：主管理脚本
-- `install.sh`：一键安装与更新脚本
+- `singbox.sh`：主管理脚本（需要 bash；systemd / OpenRC 兼容）
+- `install.sh`：一键安装与更新脚本（POSIX sh，Alpine 可直接用 `sh` 跑）
 
 ## 免责声明
 
