@@ -40,9 +40,10 @@ sudo bash singbox.sh
 - 自动生成分享链接和二维码（VLESS 与 AnyTLS 节点一起按序号列出，选序号即可看对应二维码）
 - TCP / UDP 端口转发规则增删查
 
-> **AnyTLS + Reality 的客户端限制**：该组合目前只有 sing-box 内核的客户端支持（官方 sing-box、Karing、Hiddify、v2rayN 等）。
-> Shadowrocket 的 AnyTLS 是纯 TLS 模式（不带 REALITY），mihomo 明确不支持 AnyTLS+Reality（服务端与客户端都不支持），Xray 不支持 AnyTLS。
-> 想要全平台可用的节点用 VLESS-Reality，要抗 TLS-in-TLS 长度特征且只用 sing-box 内核客户端时用 AnyTLS-Reality。
+> **AnyTLS + Reality 的客户端限制**：服务端只有 sing-box 内核能跑；客户端需 sing-box 内核（官方 sing-box、Karing、Hiddify、v2rayN 等），
+> 或 Shadowrocket 2.2.65+（类型选 AnyTLS，TLS 开启后填 SNI / 公钥 / 短 ID / 指纹，导入 `anytls://…?security=reality&pbk=&sid=` 链接会自动带上）。
+> mihomo（Clash Meta）明确不支持 AnyTLS+Reality（服务端与客户端都不支持），Xray 不支持 AnyTLS。
+> 想要全平台可用的节点用 VLESS-Reality，要抗 TLS-in-TLS 长度特征时用 AnyTLS-Reality。
 
 ### Cloudflare WARP 分流
 

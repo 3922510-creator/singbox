@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.5.0  |  快捷指令: SB / sb
+#  版本: v3.5.1  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.5.0"
+SCRIPT_VERSION="v3.5.1"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -785,9 +785,9 @@ add_anytls_node() {
         echo -e "SNI        : ${BLUE}$sni${PLAIN}"
         echo -e "分享链接   : ${YELLOW}$link${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${YELLOW}💡 客户端要求：AnyTLS + Reality 目前只有 sing-box 内核客户端支持${PLAIN}"
-        echo -e "${YELLOW}   （官方 sing-box / Karing / Hiddify / v2rayN）；小火箭的 AnyTLS 是纯${PLAIN}"
-        echo -e "${YELLOW}   TLS 模式（不带 Reality），mihomo 不支持该组合。${PLAIN}"
+        echo -e "${YELLOW}💡 客户端要求：AnyTLS + Reality 需 sing-box 内核客户端（官方 sing-box /${PLAIN}"
+        echo -e "${YELLOW}   Karing / Hiddify / v2rayN），或小火箭 Shadowrocket 2.2.65+（类型选 AnyTLS，${PLAIN}"
+        echo -e "${YELLOW}   TLS 开启后填 SNI / 公钥 / 短 ID）；mihomo 不支持该组合。${PLAIN}"
 
         if command -v qrencode &>/dev/null; then
             read -rp "是否显示二维码？[y/N]: " show_qr
