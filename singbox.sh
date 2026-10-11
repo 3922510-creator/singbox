@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.4.7  |  快捷指令: SB / sb
+#  版本: v3.4.8  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.4.7"
+SCRIPT_VERSION="v3.4.8"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -32,6 +32,10 @@ META_DIR="/etc/sing-box/.meta"
 REALITY_META="$META_DIR/reality.txt"
 WARP_META="$META_DIR/warp.json"
 LOCK_FILE="/var/run/sing-box-manager.lock"
+
+# 服务定义版本：OpenRC / systemd 脚本内容有变更时靠它自动升级旧安装（见 ensure_service_def_fresh）
+SERVICE_DEF_REV="2"
+RESPAWN_DELAY="10"                                        # supervise-daemon 拉起间隔（秒）
 
 # ---------- 平台检测（发行版家族 + init 系统）----------
 # 脚本主体不直接写 systemctl/apk：统一走下面的 OS_FAMILY 与 svc_* 抽象，
@@ -67,10 +71,17 @@ if [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
 
 # ==================== 服务控制抽象（systemd / OpenRC / 无 init）====================
 # 全脚本统一用这几个函数管 sing-box 服务（日志同理），不再散落 systemctl/journalctl。
+# OpenRC 的原始状态串：started / starting / crashed / unsupervised / stopped ...
+# crashed（进程被杀）、unsupervised（supervise-daemon 也挂了）都不是“已停止”，
+# 但此时 rc-service start 会回一句 “already been started” 就成功返回（见 svc_ctl 注释）。
+svc_state_raw() {
+    rc-service sing-box status 2>/dev/null | sed -n 's/^[[:space:]]*\* status: //p' | head -1
+}
+
 svc_active() {
     case "$INIT_SYS" in
         systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
-        openrc)  rc-service sing-box status 2>/dev/null | grep -q "started" ;;
+        openrc)  svc_state_raw | grep -qE '^(started|starting)$' ;;
         *)       pgrep -f "$BIN_FILE run" >/dev/null 2>&1 ;;
     esac
 }
@@ -79,15 +90,34 @@ svc_ctl() {
     local act="$1"
     case "$INIT_SYS" in
         systemd) systemctl "$act" sing-box ;;
-        openrc)  rc-service sing-box "$act" ;;
+        openrc)
+            # OpenRC 的坑（2026-10-11 在 Alpine 机器上实测）：sing-box 被 OOM 杀掉、
+            # 或 supervise-daemon 一起挂掉后，服务状态停在 crashed/unsupervised，
+            # 这时 `rc-service sing-box start` 只回一句
+            # "WARNING: sing-box has already been started" 并返回 0 ——
+            # 面板显示“启动成功”，实际什么都没起（也不会自愈）。
+            # 所以 start/restart 前先确认真实状态，必要时清状态 + 清残留进程。
+            if [ "$act" = "start" ] || [ "$act" = "restart" ]; then
+                if ! svc_active; then
+                    rc-service sing-box zap >/dev/null 2>&1   # 把 crashed/unsupervised 手动重置为 stopped
+                    rm -f /run/sing-box.pid 2>/dev/null
+                    # supervisor 被单独杀掉时会留下孤儿进程占着监听端口，
+                    # 新实例会因 “address already in use” 起不来 → 清理（已确认服务未运行）
+                    pkill -f "$BIN_FILE run" 2>/dev/null
+                    sleep 1
+                fi
+            fi
+            # 子 shell 里关掉锁 fd 200，避免被服务进程继承（见 acquire_lock 注释）
+            ( exec 200>&- 2>/dev/null; rc-service sing-box "$act" ) ;;
         *)
             # 无 init 系统：直接 nohup 托管（Alpine 容器 / 精简 rootfs 场景）
             case "$act" in
                 stop)    pkill -f "$BIN_FILE run" 2>/dev/null; return 0 ;;
                 start|restart)
-                    [ "$act" = "restart" ] && { pkill -f "$BIN_FILE run" 2>/dev/null; sleep 1; }
-                    nohup "$BIN_FILE" run -C /etc/sing-box >>"$SINGBOX_LOG" 2>&1 &
-                    echo $! > /var/run/sing-box.pid ;;
+                    ( exec 200>&- 2>/dev/null
+                      [ "$act" = "restart" ] && { pkill -f "$BIN_FILE run" 2>/dev/null; sleep 1; }
+                      nohup "$BIN_FILE" run -C /etc/sing-box >>"$SINGBOX_LOG" 2>&1 &
+                      echo $! > /var/run/sing-box.pid ) ;;
             esac ;;
     esac
 }
@@ -113,6 +143,11 @@ svc_status() {
     case "$INIT_SYS" in
         systemd) systemctl status sing-box --no-pager ;;
         openrc)  rc-service sing-box status
+                 if grep -q "sb-service-rev=$SERVICE_DEF_REV" "$OPENRC_FILE" 2>/dev/null; then
+                     echo "自愈   : 已启用（supervise-daemon 托管，进程崩溃/被 OOM 杀掉后 ${RESPAWN_DELAY}s 内自动拉起）"
+                 else
+                     echo -e "${YELLOW}自愈   : 未启用（服务定义是旧版，下次运行面板会自动升级）${PLAIN}"
+                 fi
                  if rc-update show default 2>/dev/null | grep -q "sing-box"; then
                      echo "自启动 : 已启用（default）"
                  else
@@ -167,11 +202,44 @@ menu_option() { printf '  %b%-2s%b %s\n' "$GREEN" "$1." "$PLAIN" "$2"; }
 menu_back() { printf '\n  %b0.%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
 read_menu_choice() { local prompt="${1:-请选择}"; read -rp "$prompt：" REPLY; }
 
-# ==================== 并发锁 ====================
+# 并发锁
+# 坑（2026-10-11 实测）：面板用 flock 锁住 fd 200，而它调用的 rc-service/start-stop-daemon
+# 是由本进程 fork 出去的，openrc 会把 fd 200 一并继承给自己的孩子
+# （supervise-daemon / sing-box 都受影响）—— 服务一起，锁就被服务进程永久持有，
+# 下一次运行面板会直接报「另一个管理实例正在运行」而进不去。
+# 所以：① 启动服务时把 fd 200 关掉（不传给服务进程）；② 万一已经是旧版残留状态，
+# 识别出持有者是服务进程就跳过，不把用户挡在外面。
+lock_holder_is_service() {
+    local p pid cmd
+    for p in /proc/[0-9]*; do
+        pid=${p#/proc/}
+        [ "$pid" = "$$" ] && continue
+        for fd in "$p"/fd/*; do
+            case "$(readlink "$fd" 2>/dev/null)" in
+                *sing-box-manager.lock*)
+                    cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+                    case "$cmd" in
+                        *sing-box*|*supervise-daemon*|*start-stop-daemon*)
+                            echo -e "${YELLOW}提示：锁文件被服务进程持有（旧版面板的 fd 继承问题）：PID $pid $cmd${PLAIN}"
+                            echo -e "${YELLOW}      已忽略该锁（新版面板启动服务时不再传递锁 fd）。${PLAIN}"
+                            return 0 ;;
+                        *)
+                            echo -e "${RED}  占用者：PID $pid $cmd${PLAIN}" >&2
+                            return 1 ;;
+                    esac ;;
+            esac
+        done
+    done
+    return 1
+}
+
 acquire_lock() {
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
     exec 200>"$LOCK_FILE"
     if ! flock -n 200; then
+        if lock_holder_is_service; then
+            return 0    # 历史残留，不阻塞（服务进程不会真的和面板抢操作）
+        fi
         echo -e "${RED}错误：另一个管理实例正在运行，请稍后重试。${PLAIN}"
         exit 1
     fi
@@ -332,6 +400,22 @@ get_singbox_status() {
     fi
 }
 
+# 启动服务并核对结果：OpenRC 在 crashed/unsupervised 残留状态下 start 会“成功返回但没起来”，
+# 所以不能只看 rc-service 的返回码，必须回头确认真实运行状态。
+start_service() {
+    if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}尚未安装 Sing-box！${PLAIN}"; return 1; fi
+    echo -e "${BLUE}⏳ 正在启动 sing-box...${PLAIN}"
+    svc_start
+    sleep 2
+    if svc_active; then
+        echo -e "${GREEN}✅ 启动成功！当前状态: $(get_singbox_status)${PLAIN}"
+    else
+        echo -e "${RED}❌ 启动失败：服务仍未运行，请按下面的日志定位（末尾 20 行）：${PLAIN}"
+        svc_logs 20
+        return 1
+    fi
+}
+
 restart_service() {
     if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}尚未安装 Sing-box！${PLAIN}"; return 1; fi
     echo -e "${BLUE}⏳ 正在重启 sing-box...${PLAIN}"
@@ -480,6 +564,7 @@ EOF
         openrc)
             cat > "$OPENRC_FILE" <<EOF
 #!/sbin/openrc-run
+# sb-service-rev=$SERVICE_DEF_REV
 # Sing-box 服务（OpenRC / Alpine）
 # 由 sb 管理面板生成；手动改完请 rc-service sing-box restart
 
@@ -488,11 +573,15 @@ description="Sing-box Service"
 command="$BIN_FILE"
 command_args="run -C /etc/sing-box"
 command_user="root:root"
-command_background="yes"
+# 用 supervise-daemon 托管：sing-box 被 OOM 杀掉 / 崩溃后 $RESPAWN_DELAY 秒内自动拉起。
+# 注意别改回 command_background="yes"：那种写法进程死了服务会卡在 crashed，
+# rc-service start 还会回 “already been started” 假成功（2026-10-11 实测）。
+supervisor="supervise-daemon"
+respawn_delay="$RESPAWN_DELAY"
+respawn_max="0"          # 0 = 不限制重启次数
 pidfile="/run/sing-box.pid"
 output_log="$SINGBOX_LOG"
 error_log="$SINGBOX_LOG"
-respawn_delay="10"
 
 need_root="yes"
 
@@ -503,13 +592,27 @@ depend() {
 EOF
             chmod +x "$OPENRC_FILE"
             svc_enable
-            echo -e "${GREEN}已生成 OpenRC 服务：${OPENRC_FILE}（开机自启已加入 default runlevel）${PLAIN}"
+            echo -e "${GREEN}已生成 OpenRC 服务：${OPENRC_FILE}（开机自启已加入 default runlevel；崩溃自动拉起）${PLAIN}"
             ;;
         *)
             echo -e "${YELLOW}⚠ 未检测到 systemd / OpenRC：sing-box 将由 nohup 直接托管（重启后需手动拉起）。${PLAIN}"
             echo -e "   手动启动：nohup $BIN_FILE run -C /etc/sing-box >> $SINGBOX_LOG 2>&1 &"
             ;;
     esac
+}
+
+# 旧安装的服务定义升级：老版本面板写的 OpenRC 脚本是 command_background（无 supervisor），
+# 进程崩溃后不会自愈、启动还会假成功。检测到旧定义就重写一份（先备份，不重启服务，
+# 下次重启即生效），避免必须重装核心才能拿到修复。
+ensure_service_def_fresh() {
+    [ "$INIT_SYS" = "openrc" ] || return 0
+    [ -f "$OPENRC_FILE" ] || return 0
+    grep -q "sb-service-rev=$SERVICE_DEF_REV" "$OPENRC_FILE" 2>/dev/null && return 0
+    local bak="${OPENRC_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$OPENRC_FILE" "$bak" 2>/dev/null
+    install_service_file >/dev/null 2>&1
+    echo -e "${YELLOW}ℹ 已更新 OpenRC 服务定义（旧版缺陷：进程崩溃后不自愈、启动可能假成功）${PLAIN}"
+    echo -e "  备份：${bak}；重启一次服务后新定义生效（面板「重启服务」或 rc-service sing-box restart）"
 }
 
 uninstall_singbox() {
@@ -845,7 +948,7 @@ menu_system() {
         menu_back
         read_menu_choice "请选择 [0-8]"; c="$REPLY"
         case "$c" in
-            1) install_singbox ;; 2) svc_start && echo -e "${GREEN}✅ 已启动${PLAIN}" ;;
+            1) install_singbox ;; 2) start_service ;;
             3) svc_stop && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
             5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
@@ -1698,6 +1801,7 @@ menu_warp() {
 # ==================== 入口 ====================
 install_dependencies
 ensure_config
+ensure_service_def_fresh
 while true; do
     show_menu
 done

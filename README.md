@@ -88,7 +88,7 @@ sudo bash singbox.sh
 
 | 项目 | Debian / Ubuntu / RHEL | Alpine |
 | --- | --- | --- |
-| 服务管理 | systemd (`systemctl`) | OpenRC (`rc-service` / `rc-update`)，服务文件 `/etc/init.d/sing-box` |
+| 服务管理 | systemd (`systemctl`)，`Restart=on-failure` | OpenRC (`rc-service` / `rc-update`)，服务文件 `/etc/init.d/sing-box`；由 `supervise-daemon` 托管，进程崩溃/被 OOM 杀掉后 10s 内自动拉起（v3.4.8+） |
 | 官方二进制 | 直接可用 | 需 `gcompat` + `libc6-compat`（脚本实测不能跑就自动装）；备选 `apk add sing-box`（musl 原生，版本略旧） |
 | 日志 | `journalctl -u sing-box` | `/var/log/sing-box.log` |
 | 包管理 | `apt` / `yum` | `apk`（二维码在 `libqrencode-tools`，需 community 仓库） |
