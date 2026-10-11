@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.6.0  |  快捷指令: SB / sb
+#  版本: v3.7.0  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.6.0"
+SCRIPT_VERSION="v3.7.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -186,23 +186,54 @@ svc_active_name() {
 }
 
 # ---------- 通用交互 ----------
-pause() { echo ""; read -rp "按回车键继续..." _; }
+pause() { echo ""; read -rp "  ⏎ 按回车键继续..." _; }
 
-# 统一菜单样式：所有菜单使用同一套标题、分组和提示，避免重复绘制导致维护混乱。
+# ====================================================================
+#  UI 渲染层（v3.7 新皮肤）
+#  硬约束：手机 SSH 客户端 + 中文 + ANSI 会让「固定宽度右边框」错位，所以全部
+#  左对齐、只用水平规则线；规则线宽度随终端自适应（手机竖屏不折行）。
+#  只用基础 ANSI + 粗体/暗色，不碰 256/truecolor，保证各终端渲染一致。
+# ====================================================================
+BOLD="\033[1m"; DIM="\033[2m"
+
+# 规则线宽度：优先读 $COLUMNS，退回 tput；夹在 32..54 列（手机竖屏约 40-50 列）
+ui_width() {
+    local w="${COLUMNS:-0}"
+    case "$w" in ''|*[!0-9]*) w=0 ;; esac
+    [ "$w" -eq 0 ] && w=$(tput cols 2>/dev/null || echo 44)
+    case "$w" in ''|*[!0-9]*) w=44 ;; esac
+    [ "$w" -lt 32 ] && w=32
+    [ "$w" -gt 54 ] && w=54
+    printf '%s' "$w"
+}
+ui_rule() {
+    local w i line=''
+    w=$(ui_width); i=0
+    while [ "$i" -lt "$w" ]; do line="${line}─"; i=$((i+1)); done
+    printf '%b%s%b\n' "${DIM}${BLUE}" "$line" "$PLAIN"
+}
+
+# 标题区：规则线 → 粗体标题 → 暗色副标题 → 状态 → 规则线
 menu_header() {
     local title="$1" subtitle="${2:-}" status="${3:-}"
     clear
-    # 不使用固定宽度右边框：printf 的 %-Ns 按字符而非终端显示宽度计算，
-    # 中文、ANSI 颜色码和手机 SSH 客户端会导致边框错位。
-    printf '\n%b┌─ %s ─┐%b\n' "$CYAN" "$title" "$PLAIN"
-    [ -n "$subtitle" ] && printf '%b│%b %s\n' "$CYAN" "$PLAIN" "$subtitle"
-    [ -n "$status" ] && printf '%b│%b 状态：%b\n' "$CYAN" "$PLAIN" "$status"
-    printf '%b└────────────────────────────────────────%b\n' "$CYAN" "$PLAIN"
+    echo ""
+    ui_rule
+    printf '  %b%s%b\n' "$BOLD" "$title" "$PLAIN"
+    [ -n "$subtitle" ] && printf '  %b%s%b\n' "$DIM" "$subtitle" "$PLAIN"
+    [ -n "$status" ] && printf '  %b状态%b %s\n' "$DIM" "$PLAIN" "$status"
+    ui_rule
 }
-menu_section() { printf '\n%b【%s】%b\n' "$BLUE" "$1" "$PLAIN"; }
-menu_option() { printf '  %b%-2s%b %s\n' "$GREEN" "$1." "$PLAIN" "$2"; }
-menu_back() { printf '\n  %b0.%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
-read_menu_choice() { local prompt="${1:-请选择}"; read -rp "$prompt：" REPLY; }
+
+# 分组：左侧强调条 + 粗体标签
+menu_section() { printf '\n  %b▌%b %b%s%b\n' "$BLUE" "$PLAIN" "$BOLD" "$1" "$PLAIN"; }
+# 选项：绿色右对齐序号 + 文本
+menu_option() { printf '    %b%2s)%b %s\n' "$GREEN" "$1" "$PLAIN" "$2"; }
+# 返回 / 退出
+menu_back() { printf '\n    %b 0)%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
+menu_exit() { printf '\n    %b 0)%b 退出脚本\n' "$YELLOW" "$PLAIN"; }
+# 输入提示：强调箭头
+read_menu_choice() { local prompt="${1:-请选择}"; printf '%b  ❯%b %s: ' "$BLUE" "$PLAIN" "$prompt"; read -r REPLY; }
 
 # 并发锁
 # 坑（2026-10-11 实测）：面板用 flock 锁住 fd 200，而它调用的 rc-service/start-stop-daemon
@@ -1802,7 +1833,7 @@ show_menu() {
     menu_section "配置与工具"
     menu_option 5 "配置诊断（查看、编辑、回滚）"
     menu_option 6 "实用工具（解锁检测、DNS、防火墙）"
-    printf '\n  %b0.%b 退出脚本\n\n' "$YELLOW" "$PLAIN"
+    printf '    %b 0)%b 退出脚本\n\n' "$YELLOW" "$PLAIN"
     read_menu_choice "请选择 [0-6]"; choice="$REPLY"
     case "$choice" in
         1) menu_system ;; 2) menu_nodes ;; 3) menu_forward ;; 4) menu_warp ;;
@@ -2089,22 +2120,23 @@ menu_warp() {
         menu_section "出口"
         menu_option 1 "添加 / 重置 WARP（自动注册账号）"
         menu_option 2 "查看 WARP 出口信息"
-        menu_option 9 "删除 WARP 出口及相关规则"
+        menu_option 3 "删除 WARP 出口及相关规则"
         menu_section "分流规则"
-        menu_option 3 "AI 服务走 WARP"
-        menu_option 4 "流媒体走 WARP"
-        menu_option 5 "自定义域名走 WARP"
-        menu_option 8 "指定节点全部走 WARP"
+        menu_option 4 "AI 服务走 WARP"
+        menu_option 5 "流媒体走 WARP"
+        menu_option 6 "自定义域名走 WARP"
+        menu_option 7 "指定节点全部走 WARP"
         local rule_count
         rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-        menu_option 6 "查看已添加的规则（${rule_count:-0} 条）"
-        menu_option 7 "删除指定规则"
+        menu_option 8 "查看已添加的规则（${rule_count:-0} 条）"
+        menu_option 9 "删除指定规则"
         menu_back
         read_menu_choice "请选择 [0-9]"; c="$REPLY"
         case "$c" in
-            1) add_warp ;; 2) view_warp ;; 3) add_warp_ai ;; 4) add_warp_media ;;
-            5) add_warp_route ;; 6) view_warp_rules ;; 7) delete_warp_rule ;;
-            8) add_warp_node_route ;; 9) delete_warp ;; 0) return ;;
+            1) add_warp ;; 2) view_warp ;; 3) delete_warp ;;
+            4) add_warp_ai ;; 5) add_warp_media ;; 6) add_warp_route ;;
+            7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;;
+            0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
