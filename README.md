@@ -132,3 +132,14 @@ bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/i
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Swap 管理
+
+入口：`sb → 实用工具 → 6 Swap 管理`。
+
+- 查看系统全部 Swap 和内存状态；自定义 128–65536 MiB 创建 Swap，并写入 `/etc/fstab` 开机启用。
+- 只创建和删除 `/var/lib/sb-swap/swapfile`，使用独立标记识别归属，不接管已有 `/swapfile`、Swap 分区或 zram；目录已存在时拒绝覆盖。
+- 添加、删除都需输入 `确认`；删除前检查可用内存，`swapoff` 失败不会删文件或持久化条目。
+- 修改 fstab 前保留 `/etc/fstab.sb-swap.bak.*` 备份，以同目录临时文件原子替换；不修改其他条目。持久化失败会尝试撤销创建/恢复启用，失败则保留文件并提示人工处理。
+- 当前仅提供普通磁盘文件系统上的通用 Swap 文件流程；拒绝 Btrfs/ZFS、内存文件系统、NFS 和 overlay。容器没有 `swapon` 权限时会报错并清理本次创建文件，不改 fstab。
+- 调整容量请先删除再添加；不会调整 swappiness，也不会重启 sing-box 或服务器。面板卸载 sing-box 不会删除 Swap。

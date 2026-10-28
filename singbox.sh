@@ -1883,12 +1883,203 @@ menu_tools() {
         menu_option 3 "DNS 设置"
         menu_option 4 "防火墙设置（ufw）"
         menu_option 5 "网络加速（BBR / BBRv3 + fq）"
+        menu_option 6 "Swap 管理（添加 / 删除）"
         menu_back
-        read_menu_choice "请选择 [0-5]"; c="$REPLY"
+        read_menu_choice "请选择 [0-6]"; c="$REPLY"
         case "$c" in
             1) media_check_quick; pause ;; 2) media_check_full; pause ;;
-            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 0) return ;;
+            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 6) menu_swap ;; 0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
+        esac
+    done
+}
+
+# ==================== Swap 管理 ====================
+# 固定独立目录 + 所有权标记，只管理本面板创建的文件，不接管 /swapfile 或分区。
+SB_SWAP_DIR="/var/lib/sb-swap"
+SB_SWAP_FILE="$SB_SWAP_DIR/swapfile"
+SB_SWAP_MARKER="$SB_SWAP_DIR/managed"
+SB_SWAP_FSTAB="/etc/fstab"
+SB_SWAP_PROC="/proc/swaps"
+SB_SWAP_MEMINFO="/proc/meminfo"
+
+swap_entry() {
+    printf '%s none swap sw 0 0 # sb-managed-swap' "$SB_SWAP_FILE"
+}
+
+swap_active() {
+    awk -v path="$SB_SWAP_FILE" 'NR > 1 && $1 == path {found=1} END {exit !found}' "$SB_SWAP_PROC"
+}
+
+swap_owned() {
+    [ ! -L "$SB_SWAP_DIR" ] && [ -d "$SB_SWAP_DIR" ] && [ -O "$SB_SWAP_DIR" ] &&
+        [ ! -L "$SB_SWAP_FILE" ] && [ -f "$SB_SWAP_FILE" ] &&
+        [ ! -L "$SB_SWAP_MARKER" ] && [ -f "$SB_SWAP_MARKER" ] &&
+        [ "$(cat "$SB_SWAP_MARKER")" = sb-managed-swap-v1 ]
+}
+
+swap_fstab_safe() {
+    [ -f "$SB_SWAP_FSTAB" ] && [ ! -L "$SB_SWAP_FSTAB" ] || {
+        printf 'fstab 不存在或为符号链接，拒绝自动修改。\n' >&2; return 1;
+    }
+    awk -v path="$SB_SWAP_FILE" -v entry="$(swap_entry)" '
+        $1 == path && $0 != entry {bad=1}
+        END {exit bad}
+    ' "$SB_SWAP_FSTAB" || {
+        printf 'fstab 中存在非本面板的同路径条目，请先人工核对。\n' >&2; return 1;
+    }
+}
+
+swap_write_fstab() {
+    local action="$1" tmp backup
+    swap_fstab_safe || return 1
+    tmp=$(mktemp "${SB_SWAP_FSTAB}.sb-tmp.XXXXXX") || return 1
+    # 同目录原子替换，并保留权限；每次改动先保留可恢复的原文件。
+    if ! cp -p "$SB_SWAP_FSTAB" "$tmp" || ! awk -v entry="$(swap_entry)" -v action="$action" '
+        $0 != entry {print}
+        END {if (action == "add") print entry}
+    ' "$SB_SWAP_FSTAB" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    backup=$(mktemp "${SB_SWAP_FSTAB}.sb-swap.bak.XXXXXX") || { rm -f "$tmp"; return 1; }
+    if ! cp -p "$SB_SWAP_FSTAB" "$backup" || ! mv -f "$tmp" "$SB_SWAP_FSTAB"; then
+        rm -f "$tmp"
+        printf '更新 fstab 失败；备份位置：%s\n' "$backup" >&2
+        return 1
+    fi
+    printf 'fstab 已更新，原文件备份：%s\n' "$backup"
+}
+
+swap_status() {
+    printf '\n当前系统 Swap（包含系统/其他工具创建的 Swap）：\n'
+    cat "$SB_SWAP_PROC"
+    printf '\n内存概况（kB）：\n'
+    awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ {print}' "$SB_SWAP_MEMINFO"
+    if swap_owned; then
+        printf '\n本面板管理：%s（%s MiB）\n' "$SB_SWAP_FILE" "$(( $(stat -c %s "$SB_SWAP_FILE") / 1048576 ))"
+        if swap_active; then printf '状态：已启用\n'; else printf '状态：未启用\n'; fi
+    else
+        printf '\n本面板尚未创建 Swap；不管理系统已有 Swap。\n'
+    fi
+}
+
+swap_create() {
+    local mb answer available fs cmd
+    [ -r "$SB_SWAP_PROC" ] && [ -r "$SB_SWAP_MEMINFO" ] || {
+        printf '无法读取内核 Swap/内存状态，拒绝操作。\n' >&2; return 1;
+    }
+    for cmd in dd df stat mkswap swapon swapoff; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            printf '缺少命令 %s，请先安装系统对应工具包（通常为 util-linux/coreutils）。\n' "$cmd" >&2
+            return 1
+        }
+    done
+    if [ -e "$SB_SWAP_DIR" ] || [ -L "$SB_SWAP_DIR" ]; then
+        printf '目录 %s 已存在；不会覆盖。已有面板 Swap 请先删除，再重新创建。\n' "$SB_SWAP_DIR" >&2
+        return 1
+    fi
+    swap_fstab_safe || return 1
+    # 避免沿用悬空的旧持久化条目，创建过程失败时不留下开机引用。
+    if awk -v path="$SB_SWAP_FILE" '$1 == path {found=1} END {exit !found}' "$SB_SWAP_FSTAB"; then
+        printf 'fstab 中已有此路径条目，拒绝重复创建，请先人工核对。\n' >&2
+        return 1
+    fi
+    read -rp "Swap 大小（MiB，128–65536；例如 1024 = 1 GiB）: " mb || return 1
+    if ! [[ "$mb" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$mb" -lt 128 ] || [ "$mb" -gt 65536 ]; then
+        printf '请输入 128–65536 范围内的整数 MiB。\n' >&2; return 1
+    fi
+    fs=$(stat -f -c %T /var/lib) || return 1
+    case "$fs" in
+        btrfs|zfs|tmpfs|ramfs|nfs*|overlay*)
+            printf '当前文件系统 %s 不支持本面板的通用 Swap 文件流程，请使用系统原生方案。\n' "$fs" >&2
+            return 1 ;;
+    esac
+    available=$(df -Pk /var/lib | awk 'END {print $4}')
+    if ! [[ "$available" =~ ^[0-9]+$ ]] || [ "$available" -lt "$((mb * 1024 + 262144))" ]; then
+        printf '磁盘空间不足：创建后至少需要保留 256 MiB 可用空间。\n' >&2; return 1
+    fi
+    printf '将创建 %s MiB Swap：%s，并写入 fstab 开机启用。\n' "$mb" "$SB_SWAP_FILE"
+    read -rp "输入 确认 继续（其他输入取消）: " answer || return 1
+    [ "$answer" = 确认 ] || { printf '已取消。\n'; return 0; }
+    mkdir -m 700 "$SB_SWAP_DIR" || return 1
+    # 先安全建文件，避免私有数据在权限收紧前暴露；dd 确保分配实际磁盘块。
+    if ! (umask 077; printf 'sb-managed-swap-v1\n' > "$SB_SWAP_MARKER" &&
+        : > "$SB_SWAP_FILE" && dd if=/dev/zero of="$SB_SWAP_FILE" bs=1M count="$mb" 2>/dev/null) ||
+        ! mkswap "$SB_SWAP_FILE" || ! swapon "$SB_SWAP_FILE" || ! swap_active; then
+        printf '创建/启用失败（容器可能没有 swapon 权限），未修改 fstab。\n' >&2
+        if swap_active; then
+            printf '检测到文件仍在使用，保留文件，请人工检查。\n' >&2
+        else
+            rm -f "$SB_SWAP_FILE" "$SB_SWAP_MARKER"
+            rmdir "$SB_SWAP_DIR"
+        fi
+        return 1
+    fi
+    if ! swap_write_fstab add; then
+        printf '持久化失败，正在撤销新建 Swap。\n' >&2
+        if swapoff "$SB_SWAP_FILE" && ! swap_active; then
+            rm -f "$SB_SWAP_FILE" "$SB_SWAP_MARKER"
+            rmdir "$SB_SWAP_DIR"
+        else
+            printf '停用失败，已保留 Swap 文件；本次 Swap 未保证开机启用，请人工检查。\n' >&2
+        fi
+        return 1
+    fi
+    printf '✅ 已创建并启用 %s MiB Swap，开机自动启用。\n' "$mb"
+}
+
+swap_delete() {
+    local answer used available was_active=0
+    [ -r "$SB_SWAP_PROC" ] && [ -r "$SB_SWAP_MEMINFO" ] || {
+        printf '无法读取内核 Swap/内存状态，拒绝操作。\n' >&2; return 1;
+    }
+    swap_owned || { printf '未找到本面板创建的 Swap，拒绝删除其他 Swap。\n' >&2; return 1; }
+    swap_fstab_safe || return 1
+    if swap_active; then
+        was_active=1
+        used=$(awk -v path="$SB_SWAP_FILE" 'NR > 1 && $1 == path {print $4}' "$SB_SWAP_PROC")
+        available=$(awk '/^MemAvailable:/ {print $2}' "$SB_SWAP_MEMINFO")
+        if ! [[ "$used" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || [ "$available" -lt "$((used + 65536))" ]; then
+            printf '可用内存不足或无法可靠读取：停用前至少需覆盖 Swap 已用量并余留 64 MiB。请先释放内存。\n' >&2
+            return 1
+        fi
+    fi
+    printf '将停用并删除 %s，移除对应开机条目；不动其他 Swap。\n' "$SB_SWAP_FILE"
+    read -rp "输入 确认 删除（其他输入取消）: " answer || return 1
+    [ "$answer" = 确认 ] || { printf '已取消。\n'; return 0; }
+    if [ "$was_active" = 1 ]; then
+        if ! swapoff "$SB_SWAP_FILE" || swap_active; then
+            printf '停用失败或仍在使用，文件及 fstab 均保留，未执行删除。\n' >&2; return 1
+        fi
+    fi
+    if ! swap_write_fstab remove; then
+        if [ "$was_active" = 1 ]; then
+            swapon "$SB_SWAP_FILE" || printf '恢复启用失败，文件仍保留，请人工检查。\n' >&2
+        fi
+        return 1
+    fi
+    if ! rm -f "$SB_SWAP_FILE"; then
+        printf 'Swap 已停用且开机条目已移除，但文件删除失败：%s\n' "$SB_SWAP_FILE" >&2
+        return 1
+    fi
+    rm -f "$SB_SWAP_MARKER"
+    rmdir "$SB_SWAP_DIR" || printf '目录中还有其他文件，已保留目录。\n' >&2
+    printf '✅ 已删除本面板创建的 Swap。\n'
+}
+
+menu_swap() {
+    local c
+    while true; do
+        menu_header "Swap 管理" "只管理本面板创建的 Swap 文件"
+        swap_status
+        menu_option 1 "添加 Swap（自定义 MiB）"
+        menu_option 2 "删除本面板 Swap"
+        menu_back
+        read_menu_choice "请选择 [0-2]" || return
+        c="$REPLY"
+        case "$c" in
+            1) swap_create; pause ;; 2) swap_delete; pause ;; 0) return ;;
+            *) printf '无效选项！\n' ;;
         esac
     done
 }
