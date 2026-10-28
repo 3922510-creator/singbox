@@ -119,3 +119,16 @@ bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/i
 ## 免责声明
 
 本项目仅用于合法的服务器运维和网络测试。请遵守所在地区法律法规以及服务提供商的使用条款。
+
+## 节点备注
+
+- 添加 VLESS-Reality / AnyTLS-Reality 节点时可输入备注（最多 80 字），支持中文、空格及特殊符号；分享链接的名称会自动 URL 编码。
+- 已有节点：`sb → 节点管理 → 5 修改节点备注`，留空恢复默认名称。
+- 列表、分享链接及二维码同步使用备注；已经导入客户端的名称不会自动变化，需重新导入或在客户端手动修改。
+- 备注保存在 `/etc/sing-box/.meta/node-names.json`（权限 600），不修改节点内部 tag、端口、认证或路由，修改备注无需重启服务；原有节点未设置备注时继续显示 tag。
+
+备注功能回归测试（隔离临时目录，不操作生产配置/服务）：
+
+```bash
+python3 -m unittest discover -s tests -v
+```

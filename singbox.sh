@@ -31,6 +31,7 @@ SINGBOX_LOG="/var/log/sing-box.log"                    # 无 journald 时 sing-b
 META_DIR="/etc/sing-box/.meta"
 REALITY_META="$META_DIR/reality.txt"                          # Reality 系（VLESS / AnyTLS）公钥记录: tag|public_key
 WARP_META="$META_DIR/warp.json"
+NODE_NAMES_META="$META_DIR/node-names.json"                  # 备注独立保存，不改 tag / 路由 / 服务配置
 LOCK_FILE="/var/run/sing-box-manager.lock"
 
 # 服务定义版本：OpenRC / systemd 脚本内容有变更时靠它自动升级旧安装（见 ensure_service_def_fresh）
@@ -499,6 +500,61 @@ remove_reality_meta() {
     mv "${REALITY_META}.tmp" "$REALITY_META"
 }
 
+# 备注只影响展示与链接片段；旧节点没有记录时沿用 tag。
+node_display_name() {
+    local name
+    name=$(jq -er --arg tag "$1" '.[$tag] | select(type == "string" and length > 0)' "$NODE_NAMES_META" 2>/dev/null) || name="$1"
+    printf '%s' "$name"
+}
+
+read_node_name() {
+    local name
+    while true; do
+        read -rp "节点备注（最多 80 字，留空使用默认名称）: " name || return 1
+        if [ "${#name}" -gt 80 ] || [[ "$name" =~ [[:cntrl:]] ]]; then
+            printf '备注不能超过 80 字或包含控制字符。\n' >&2
+            continue
+        fi
+        printf '%s' "$name"
+        return 0
+    done
+}
+
+save_node_name() {
+    local tag="$1" name="$2" tmp
+    mkdir -p "$META_DIR" || return 1
+    tmp=$(mktemp "${NODE_NAMES_META}.tmp.XXXXXX") || return 1
+    # 损坏的备注文件不得被覆盖；写入失败保留原文件。
+    if { if [ -e "$NODE_NAMES_META" ]; then cat "$NODE_NAMES_META"; else printf '{}'; fi; } |
+        jq -e --arg tag "$tag" --arg name "$name" '
+            if type != "object" then error("备注文件必须是对象")
+            elif $name == "" then del(.[$tag]) else .[$tag] = $name end
+        ' > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$NODE_NAMES_META"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    printf '保存节点备注失败，原备注未变。\n' >&2
+    return 1
+}
+
+node_link_fragment() {
+    node_display_name "$1" | jq -sRr '@uri'
+}
+
+rename_node() {
+    local idx tag name
+    idx=$(prompt_delete_index "节点备注" node)
+    [ -n "$idx" ] || return 0
+    tag=$(inbound_field "$idx" tag)
+    printf '当前备注: %s\n内部标识: %s\n' "$(node_display_name "$tag")" "$tag"
+    name=$(read_node_name) || return 1
+    if save_node_name "$tag" "$name"; then
+        printf '✅ 备注已更新为：%s（无需重启；已导入客户端的旧名称不会自动更新）\n' "$(node_display_name "$tag")"
+    else
+        return 1
+    fi
+}
+
 # ==================== 删除项选择 ====================
 prompt_delete_index() {
     local title="$1" filter_type="$2"
@@ -508,7 +564,9 @@ prompt_delete_index() {
     while [ $i -lt "$total" ]; do
         local t
         t=$(inbound_field "$i" "type")
-        [ "$t" == "$filter_type" ] && idxs+=("$i")
+        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls ]]; }; then
+            idxs+=("$i")
+        fi
         i=$((i+1))
     done
 
@@ -524,7 +582,9 @@ prompt_delete_index() {
         local tag port
         tag=$(inbound_field "$real" "tag")
         port=$(inbound_field "$real" "listen_port")
-        echo -e "  [${GREEN}$n${PLAIN}] $tag  (端口: $port)" >&2
+        local display="$tag"
+        case "$(inbound_field "$real" type)" in vless|anytls) display=$(node_display_name "$tag") ;; esac
+        printf '  [%s] %s  (端口: %s)\n' "$n" "$display" "$port" >&2
     done
     echo -e "--------------------------------------------------" >&2
 
@@ -714,7 +774,8 @@ add_reality_node() {
     uuid=$("$BIN_FILE" generate uuid)
     short_id=$("$BIN_FILE" generate rand 8 --hex)
 
-    local tag="vless-reality-$port"
+    local tag="vless-reality-$port" name
+    name=$(read_node_name) || return 1
     local temp_json
     temp_json=$(jq --argjson port "$port" --arg uuid "$uuid" --arg pk "$private_key" \
                    --arg sni "$sni" --arg sid "$short_id" --arg tag "$tag" \
@@ -735,7 +796,9 @@ add_reality_node() {
         open_firewall_port "$port"
         svc_restart
         local ip; ip=$(get_public_ip)
-        local link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#Reality-$port"
+        save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
+        local link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(node_link_fragment "$tag")"
+        printf '节点备注   : %s\n' "$(node_display_name "$tag")"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
@@ -783,7 +846,8 @@ add_anytls_node() {
     password=$("$BIN_FILE" generate rand 16 --hex)
     short_id=$("$BIN_FILE" generate rand 8 --hex)
 
-    local tag="anytls-reality-$port"
+    local tag="anytls-reality-$port" name
+    name=$(read_node_name) || return 1
     local temp_json
     temp_json=$(jq --argjson port "$port" --arg pw "$password" --arg pk "$private_key" \
                    --arg sni "$sni" --arg sid "$short_id" --arg tag "$tag" \
@@ -804,7 +868,9 @@ add_anytls_node() {
         open_firewall_port "$port"
         svc_restart
         local ip; ip=$(get_public_ip)
-        local link="anytls://$password@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#AnyTLS-$port"
+        save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
+        local link="anytls://$password@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#$(node_link_fragment "$tag")"
+        printf '节点备注   : %s\n' "$(node_display_name "$tag")"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
@@ -860,12 +926,12 @@ view_node_links() {
             tag=$(inbound_field  "$i" "tag")
             port=$(inbound_field "$i" "listen_port")
             pbk=$(get_reality_pubkey "$tag")
-            link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=tcp#$tag"
+            link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=tcp#$(node_link_fragment "$tag")"
 
             links+=("$link")
-            tags+=("$tag")
+            tags+=("$(node_display_name "$tag")")
 
-            echo -e "  [${GREEN}$idx${PLAIN}] ${GREEN}VLESS-Reality${PLAIN} | ${BLUE}$tag${PLAIN} | 端口: $port"
+            printf '  [%s] VLESS-Reality | %s | 端口: %s\n' "$idx" "$(node_display_name "$tag")" "$port"
             echo -e "      SNI : $sni  |  ShortId: $sid"
             echo -e "      公钥: ${pbk:-未记录}"
             echo -e "      链接: ${YELLOW}$link${PLAIN}"
@@ -888,12 +954,12 @@ view_node_links() {
                 tag=$(inbound_field  "$i" "tag")
                 port=$(inbound_field "$i" "listen_port")
                 pbk=$(get_reality_pubkey "$tag")
-                link="anytls://$pw@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid#$tag"
+                link="anytls://$pw@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid#$(node_link_fragment "$tag")"
 
                 links+=("$link")
-                tags+=("$tag")
+                tags+=("$(node_display_name "$tag")")
 
-                echo -e "  [${GREEN}$idx${PLAIN}] ${GREEN}AnyTLS-Reality${PLAIN} | ${BLUE}$tag${PLAIN} | 端口: $port"
+                printf '  [%s] AnyTLS-Reality | %s | 端口: %s\n' "$idx" "$(node_display_name "$tag")" "$port"
                 echo -e "      SNI : $sni  |  ShortId: $sid"
                 echo -e "      公钥: ${pbk:-未记录}"
                 echo -e "      密码: $pw"
@@ -908,7 +974,7 @@ view_node_links() {
         read -rp "输入要显示二维码的序号 (0 跳过): " qr_idx
         if [[ "$qr_idx" =~ ^[0-9]+$ ]] && [ "$qr_idx" -ge 1 ] && [ "$qr_idx" -le "${#links[@]}" ]; then
             local ridx=$((qr_idx - 1))
-            echo -e "${BLUE}二维码 [${tags[$ridx]}]:${PLAIN}"
+            printf '二维码 [%s]:\n' "${tags[$ridx]}"
             qrencode -t ANSIUTF8 "${links[$ridx]}"
         fi
     fi
@@ -955,6 +1021,9 @@ delete_node() {
 
     if save_and_check_config "$temp_json"; then
         remove_reality_meta "$del_tag"
+        if [ -e "$NODE_NAMES_META" ]; then
+            save_node_name "$del_tag" "" || printf '节点已删除，但旧备注清理失败。\n' >&2
+        fi
         svc_restart
         echo -e "${GREEN}✅ 节点 [${del_tag}] 已删除。${PLAIN}"
     fi
@@ -1137,10 +1206,12 @@ menu_nodes() {
         menu_option 2 "添加 AnyTLS-Reality 节点"
         menu_option 3 "查看分享链接 / 二维码（全部节点）"
         menu_option 4 "删除节点"
+        menu_option 5 "修改节点备注（无需重启）"
         menu_back
-        read_menu_choice "请选择 [0-4]"; c="$REPLY"
+        read_menu_choice "请选择 [0-5]"; c="$REPLY"
         case "$c" in
             1) add_reality_node ;; 2) add_anytls_node ;; 3) view_node_links ;; 4) delete_node ;;
+            5) rename_node ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
