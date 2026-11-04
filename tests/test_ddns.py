@@ -13,6 +13,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'ddns.sh'
 class DDNSTests(unittest.TestCase):
     def shell(self, body, expected=0):
         env = dict(os.environ, DDNS_TEST_SOURCE='1')
+        if 'menu' in body:
+            body = "show_status() { printf '  首页模拟状态\\n'; }; " + body
         result = subprocess.run(['sh', '-c', '. "$1"; ' + body, 'test', str(SCRIPT)],
                                 env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -31,49 +33,29 @@ class DDNSTests(unittest.TestCase):
         for value in ['https://example.com', '*.example.com', '-a.example.com', 'example.com:22']:
             self.shell('valid_domain ' + "'" + value + "'", expected=1)
 
-    def test_source_url(self):
-        self.assertEqual(self.shell('source_mode=url; source=https://example.com; fetch() { echo 8.8.8.8; }; get_ip').strip(), '8.8.8.8')
+    def test_three_interfaces_agree(self):
+        output = self.shell('''ip() { exit 9; }
+fetch() {
+  case "$*" in '-4 --noproxy * -A curl/ddns https://api.ip.sb/ip'|'-4 --noproxy * -A curl/ddns https://api4.ipify.org'|'-4 --noproxy * -A curl/ddns https://ipv4.icanhazip.com') echo 8.8.8.8 ;; *) exit 9 ;; esac
+}
+get_ip''')
+        self.assertEqual(output.strip(), '8.8.8.8')
+        self.assertEqual(len(self.shell('ip_endpoints').splitlines()), 3)
 
-    def test_source_hostname(self):
-        body = '''source_mode=hostname; source=provider.example.com
-fetch() { printf '%s' '{"Status":0,"Answer":[{"type":5,"data":"alias.example.com"},{"type":1,"data":"8.8.8.8"}]}'; }
-get_ip'''
-        self.assertEqual(self.shell(body).strip(), '8.8.8.8')
-        self.shell(body.replace('"type":5,"data":"alias.example.com"', '"type":1,"data":"1.1.1.1"'), expected=1)
-
-    def test_egress_agreement(self):
-        body = '''source_mode=egress
-local_public_ip() { echo 8.8.8.8; }
-fetch() { case "$*" in *api.ip.sb/ip*) echo 1.1.1.1 ;; *) exit 9 ;; esac; }
-get_ip'''
-        self.shell(body, expected=1)
-        self.assertEqual(self.shell(body.replace('echo 1.1.1.1', 'echo 8.8.8.8')).strip(), '8.8.8.8')
-
-    def test_local_public_interface(self):
-        self.assertEqual(self.shell('''ip() { echo '1.1.1.1 via 8.8.4.1 dev eth0 src 8.8.8.8 uid 0'; }
-fetch() { exit 9; }
-local_public_ip''').strip(), '8.8.8.8')
-
-    def test_nat_local_public_fallback(self):
-        body = '''ip() { echo '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.2 uid 0'; }
-fetch() { case "$*" in *'--noproxy * https://api4.ipify.org') echo 8.8.8.8 ;; *) exit 9 ;; esac; }
-local_public_ip'''
-        self.assertEqual(self.shell(body).strip(), '8.8.8.8')
-        self.shell(body.replace('echo 8.8.8.8', 'echo 10.0.0.1'), expected=1)
-
-    def test_ip_sb_failure_preserves_dns(self):
-        self.shell('''source_mode=egress
-local_public_ip() { echo 8.8.8.8; }
-fetch() { return 1; }
+    def test_each_interface_failure_and_mismatch_preserves_dns(self):
+        for url in ['https://api.ip.sb/ip', 'https://api4.ipify.org', 'https://ipv4.icanhazip.com']:
+            for result in ['return 1', 'echo 1.1.1.1', 'echo 10.0.0.1', 'echo html']:
+                with self.subTest(url=url, result=result):
+                    self.shell('''fetch() { case "$*" in *"%s") %s ;; *) echo 8.8.8.8 ;; esac; }
 api() { exit 9; }
-update''', expected=1)
+update''' % (url, result), expected=1)
 
     def test_menu_continues_after_error(self):
         output = self.shell('''id() { echo 0; }
-egress_ip() { fail 'mock query failed'; }
+get_ip() { fail 'mock query failed'; }
 printf '2\\n\\n0\\n' | menu''')
         self.assertEqual(output.count('Cloudflare DDNS'), 2)
-        self.assertIn('出口校验失败', output)
+        self.assertIn('接口校验失败', output)
 
     def test_menu_rejects_manual_update(self):
         self.shell('''id() { echo 0; }
@@ -83,7 +65,8 @@ printf '3\\nn\\n\\n0\\n' | menu''')
     def test_menu_compact_order_and_no_escapes_in_pipe(self):
         output = self.shell("id() { echo 0; }; printf '0\\n' | menu")
         self.assertNotIn('\x1b', output)
-        self.assertIn('    1) 状态与解析记录\n    2) 公网 IP 交叉校验\n    3) 立即更新 DNS\n    4) 修改 IP 来源', output)
+        self.assertIn('    1) 刷新首页状态\n    2) 公网 IP 交叉校验\n    3) 立即更新 DNS\n    4) 查看查询接口', output)
+        self.assertLess(output.index('首页模拟状态'), output.index('1) 刷新首页状态'))
         self.assertLessEqual(len(output.splitlines()), 24)
         self.assertEqual(output.count('Cloudflare DDNS'), 1)
 
@@ -93,7 +76,7 @@ detect_init() { init=systemd; }
 systemctl() { case "$*" in *--quiet*) return 0 ;; *) exit 9 ;; esac; }
 api() { echo '{"result":[{"type":"A","content":"8.8.8.8","proxied":false}]}'; }
 show_status''')
-        for label in ['本机公网 + ip.sb', '已开启', '运行中', '仅 DNS（灰云）', '8.8.8.8']:
+        for label in ['三接口全部一致', '已开启', '运行中', '仅 DNS（灰云）', '8.8.8.8']:
             self.assertIn(label, output)
         for raw in ['egress', 'false', 'active', 'enabled']:
             self.assertNotIn(raw, output)
@@ -108,7 +91,7 @@ show_status''')
         master, slave = pty.openpty()
         try:
             env = dict(os.environ, DDNS_TEST_SOURCE='1', TERM='xterm', COLUMNS='40')
-            process = subprocess.Popen(['sh', '-c', '. "$1"; id() { echo 0; }; printf "0\\n" | menu',
+            process = subprocess.Popen(['sh', '-c', '. "$1"; id() { echo 0; }; show_status() { echo "  首页状态"; }; printf "0\\n" | menu',
                                         'test', str(SCRIPT)], env=env, stdout=slave, stderr=slave)
             os.close(slave)
             slave = None
@@ -125,7 +108,7 @@ show_status''')
             output = b''.join(chunks).decode()
             self.assertEqual(process.returncode, 0, output)
             self.assertIn('\x1b[H\x1b[2J', output)
-            self.assertIn('1) 状态与解析记录\r\n    2)', output)
+            self.assertIn('1) 刷新首页状态\r\n    2)', output)
         finally:
             if slave is not None:
                 os.close(slave)
@@ -219,7 +202,7 @@ api() { case "$*" in *--get*) echo '{"result":[]}' ;; *zones/aaaaaaaaaaaaaaaaaaa
 get_ip() { echo 8.8.8.8; }
 install_ddns'''
                 result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
-                                        input='test-token\n' + 'a' * 32 + '\nnat.example.com\n1\nprovider.example.com\ny\n', capture_output=True)
+                                        input='test-token\n' + 'a' * 32 + '\nnat.example.com\ny\n', capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 config = root / 'etc/cloudflare-ddns/config.json'
                 self.assertEqual(config.stat().st_mode & 0o777, 0o600)
@@ -249,25 +232,21 @@ install_ddns'''
                     self.assertTrue(service.stat().st_mode & 0o111)
                     subprocess.run(['sh', '-n', str(service)], check=True)
 
-    def test_change_source_backup_and_cancel(self):
+    def test_legacy_sources_ignored(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / 'config.json'
-            original = dict(token='test-token', zone_id='a' * 32, record='nat.example.com',
-                            source_mode='hostname', source='provider.example.com')
-            config.write_text(json.dumps(original))
-            config.chmod(0o600)
-            prefix = 'CONFIG=' + str(config) + '; get_ip() { echo 8.8.8.8; }; '
-            self.shell(prefix + "printf '3\\ny\\nn\\n' | change_source")
-            self.assertEqual(json.loads(config.read_text()), original)
-            self.assertEqual(len(list(config.parent.glob('*.bak.*'))), 0)
-            output = self.shell(prefix + "printf '3\\ny\\ny\\n' | change_source")
-            self.assertNotIn('test-token', output)
-            saved = json.loads(config.read_text())
-            self.assertEqual(saved, dict(original, source_mode='egress', source=''))
-            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
-            backup = list(config.parent.glob('*.bak.*'))
-            self.assertEqual(len(backup), 1)
-            self.assertEqual(json.loads(backup[0].read_text()), original)
+            for mode in ['hostname', 'url', 'egress']:
+                config.write_text(json.dumps(dict(token='test-token', zone_id='a' * 32,
+                    record='nat.example.com', source_mode=mode, source='https://old.example.com')))
+                self.assertEqual(self.shell('CONFIG=' + str(config) + '''; load_config
+ip() { exit 9; }
+fetch() { case "$*" in *old.example.com*) exit 9 ;; *) echo 8.8.8.8 ;; esac; }
+get_ip''').strip(), '8.8.8.8')
+
+    def test_homepage_refresh_does_not_require_pause(self):
+        output = self.shell("id() { echo 0; }; printf '1\\n0\\n' | menu")
+        self.assertEqual(output.count('首页模拟状态'), 2)
+        self.assertNotIn('按回车返回', output)
 
     def test_service_syntax(self):
         text = SCRIPT.read_text()

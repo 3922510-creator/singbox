@@ -24,44 +24,31 @@ valid_domain() {
     printf '%s\n' "$1" | jq -Re 'length <= 253 and contains(".") and
       (split(".") | all(.[]; test("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")))' >/dev/null
 }
+# Three separate free HTTPS services. No NIC inspection or provider DNS lookup.
+ip_endpoints() {
+    printf '%s\n' https://api.ip.sb/ip https://api4.ipify.org https://ipv4.icanhazip.com
+}
 get_ip() {
-    case "$source_mode" in
-        hostname)
-            # Use DNS-over-HTTPS so no dig/getent/python package is required.
-            result=$(fetch -H 'Accept: application/dns-json' --get --data-urlencode "name=$source" \
-                --data-urlencode 'type=A' https://cloudflare-dns.com/dns-query) || return 1
-            value=$(printf '%s' "$result" | jq -er 'select(.Status == 0) |
-                [.Answer[]? | select(.type == 1) | .data] | unique | select(length == 1) | .[0]') || fail '商家域名必须解析到一个 IPv4'
-            public_ip "$value" ;;
-        url) value=$(fetch "$source") || return 1; public_ip "$value" ;;
-        egress)
-            egress_ip ;;
-        *) fail '未知 IP 来源' ;;
-    esac
-}
-local_public_ip() {
-    # Inspect the source address of the default IPv4 route, not Docker/VPN NICs.
-    # A NAT guest normally has no public address on its own interfaces.
-    local_ip=''
-    if command -v ip >/dev/null 2>&1; then
-        route=$(ip -4 route get 1.1.1.1 2>/dev/null) || route=''
-        local_ip=$(printf '%s\n' "$route" | awk '{for (i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')
-    fi
-    if local_ip=$(public_ip "$local_ip" 2>/dev/null); then
-        printf '本机路由公网 IPv4：%s\n' "$local_ip" >&2
-    else
-        local_ip=$(fetch -4 --noproxy '*' https://api4.ipify.org) || return 1
-        local_ip=$(public_ip "$local_ip") || return 1
-        printf '网卡无可用公网地址，通过独立接口查询本机公网 IPv4：%s\n' "$local_ip" >&2
-    fi
-    printf '%s\n' "$local_ip"
-}
-egress_ip() {
-    first=$(local_public_ip) || return 1
-    second=$(fetch -4 --noproxy '*' -A 'curl/ddns' https://api.ip.sb/ip) || return 1
-    second=$(public_ip "$second") || return 1
-    [ "$first" = "$second" ] || fail '本机公网 IPv4 与 ip.sb 不一致，保留原 DNS'
-    printf '%s\n' "$first"
+    agreed=''
+    for endpoint in $(ip_endpoints); do
+        value=$(fetch -4 --noproxy '*' -A 'curl/ddns' "$endpoint") || {
+            printf '接口查询失败：%s；保留原 DNS\n' "$endpoint" >&2
+            return 1
+        }
+        value=$(public_ip "$value") || return 1
+        case "$endpoint" in
+            *api.ip.sb*) endpoint_name=ip.sb ;;
+            *ipify.org*) endpoint_name=ipify ;;
+            *icanhazip.com*) endpoint_name=icanhazip ;;
+        esac
+        printf '  %-10s : %s\n' "$endpoint_name" "$value" >&2
+        if [ -n "$agreed" ] && [ "$agreed" != "$value" ]; then
+            fail '三个接口的公网 IPv4 不一致，保留原 DNS'
+        fi
+        agreed=$value
+    done
+    [ -n "$agreed" ] || return 1
+    printf '%s\n' "$agreed"
 }
 api() {
     # Feed the credential via stdin, not the process argument list.
@@ -74,19 +61,12 @@ load_config() {
     token=$(jq -er '.token' "$CONFIG") || return 1
     zone_id=$(jq -er '.zone_id' "$CONFIG") || return 1
     record=$(jq -er '.record' "$CONFIG") || return 1
-    source_mode=$(jq -er '.source_mode' "$CONFIG") || return 1
-    source=$(jq -r '.source // ""' "$CONFIG") || return 1
     validate
 }
 validate() {
     case "$token" in ''|*[!a-zA-Z0-9_-]*) fail 'Token 格式不正确' ;; esac
     printf '%s\n' "$zone_id" | grep -Eq '^[a-fA-F0-9]{32}$' || fail 'Zone ID 应为 32 位十六进制字符'
     valid_domain "$record" || fail '目标必须为完整域名，不带协议或端口'
-    case "$source_mode" in
-        hostname) valid_domain "$source" || fail '来源域名无效'; [ "$source" != "$record" ] || fail '来源不能是目标域名' ;;
-        url) case "$source" in https://?*) ;; *) fail '来源接口必须是 HTTPS' ;; esac ;;
-        egress) ;; *) fail '未知 IP 来源' ;;
-    esac
 }
 update() {
     ip=$(get_ip) || return 1
@@ -121,18 +101,6 @@ detect_init() {
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then init=openrc
     else fail '只支持 systemd / OpenRC'; fi
 }
-select_source() {
-    printf '%s\n' 'IP 来源：1 商家动态域名；2 HTTPS 纯文本 IPv4 接口；3 本机公网 IPv4 + ip.sb 交叉校验'
-    ask '选择 [1/2/3]：'
-    case "$answer" in
-        1) source_mode=hostname; ask '商家动态域名：'; source=$answer ;;
-        2) source_mode=url; ask 'HTTPS 查询接口：'; source=$answer ;;
-        3) source_mode=egress; source=''
-           confirm '出口 IP 已核实等于入站映射 IP？' || fail '未确认，不使用出口 IP' ;;
-        *) fail '无效选择' ;;
-    esac
-    validate
-}
 check_entry() {
     if [ -e /usr/local/bin/ddns ] || [ -L /usr/local/bin/ddns ]; then
         [ -L /usr/local/bin/ddns ] && [ "$(readlink /usr/local/bin/ddns)" = "$SELF" ] || fail '/usr/local/bin/ddns 已被其他程序占用'
@@ -149,7 +117,7 @@ upgrade_ddns() {
     if [ "$init" = openrc ]; then
         grep -F "$SELF --daemon" /etc/init.d/cloudflare-ddns >/dev/null || fail '服务不是已知 DDNS 安装，拒绝重启'
     fi
-    printf '%s\n' '将备份并升级 DDNS 脚本，保留域名、Token、IP 来源和自启设置，添加 ddns 菜单。'
+    printf '%s\n' '将备份并升级 DDNS 脚本，保留域名、Token 和自启设置。IP 来源统一改为三个接口全部一致校验，旧来源设置不再使用。'
     [ "$init" != openrc ] || printf '%s\n' 'OpenRC 会重启 DDNS 服务以加载新脚本（不影响 sing-box / SSH）。'
     confirm '升级 DDNS 脚本？' || fail '已取消'
     sh -n "$0" || return 1
@@ -183,19 +151,19 @@ install_ddns() {
     stty "$tty_state"; trap - EXIT HUP INT TERM; printf '\n'
     ask 'Zone ID：'; zone_id=$answer
     ask '完整目标域名（如 nat.example.com）：'; record=$answer
-    select_source
+    validate
     zone=$(api "$API/zones/$zone_id") || exit 1
     zone_name=$(printf '%s' "$zone" | jq -er '.result.name')
     case "$record" in "$zone_name"|*."$zone_name") ;; *) fail '目标域名不属于此 Zone' ;; esac
     ip=$(get_ip) || exit 1
-    printf '将把 %s 更新为 %s，灰云，每 60 秒检查。不会改端口或 AAAA。\n' "$record" "$ip"
+    printf '将把 %s 更新为 %s，灰云，每 60 秒检查，三个接口全部一致才更新。不会改端口或 AAAA。\n' "$record" "$ip"
+    printf '%s\n' '注意：接口获取的是公网出口 IPv4，请确保它与商家入站映射 IP 相同。'
     confirm '安装并修改 DNS？' || fail '已取消'
     update || exit 1
     umask 077
     mkdir /etc/cloudflare-ddns
     printf '%s' "$token" | jq -Rs --arg zone_id "$zone_id" --arg record "$record" \
-        --arg source_mode "$source_mode" --arg source "$source" \
-        '{token:.,zone_id:$zone_id,record:$record,source_mode:$source_mode,source:$source}' > "$CONFIG"
+        '{token:.,zone_id:$zone_id,record:$record}' > "$CONFIG"
     mkdir -p /usr/local/lib
     cp "$0" "$SELF"; chmod 700 "$SELF"
     if [ "$init" = systemd ]; then
@@ -249,38 +217,21 @@ UNIT
 show_status() {
     load_config || return 1
     detect_init
-    printf '  目标域名 : %s\n  IP 来源  : %s\n' "$record" "$(source_label)"
+    printf '  目标域名 : %s\n  IP 校验  : 三接口全部一致\n' "$record"
     if [ "$init" = systemd ]; then
         if systemctl is-enabled --quiet cloudflare-ddns.timer; then enabled_text=已开启; else enabled_text=已关闭; fi
         if systemctl is-active --quiet cloudflare-ddns.timer; then active_text=运行中; else active_text=未运行; fi
         printf '  开机自启 : %s\n  定时检查 : %s\n' "$enabled_text" "$active_text"
     else
         if rc-service cloudflare-ddns status >/dev/null 2>&1; then active_text=运行中; else active_text=未运行; fi
-        printf '  定时检查 : %s\n' "$active_text"
+        if rc-update show default 2>/dev/null | grep -Eq '^[[:space:]]*cloudflare-ddns[[:space:]]'; then enabled_text=已开启; else enabled_text=已关闭; fi
+        printf '  开机自启 : %s\n  定时检查 : %s\n' "$enabled_text" "$active_text"
     fi
     response=$(api --get --data-urlencode "name=$record" "$API/zones/$zone_id/dns_records") || return 1
     printf '%s' "$response" | jq -r '
       [.result[] | select(.type == "A")] |
       if length == 0 then "  解析地址 : 尚无 A 记录"
       else .[] | "  解析地址 : \(.content)\n  代理状态 : \(if .proxied then "橙云代理" else "仅 DNS（灰云）" end)" end'
-}
-change_source() {
-    load_config || return 1
-    select_source
-    ip=$(get_ip) || return 1
-    printf '新的 IP 来源：%s；当前查询值：%s。保存后下次自动检查生效。\n' "$source_mode" "$ip"
-    confirm '保存新的 IP 来源？' || return 0
-    [ ! -L "$CONFIG" ] || fail '配置不能是符号链接'
-    umask 077
-    backup="$CONFIG.bak.$(date +%Y%m%d-%H%M%S).$$"
-    cp -p "$CONFIG" "$backup" || return 1
-    staged=$(mktemp "$CONFIG.new.XXXXXX") || return 1
-    trap 'rm -f "$staged"' EXIT
-    trap 'exit 1' HUP INT TERM
-    jq --arg mode "$source_mode" --arg source "$source" '.source_mode=$mode | .source=$source' "$CONFIG" > "$staged" || return 1
-    jq -e . "$staged" >/dev/null && chmod 600 "$staged" && mv "$staged" "$CONFIG" || return 1
-    trap - EXIT HUP INT TERM
-    printf '配置已保存，备份：%s\n' "$backup"
 }
 service_action() {
     detect_init
@@ -297,13 +248,6 @@ service_action() {
             disable) rc-service cloudflare-ddns stop && rc-update del cloudflare-ddns default ;;
         esac
     fi
-}
-source_label() {
-    case "$source_mode" in
-        egress) printf '%s' '本机公网 + ip.sb' ;;
-        hostname) printf '%s' '商家动态域名' ;;
-        url) printf '%s' 'HTTPS 查询接口' ;;
-    esac
 }
 ui_rule() {
     ui_width=${COLUMNS:-0}
@@ -328,6 +272,8 @@ ui_header() {
     ui_rule
     printf '  Cloudflare DDNS 管理面板\n  IPv4 动态解析 · 每 60 秒检查\n'
     ui_rule
+    (show_status) && : || printf '%s\n' '  状态读取不完整，请查看日志'
+    ui_rule
 }
 menu_option() { printf '    %s) %s\n' "$1" "$2"; }
 menu_pause() { printf '\n  按回车返回菜单...'; IFS= read -r answer || return 1; }
@@ -336,10 +282,10 @@ menu() {
     while :; do
         ui_header
         printf '\n  解析管理\n'
-        menu_option 1 '状态与解析记录'
+        menu_option 1 '刷新首页状态'
         menu_option 2 '公网 IP 交叉校验'
         menu_option 3 '立即更新 DNS'
-        menu_option 4 '修改 IP 来源'
+        menu_option 4 '查看查询接口'
         printf '\n  运行与服务\n'
         menu_option 5 '查看运行日志'
         menu_option 6 '开启自动更新'
@@ -348,13 +294,13 @@ menu() {
         menu_option 0 '退出脚本'
         printf '\n'
         ask '  请选择 [0-7]：'
-        case "$answer" in 0) return ;; esac
+        case "$answer" in 0) return ;; 1) continue ;; esac
         ui_clear
         printf '\n'
         ui_rule
         case "$answer" in
-            1) printf '  状态与解析记录\n' ;; 2) printf '  公网 IP 交叉校验\n' ;;
-            3) printf '  立即更新 DNS\n' ;; 4) printf '  修改 IP 来源\n' ;;
+            2) printf '  公网 IP 交叉校验\n' ;;
+            3) printf '  立即更新 DNS\n' ;; 4) printf '  查询接口\n' ;;
             5) printf '  运行日志\n' ;; 6|7) printf '  自动更新设置\n' ;;
             *) printf '  提示\n' ;;
         esac
@@ -362,10 +308,9 @@ menu() {
         printf '\n'
         # Separate processes isolate fatal errors; a failed query must not close the menu.
         case "$answer" in
-            1) (show_status) && : || printf '%s\n' '状态查询失败' ;;
-            2) (egress_ip) && : || printf '%s\n' '出口校验失败，不修改 DNS' ;;
+            2) (verified=$(get_ip) || exit 1; printf '\n  三接口校验通过：%s\n' "$verified") && : || printf '%s\n' '接口校验失败，不修改 DNS' ;;
             3) if confirm '立即更新 DNS？'; then (load_config || exit 1; update) && : || printf '%s\n' '更新失败'; fi ;;
-            4) (change_source) && : || printf '%s\n' '配置未完成修改' ;;
+            4) ip_endpoints; printf '\n  三个接口均返回相同公网 IPv4 才更新。\n  任一失败、返回无效值或不一致，均保留原 DNS。\n' ;;
             5) (detect_init
                 if [ "$init" = systemd ]; then journalctl -u cloudflare-ddns.service -n 30 --no-pager
                 else tail -n 30 /var/log/cloudflare-ddns.log; fi) && : || printf '%s\n' '日志读取失败' ;;
