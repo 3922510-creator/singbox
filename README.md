@@ -143,3 +143,61 @@ python3 -m unittest discover -s tests -v
 - 修改 fstab 前保留 `/etc/fstab.sb-swap.bak.*` 备份，以同目录临时文件原子替换；不修改其他条目。持久化失败会尝试撤销创建/恢复启用，失败则保留文件并提示人工处理。
 - 当前仅提供普通磁盘文件系统上的通用 Swap 文件流程；拒绝 Btrfs/ZFS、内存文件系统、NFS 和 overlay。容器没有 `swapon` 权限时会报错并清理本次创建文件，不改 fstab。
 - 调整容量请先删除再添加；不会调整 swappiness，也不会重启 sing-box 或服务器。面板卸载 sing-box 不会删除 Swap。
+
+## NAT 服务器 Cloudflare DDNS（独立脚本）
+
+适合共享公网 IPv4 会变化、商家映射端口固定的 NAT 服务器。独立安装，**不依赖、不修改、不重启 sing-box**。
+
+```sh
+curl -fSL https://raw.githubusercontent.com/3922510-creator/singbox/main/install-ddns.sh -o /tmp/install-cloudflare-ddns.sh && sudo sh /tmp/install-cloudflare-ddns.sh
+```
+
+已经是 root 时可以去掉 `sudo`。支持 Debian / Ubuntu / RHEL 系（systemd）与 Alpine（OpenRC）；依赖 Python 3、curl、CA 证书，不需要 pip 包。
+
+安装过程中输入：
+
+1. Cloudflare **API Token**：权限 `Zone / DNS / Edit` 和 `Zone / Zone / Read`，资源限制为对应域名，不用 Global API Key。
+2. **Zone ID**：Cloudflare 域名概述页面可查看。
+3. 目标完整域名，例如 `nat.example.com`。
+4. 入站 IP 来源，三选一：商家的动态域名、返回纯文本 IPv4 的 HTTPS 接口、已确认与入站相同的本机出口 IP。
+
+**重要：NAT 出口 IP 不一定是入站映射 IP。** 首选商家提供的动态域名或查询接口（JSON/鉴权接口目前不支持，需要按商家实际格式适配）。只有核实两者一致后才能选择出口查询；出口模式要求两个查询服务返回一致结果。不能确定 IP 来源时不要随便选出口模式。商家域名不能间接 CNAME 回目标域名，否则会形成自引用。
+
+脚本每 60 秒检查一次，变化后更新 A 记录并设为**仅 DNS（灰云）**、TTL 60 秒。首次写 DNS 前展示地址并要求确认；无变化不写入，获取失败保留原 DNS；不覆盖已有安装，遇到同名 CNAME 或多条 A 记录会拒绝。域名生效速度受 DNS 缓存影响，不保证一分钟内全球生效。不会改 AAAA，若目标域名已有 AAAA，请自行核对，避免客户端优先连接错误 IPv6。
+
+访问仍需带商家分配的**外部端口**，例如：
+
+```sh
+ssh -p 30001 root@nat.example.com
+```
+
+Token 仅在本机隐藏输入，存放于 `/etc/cloudflare-ddns/config.json`（目录 700、文件 600），不要发给别人或提交到 Git。安装后手动检查：
+
+```sh
+python3 /usr/local/lib/cloudflare-ddns.py --once
+```
+
+systemd 管理：
+
+```sh
+systemctl status cloudflare-ddns.timer
+journalctl -u cloudflare-ddns.service -n 30 --no-pager
+# 停用自动更新
+systemctl disable --now cloudflare-ddns.timer
+```
+
+Alpine / OpenRC 管理：
+
+```sh
+rc-service cloudflare-ddns status
+tail -n 30 /var/log/cloudflare-ddns.log
+# 停用自动更新
+rc-service cloudflare-ddns stop
+rc-update del cloudflare-ddns default
+```
+
+修改配置前先备份；systemd 下次执行会重读配置，OpenRC 需要 `rc-service cloudflare-ddns restart`。OpenRC 日志为本机文件，长期运行应纳入系统 logrotate。离线测试（不会访问 Cloudflare，也不会操作服务）：
+
+```sh
+python3 -m unittest discover -s tests -p 'test_ddns.py' -v
+```
