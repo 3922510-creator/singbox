@@ -1,5 +1,7 @@
 """Offline tests for the sh implementation; never touch host services or real DNS."""
 import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import os
 import pty
 from pathlib import Path
@@ -12,11 +14,12 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'ddns.sh'
 
 class DDNSTests(unittest.TestCase):
     def shell(self, body, expected=0):
-        env = dict(os.environ, DDNS_TEST_SOURCE='1')
         if 'menu' in body:
             body = "show_status() { printf '  首页模拟状态\\n'; }; " + body
-        result = subprocess.run(['sh', '-c', '. "$1"; ' + body, 'test', str(SCRIPT)],
-                                env=env, text=True, capture_output=True)
+        with tempfile.TemporaryDirectory() as state:
+            env = dict(os.environ, DDNS_TEST_SOURCE='1', DDNS_STATE=state)
+            result = subprocess.run(['sh', '-c', '. "$1"; ' + body, 'test', str(SCRIPT)],
+                                    env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result.stdout
 
@@ -67,11 +70,11 @@ printf '3\\nn\\n\\n0\\n' | menu''')
         self.assertNotIn('\x1b', output)
         self.assertIn('    1) 刷新首页状态\n    2) 公网 IP 交叉校验\n    3) 立即更新 DNS\n    4) 查看查询接口', output)
         self.assertLess(output.index('首页模拟状态'), output.index('1) 刷新首页状态'))
-        self.assertLessEqual(len(output.splitlines()), 24)
+        self.assertLessEqual(len(output.splitlines()), 26)
         self.assertEqual(output.count('Cloudflare DDNS'), 1)
 
     def test_status_translated(self):
-        output = self.shell('''load_config() { record=nat.example.com; source_mode=egress; zone_id=abc; }
+        output = self.shell('''load_config() { record=nat.example.com; source_mode=egress; zone_id=abc; bark_url=''; }
 detect_init() { init=systemd; }
 systemctl() { case "$*" in *--quiet*) return 0 ;; *) exit 9 ;; esac; }
 api() { echo '{"result":[{"type":"A","content":"8.8.8.8","proxied":false}]}'; }
@@ -196,7 +199,7 @@ api https://example.com >/dev/null''')
                     stub = bin_dir / name
                     stub.write_text('#!/bin/sh\n' + ('echo 0\n' if name == 'id' else 'exit 0\n'))
                     stub.chmod(0o755)
-                env = dict(os.environ, DDNS_TEST_SOURCE='1', PATH=str(bin_dir) + ':' + os.environ.get('PATH', os.defpath))
+                env = dict(os.environ, DDNS_TEST_SOURCE='1', DDNS_STATE=str(root / 'state'), PATH=str(bin_dir) + ':' + os.environ.get('PATH', os.defpath))
                 body = '''. "$0"
 api() { case "$*" in *--get*) echo '{"result":[]}' ;; *zones/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) echo '{"result":{"name":"example.com"}}' ;; *) echo '{"success":true}' ;; esac; }
 get_ip() { echo 8.8.8.8; }
@@ -213,6 +216,10 @@ install_ddns'''
                 self.assertTrue(installed.is_file())
                 self.assertEqual((root / 'usr/local/bin/ddns').resolve(), installed)
                 before = config.read_bytes()
+                if init == 'systemd':
+                    unit = root / 'etc/systemd/system/cloudflare-ddns.service'
+                    old_unit = unit.read_text().replace('--scheduled', '--once').replace('StateDirectory=cloudflare-ddns\n', '').replace('StateDirectoryMode=0700\n', '')
+                    unit.write_text(old_unit)
                 # Existing shell installations upgrade without re-entering the token.
                 result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
                                         input='y\n', capture_output=True)
@@ -227,6 +234,9 @@ install_ddns'''
                 self.assertEqual(len(list(installed.parent.glob('*.bak.*'))), 1)
                 if init == 'systemd':
                     self.assertTrue((root / 'etc/systemd/system/cloudflare-ddns.timer').is_file())
+                    self.assertIn('--scheduled', unit.read_text())
+                    self.assertEqual(unit.read_text().count('StateDirectory=cloudflare-ddns'), 1)
+                    self.assertEqual(len(list(unit.parent.glob('*.service.bak.*'))), 1)
                 else:
                     service = root / 'etc/init.d/cloudflare-ddns'
                     self.assertTrue(service.stat().st_mode & 0o111)
@@ -248,9 +258,122 @@ get_ip''').strip(), '8.8.8.8')
         self.assertEqual(output.count('首页模拟状态'), 2)
         self.assertNotIn('按回车返回', output)
 
+    def test_log_retains_only_last_ten(self):
+        output = self.shell('''init_state
+record=nat.example.com
+i=1
+while [ "$i" -le 15 ]; do record_change "8.8.8.$i" "1.1.1.$i"; i=$((i+1)); done
+show_changes
+[ "$(stat -c %a "$STATE/changes.log")" = 600 ]''')
+        lines = output.splitlines()
+        self.assertEqual(len(lines), 10)
+        self.assertTrue(lines[0].endswith('8.8.8.6 -> 1.1.1.6'))
+        self.assertTrue(lines[-1].endswith('8.8.8.15 -> 1.1.1.15'))
+
+    def test_only_successful_ip_changes_log_and_notify(self):
+        body = '''record=nat.example.com; zone_id=abc; bark_url=http://localhost:8080/test-key
+get_ip() { echo 8.8.8.8; }
+api() { if [ "$1" = --get ]; then printf '%s' 'FIXTURE'; else return 0; fi; }
+send_bark() { echo "PUSH:$*"; }
+update
+show_changes'''
+        for records in [[], [dict(type='A', content='8.8.8.8', proxied=False, id='id')],
+                        [dict(type='A', content='8.8.8.8', proxied=True, id='id')]]:
+            output = self.shell(body.replace('FIXTURE', json.dumps({'result': records})))
+            self.assertNotIn('PUSH:', output)
+            self.assertNotIn(' -> ', output)
+        output = self.shell(body.replace('FIXTURE', json.dumps({'result': [dict(type='A', content='1.1.1.1', proxied=False, id='id')]})))
+        self.assertIn('1.1.1.1 -> 8.8.8.8', output)
+        self.assertEqual(output.count('PUSH:'), 1)
+
+    def test_dns_failure_never_logs_or_notifies(self):
+        self.shell('''record=nat.example.com; zone_id=abc
+get_ip() { echo 8.8.8.8; }
+api() { if [ "$1" = --get ]; then echo '{"result":[{"type":"A","content":"1.1.1.1","proxied":false,"id":"id"}]}'; else return 1; fi; }
+record_change() { exit 9; }
+send_bark() { exit 9; }
+update''', expected=1)
+
+    def test_bark_url_and_response(self):
+        for url in ['https://api.day.app/key-123/', 'http://192.168.1.3:8080/key', 'https://bark.example.com/prefix/key']:
+            self.shell("validate_bark '" + url + "'")
+        for url in ['file:///etc/passwd', 'http://example.com', 'https://example.com/key?x=1', 'https://user:pass@example.com/key']:
+            self.shell("validate_bark '" + url + "'", expected=1)
+        body = '''bark_url=http://localhost:8080/test-secret
+curl() {
+  case "$*" in *test-secret*) exit 9 ;; esac
+  line=$(cat)
+  [ "$line" = 'url = "http://localhost:8080/test-secret"' ] || exit 8
+  echo '{"code":200}'
+}
+send_bark 'DDNS test' 'old -> new'
+'''
+        self.shell(body)
+        self.shell(body.replace('"code":200', '"code":400'), expected=1)
+        self.shell(body.replace("echo '{\"code\":200}'", 'return 1'), expected=1)
+
+    def test_save_bark_preserves_existing_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / 'config.json'
+            original = dict(token='test-token', zone_id='a' * 32, record='nat.example.com')
+            config.write_text(json.dumps(original))
+            config.chmod(0o600)
+            output = self.shell('CONFIG=' + str(config) + '; bark_url=http://localhost:8080/secret-key; save_bark')
+            self.assertNotIn('secret-key', output)
+            self.assertEqual(json.loads(config.read_text()), dict(original, bark_url='http://localhost:8080/secret-key'))
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(list(config.parent.glob('*.bak.*'))), 1)
+
+    def test_self_hosted_bark_http_roundtrip(self):
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"code":200,"message":"success"}')
+            def log_message(self, *_):
+                pass
+        # Port 0 allocates a free listener atomically; no production port or PID is touched.
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            self.shell('bark_url=http://127.0.0.1:' + str(server.server_port) + '/prefix/device-key; send_bark "DDNS 测试" "1.1.1.1 -> 8.8.8.8"')
+            self.assertEqual(received, [('/prefix/device-key', dict(title='DDNS 测试', body='1.1.1.1 -> 8.8.8.8', group='DDNS'))])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+    def test_notification_failure_does_not_undo_dns(self):
+        output = self.shell('''record=nat.example.com; zone_id=abc; bark_url=http://localhost:8080/key
+get_ip() { echo 8.8.8.8; }
+api() { if [ "$1" = --get ]; then echo '{"result":[{"type":"A","content":"1.1.1.1","proxied":false,"id":"id"}]}'; else return 0; fi; }
+send_bark() { return 1; }
+update
+show_changes''')
+        self.assertEqual(output.count('1.1.1.1 -> 8.8.8.8'), 1)
+
+    def test_test_notification_never_updates_dns(self):
+        output = self.shell('''load_config() { record=nat.example.com; bark_url=http://localhost:8080/key; }
+curl() { cat >/dev/null; echo '{"code":200}'; }
+api() { exit 9; }
+printf 'y\\n' | test_bark''')
+        self.assertIn('Bark 服务端已确认接收', output)
+        self.assertIn('请检查手机', output)
+
+    def test_active_lock_rejects_second_writer(self):
+        self.shell('''init_state
+mkdir "$STATE/update.lock"
+printf '%s\\n' "$$" > "$STATE/update.lock/pid"
+get_ip() { exit 9; }
+update''', expected=1)
+
     def test_service_syntax(self):
         text = SCRIPT.read_text()
-        self.assertIn('ExecStart=/bin/sh /usr/local/lib/cloudflare-ddns.sh --once', text)
+        self.assertIn('ExecStart=/bin/sh /usr/local/lib/cloudflare-ddns.sh --scheduled', text)
+        self.assertIn('StateDirectory=cloudflare-ddns', text)
         self.assertIn('command_args="/usr/local/lib/cloudflare-ddns.sh --daemon"', text)
         self.assertNotIn('ExecStart=/usr/bin/env python', text)
         subprocess.run(['sh', '-n', str(SCRIPT)], check=True)
