@@ -42,10 +42,42 @@ get_ip'''
 
     def test_egress_agreement(self):
         body = '''source_mode=egress
-fetch() { case "$1" in *ipify*) echo 8.8.8.8 ;; *) echo 1.1.1.1 ;; esac; }
+local_public_ip() { echo 8.8.8.8; }
+fetch() { case "$*" in *api.ip.sb/ip*) echo 1.1.1.1 ;; *) exit 9 ;; esac; }
 get_ip'''
         self.shell(body, expected=1)
         self.assertEqual(self.shell(body.replace('echo 1.1.1.1', 'echo 8.8.8.8')).strip(), '8.8.8.8')
+
+    def test_local_public_interface(self):
+        self.assertEqual(self.shell('''ip() { echo '1.1.1.1 via 8.8.4.1 dev eth0 src 8.8.8.8 uid 0'; }
+fetch() { exit 9; }
+local_public_ip''').strip(), '8.8.8.8')
+
+    def test_nat_local_public_fallback(self):
+        body = '''ip() { echo '1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.2 uid 0'; }
+fetch() { case "$*" in *'--noproxy * https://api4.ipify.org') echo 8.8.8.8 ;; *) exit 9 ;; esac; }
+local_public_ip'''
+        self.assertEqual(self.shell(body).strip(), '8.8.8.8')
+        self.shell(body.replace('echo 8.8.8.8', 'echo 10.0.0.1'), expected=1)
+
+    def test_ip_sb_failure_preserves_dns(self):
+        self.shell('''source_mode=egress
+local_public_ip() { echo 8.8.8.8; }
+fetch() { return 1; }
+api() { exit 9; }
+update''', expected=1)
+
+    def test_menu_continues_after_error(self):
+        output = self.shell('''id() { echo 0; }
+egress_ip() { fail 'mock query failed'; }
+printf '2\\n0\\n' | menu''')
+        self.assertEqual(output.count('Cloudflare DDNS'), 2)
+        self.assertIn('出口校验失败', output)
+
+    def test_menu_rejects_manual_update(self):
+        self.shell('''id() { echo 0; }
+update() { exit 9; }
+printf '3\\n否决\\n0\\n' | menu''')
 
     def update(self, records, expected=0):
         fixture = json.dumps({'success': True, 'result': records})
@@ -138,13 +170,48 @@ install_ddns'''
                 self.assertEqual(config.parent.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(json.loads(config.read_text())['token'], 'test-token')
                 self.assertNotIn('test-token', result.stdout + result.stderr)
-                self.assertTrue((root / 'usr/local/lib/cloudflare-ddns.sh').is_file())
+                installed = root / 'usr/local/lib/cloudflare-ddns.sh'
+                self.assertTrue(installed.is_file())
+                self.assertEqual((root / 'usr/local/bin/ddns').resolve(), installed)
+                before = config.read_bytes()
+                # Existing shell installations upgrade without re-entering the token.
+                result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
+                                        input='确认\n', capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(config.read_bytes(), before)
+                self.assertEqual(len(list(installed.parent.glob('*.bak.*'))), 1)
+                self.assertNotIn('test-token', result.stdout + result.stderr)
+                # Rejecting an upgrade must not create a backup or modify files.
+                result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
+                                        input='否决\n', capture_output=True)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(list(installed.parent.glob('*.bak.*'))), 1)
                 if init == 'systemd':
                     self.assertTrue((root / 'etc/systemd/system/cloudflare-ddns.timer').is_file())
                 else:
                     service = root / 'etc/init.d/cloudflare-ddns'
                     self.assertTrue(service.stat().st_mode & 0o111)
                     subprocess.run(['sh', '-n', str(service)], check=True)
+
+    def test_change_source_backup_and_cancel(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / 'config.json'
+            original = dict(token='test-token', zone_id='a' * 32, record='nat.example.com',
+                            source_mode='hostname', source='provider.example.com')
+            config.write_text(json.dumps(original))
+            config.chmod(0o600)
+            prefix = 'CONFIG=' + str(config) + '; get_ip() { echo 8.8.8.8; }; '
+            self.shell(prefix + "printf '3\\nYES\\n否决\\n' | change_source")
+            self.assertEqual(json.loads(config.read_text()), original)
+            self.assertEqual(len(list(config.parent.glob('*.bak.*'))), 0)
+            output = self.shell(prefix + "printf '3\\nYES\\n确认\\n' | change_source")
+            self.assertNotIn('test-token', output)
+            saved = json.loads(config.read_text())
+            self.assertEqual(saved, dict(original, source_mode='egress', source=''))
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            backup = list(config.parent.glob('*.bak.*'))
+            self.assertEqual(len(backup), 1)
+            self.assertEqual(json.loads(backup[0].read_text()), original)
 
     def test_service_syntax(self):
         text = SCRIPT.read_text()
