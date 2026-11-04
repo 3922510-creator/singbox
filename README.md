@@ -152,7 +152,7 @@ python3 -m unittest discover -s tests -v
 curl -fSL https://raw.githubusercontent.com/3922510-creator/singbox/main/install-ddns.sh -o /tmp/install-cloudflare-ddns.sh && sudo sh /tmp/install-cloudflare-ddns.sh
 ```
 
-已经是 root 时可以去掉 `sudo`。支持 Debian / Ubuntu / RHEL 系（systemd）与 Alpine（OpenRC）；依赖 Python 3、curl、CA 证书，不需要 pip 包。
+已经是 root 时可以去掉 `sudo`。支持 Debian / Ubuntu / RHEL 系（systemd）与 Alpine（OpenRC）；仅依赖 `sh`、`curl`、`jq` 和 CA 证书，不需要 Python。
 
 安装过程中输入：
 
@@ -161,7 +161,7 @@ curl -fSL https://raw.githubusercontent.com/3922510-creator/singbox/main/install
 3. 目标完整域名，例如 `nat.example.com`。
 4. 入站 IP 来源，三选一：商家的动态域名、返回纯文本 IPv4 的 HTTPS 接口、已确认与入站相同的本机出口 IP。
 
-**重要：NAT 出口 IP 不一定是入站映射 IP。** 首选商家提供的动态域名或查询接口（JSON/鉴权接口目前不支持，需要按商家实际格式适配）。只有核实两者一致后才能选择出口查询；出口模式要求两个查询服务返回一致结果。不能确定 IP 来源时不要随便选出口模式。商家域名不能间接 CNAME 回目标域名，否则会形成自引用。
+**重要：NAT 出口 IP 不一定是入站映射 IP。** 首选商家提供的动态域名或查询接口（JSON/鉴权接口目前不支持，需要按商家实际格式适配）。只有核实两者一致后才能选择出口查询；出口模式要求两个查询服务返回一致结果。不能确定 IP 来源时不要随便选出口模式。商家域名通过 Cloudflare DNS-over-HTTPS 查询，不需要另装 dig；来源域名不能间接 CNAME 回目标域名，否则会形成自引用。
 
 脚本每 60 秒检查一次，变化后更新 A 记录并设为**仅 DNS（灰云）**、TTL 60 秒。首次写 DNS 前展示地址并要求确认；无变化不写入，获取失败保留原 DNS；不覆盖已有安装，遇到同名 CNAME 或多条 A 记录会拒绝。域名生效速度受 DNS 缓存影响，不保证一分钟内全球生效。不会改 AAAA，若目标域名已有 AAAA，请自行核对，避免客户端优先连接错误 IPv6。
 
@@ -174,7 +174,7 @@ ssh -p 30001 root@nat.example.com
 Token 仅在本机隐藏输入，存放于 `/etc/cloudflare-ddns/config.json`（目录 700、文件 600），不要发给别人或提交到 Git。安装后手动检查：
 
 ```sh
-python3 /usr/local/lib/cloudflare-ddns.py --once
+sh /usr/local/lib/cloudflare-ddns.sh --once
 ```
 
 systemd 管理：
@@ -196,7 +196,7 @@ rc-service cloudflare-ddns stop
 rc-update del cloudflare-ddns default
 ```
 
-修改配置前先备份；systemd 下次执行会重读配置，OpenRC 需要 `rc-service cloudflare-ddns restart`。OpenRC 日志为本机文件，长期运行应纳入系统 logrotate。离线测试（不会访问 Cloudflare，也不会操作服务）：
+修改配置前先备份；systemd / OpenRC 均会在下次检查时重新读取配置。此安装器不会覆盖旧版 Python 安装，已装旧版的机器需先停用旧服务并备份、迁移，不会自动卸载系统 Python。OpenRC 日志为本机文件，长期运行应纳入系统 logrotate。离线测试（不会访问 Cloudflare，也不会操作服务）：
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_ddns.py' -v
