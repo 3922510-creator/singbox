@@ -112,6 +112,10 @@ update() {
     printf '%s 已更新为 %s（仅 DNS）\n' "$record" "$ip"
 }
 ask() { printf '%s' "$1"; IFS= read -r answer || exit 1; }
+confirm() {
+    ask "$1 [y/N]："
+    case "$answer" in y|Y) return 0 ;; *) return 1 ;; esac
+}
 detect_init() {
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then init=systemd
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then init=openrc
@@ -124,8 +128,7 @@ select_source() {
         1) source_mode=hostname; ask '商家动态域名：'; source=$answer ;;
         2) source_mode=url; ask 'HTTPS 查询接口：'; source=$answer ;;
         3) source_mode=egress; source=''
-           ask '必须确认出口 IP 等于入站映射 IP。确认请输入 YES：'
-           [ "$answer" = YES ] || fail '未确认，不使用出口 IP' ;;
+           confirm '出口 IP 已核实等于入站映射 IP？' || fail '未确认，不使用出口 IP' ;;
         *) fail '无效选择' ;;
     esac
     validate
@@ -148,7 +151,7 @@ upgrade_ddns() {
     fi
     printf '%s\n' '将备份并升级 DDNS 脚本，保留域名、Token、IP 来源和自启设置，添加 ddns 菜单。'
     [ "$init" != openrc ] || printf '%s\n' 'OpenRC 会重启 DDNS 服务以加载新脚本（不影响 sing-box / SSH）。'
-    ask '确认执行升级？回复 确认 / 否决：'; [ "$answer" = 确认 ] || fail '已取消'
+    confirm '升级 DDNS 脚本？' || fail '已取消'
     sh -n "$0" || return 1
     umask 077
     backup="${SELF}.bak.$(date +%Y%m%d-%H%M%S).$$"
@@ -186,7 +189,7 @@ install_ddns() {
     case "$record" in "$zone_name"|*."$zone_name") ;; *) fail '目标域名不属于此 Zone' ;; esac
     ip=$(get_ip) || exit 1
     printf '将把 %s 更新为 %s，灰云，每 60 秒检查。不会改端口或 AAAA。\n' "$record" "$ip"
-    ask '确认安装并修改 DNS？请输入 YES：'; [ "$answer" = YES ] || fail '已取消'
+    confirm '安装并修改 DNS？' || fail '已取消'
     update || exit 1
     umask 077
     mkdir /etc/cloudflare-ddns
@@ -246,22 +249,27 @@ UNIT
 show_status() {
     load_config || return 1
     detect_init
-    printf '目标域名：%s\nIP 来源：%s\n' "$record" "$source_mode"
+    printf '  目标域名 : %s\n  IP 来源  : %s\n' "$record" "$(source_label)"
     if [ "$init" = systemd ]; then
-        systemctl is-enabled cloudflare-ddns.timer || :
-        systemctl is-active cloudflare-ddns.timer || :
+        if systemctl is-enabled --quiet cloudflare-ddns.timer; then enabled_text=已开启; else enabled_text=已关闭; fi
+        if systemctl is-active --quiet cloudflare-ddns.timer; then active_text=运行中; else active_text=未运行; fi
+        printf '  开机自启 : %s\n  定时检查 : %s\n' "$enabled_text" "$active_text"
     else
-        rc-service cloudflare-ddns status || :
+        if rc-service cloudflare-ddns status >/dev/null 2>&1; then active_text=运行中; else active_text=未运行; fi
+        printf '  定时检查 : %s\n' "$active_text"
     fi
     response=$(api --get --data-urlencode "name=$record" "$API/zones/$zone_id/dns_records") || return 1
-    printf '%s' "$response" | jq -r '.result[] | select(.type == "A") | "Cloudflare A：\(.content)  橙云：\(.proxied)"'
+    printf '%s' "$response" | jq -r '
+      [.result[] | select(.type == "A")] |
+      if length == 0 then "  解析地址 : 尚无 A 记录"
+      else .[] | "  解析地址 : \(.content)\n  代理状态 : \(if .proxied then "橙云代理" else "仅 DNS（灰云）" end)" end'
 }
 change_source() {
     load_config || return 1
     select_source
     ip=$(get_ip) || return 1
     printf '新的 IP 来源：%s；当前查询值：%s。保存后下次自动检查生效。\n' "$source_mode" "$ip"
-    ask '确认修改 IP 来源？回复 确认 / 否决：'; [ "$answer" = 确认 ] || return 0
+    confirm '保存新的 IP 来源？' || return 0
     [ ! -L "$CONFIG" ] || fail '配置不能是符号链接'
     umask 077
     backup="$CONFIG.bak.$(date +%Y%m%d-%H%M%S).$$"
@@ -276,7 +284,8 @@ change_source() {
 }
 service_action() {
     detect_init
-    ask '确认更改 DDNS 自动更新状态？回复 确认 / 否决：'; [ "$answer" = 确认 ] || return 0
+    case "$1" in enable) action_text=开启 ;; disable) action_text=关闭 ;; esac
+    confirm "${action_text} DDNS 自动更新？" || return 0
     if [ "$init" = systemd ]; then
         case "$1" in
             enable) systemctl enable --now cloudflare-ddns.timer ;;
@@ -289,17 +298,73 @@ service_action() {
         esac
     fi
 }
+source_label() {
+    case "$source_mode" in
+        egress) printf '%s' '本机公网 + ip.sb' ;;
+        hostname) printf '%s' '商家动态域名' ;;
+        url) printf '%s' 'HTTPS 查询接口' ;;
+    esac
+}
+ui_rule() {
+    ui_width=${COLUMNS:-0}
+    case "$ui_width" in ''|*[!0-9]*) ui_width=0 ;; esac
+    if [ "$ui_width" -eq 0 ]; then
+        ui_width=$(stty size 2>/dev/null | awk '{print $2}') || ui_width=''
+    fi
+    case "$ui_width" in ''|*[!0-9]*) ui_width=44 ;; esac
+    [ "$ui_width" -le 54 ] || ui_width=54
+    [ "$ui_width" -ge 8 ] || ui_width=8
+    ui_line=''; ui_i=2
+    while [ "$ui_i" -lt "$ui_width" ]; do ui_line="${ui_line}─"; ui_i=$((ui_i + 1)); done
+    printf '  %s\n' "$ui_line"
+}
+ui_clear() {
+    # No clear/tput dependency; leave redirected logs free of control characters.
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[H\033[2J'; fi
+}
+ui_header() {
+    ui_clear
+    printf '\n'
+    ui_rule
+    printf '  Cloudflare DDNS 管理面板\n  IPv4 动态解析 · 每 60 秒检查\n'
+    ui_rule
+}
+menu_option() { printf '    %s) %s\n' "$1" "$2"; }
+menu_pause() { printf '\n  按回车返回菜单...'; IFS= read -r answer || return 1; }
 menu() {
     [ "$(id -u)" = 0 ] || fail '请用 root 打开管理菜单'
     while :; do
-        printf '\n%s\n' 'Cloudflare DDNS' '1. 查看状态和当前 A 记录' '2. 检测本机公网 IP（与 ip.sb 比对）' '3. 立即更新 DNS' '4. 修改 IP 来源' '5. 查看日志' '6. 开启自动更新' '7. 关闭自动更新' '0. 退出'
-        ask '选择：'
+        ui_header
+        printf '\n  解析管理\n'
+        menu_option 1 '状态与解析记录'
+        menu_option 2 '公网 IP 交叉校验'
+        menu_option 3 '立即更新 DNS'
+        menu_option 4 '修改 IP 来源'
+        printf '\n  运行与服务\n'
+        menu_option 5 '查看运行日志'
+        menu_option 6 '开启自动更新'
+        menu_option 7 '关闭自动更新'
+        printf '\n'
+        menu_option 0 '退出脚本'
+        printf '\n'
+        ask '  请选择 [0-7]：'
+        case "$answer" in 0) return ;; esac
+        ui_clear
+        printf '\n'
+        ui_rule
+        case "$answer" in
+            1) printf '  状态与解析记录\n' ;; 2) printf '  公网 IP 交叉校验\n' ;;
+            3) printf '  立即更新 DNS\n' ;; 4) printf '  修改 IP 来源\n' ;;
+            5) printf '  运行日志\n' ;; 6|7) printf '  自动更新设置\n' ;;
+            *) printf '  提示\n' ;;
+        esac
+        ui_rule
+        printf '\n'
         # Separate processes isolate fatal errors; a failed query must not close the menu.
         case "$answer" in
             1) (show_status) && : || printf '%s\n' '状态查询失败' ;;
             2) (egress_ip) && : || printf '%s\n' '出口校验失败，不修改 DNS' ;;
-            3) ask '确认立即更新 DNS？回复 确认 / 否决：'
-               if [ "$answer" = 确认 ]; then (load_config || exit 1; update) && : || printf '%s\n' '更新失败'; fi ;;
+            3) if confirm '立即更新 DNS？'; then (load_config || exit 1; update) && : || printf '%s\n' '更新失败'; fi ;;
             4) (change_source) && : || printf '%s\n' '配置未完成修改' ;;
             5) (detect_init
                 if [ "$init" = systemd ]; then journalctl -u cloudflare-ddns.service -n 30 --no-pager
@@ -307,8 +372,9 @@ menu() {
             6) (service_action enable) && : || printf '%s\n' '操作失败' ;;
             7) (service_action disable) && : || printf '%s\n' '操作失败' ;;
             0) return ;;
-            *) printf '%s\n' '无效选择' ;;
+            *) printf '%s\n' '  无效选择，请输入 0-7' ;;
         esac
+        menu_pause || return 0
     done
 }
 main() {

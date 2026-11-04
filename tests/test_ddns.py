@@ -1,6 +1,7 @@
 """Offline tests for the sh implementation; never touch host services or real DNS."""
 import json
 import os
+import pty
 from pathlib import Path
 import subprocess
 import tempfile
@@ -70,14 +71,69 @@ update''', expected=1)
     def test_menu_continues_after_error(self):
         output = self.shell('''id() { echo 0; }
 egress_ip() { fail 'mock query failed'; }
-printf '2\\n0\\n' | menu''')
+printf '2\\n\\n0\\n' | menu''')
         self.assertEqual(output.count('Cloudflare DDNS'), 2)
         self.assertIn('出口校验失败', output)
 
     def test_menu_rejects_manual_update(self):
         self.shell('''id() { echo 0; }
 update() { exit 9; }
-printf '3\\n否决\\n0\\n' | menu''')
+printf '3\\nn\\n\\n0\\n' | menu''')
+
+    def test_menu_compact_order_and_no_escapes_in_pipe(self):
+        output = self.shell("id() { echo 0; }; printf '0\\n' | menu")
+        self.assertNotIn('\x1b', output)
+        self.assertIn('    1) 状态与解析记录\n    2) 公网 IP 交叉校验\n    3) 立即更新 DNS\n    4) 修改 IP 来源', output)
+        self.assertLessEqual(len(output.splitlines()), 24)
+        self.assertEqual(output.count('Cloudflare DDNS'), 1)
+
+    def test_status_translated(self):
+        output = self.shell('''load_config() { record=nat.example.com; source_mode=egress; zone_id=abc; }
+detect_init() { init=systemd; }
+systemctl() { case "$*" in *--quiet*) return 0 ;; *) exit 9 ;; esac; }
+api() { echo '{"result":[{"type":"A","content":"8.8.8.8","proxied":false}]}'; }
+show_status''')
+        for label in ['本机公网 + ip.sb', '已开启', '运行中', '仅 DNS（灰云）', '8.8.8.8']:
+            self.assertIn(label, output)
+        for raw in ['egress', 'false', 'active', 'enabled']:
+            self.assertNotIn(raw, output)
+
+    def test_confirm_y_and_default_no(self):
+        for value in ['y', 'Y']:
+            self.shell("printf '%s\\n' '" + value + "' | confirm '测试'")
+        for value in ['', 'n', 'N', 'yes', '确认', '1']:
+            self.shell("printf '%s\\n' '" + value + "' | confirm '测试'", expected=1)
+
+    def test_terminal_clear_and_compact_menu(self):
+        master, slave = pty.openpty()
+        try:
+            env = dict(os.environ, DDNS_TEST_SOURCE='1', TERM='xterm', COLUMNS='40')
+            process = subprocess.Popen(['sh', '-c', '. "$1"; id() { echo 0; }; printf "0\\n" | menu',
+                                        'test', str(SCRIPT)], env=env, stdout=slave, stderr=slave)
+            os.close(slave)
+            slave = None
+            process.wait(timeout=5)
+            chunks = []
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            output = b''.join(chunks).decode()
+            self.assertEqual(process.returncode, 0, output)
+            self.assertIn('\x1b[H\x1b[2J', output)
+            self.assertIn('1) 状态与解析记录\r\n    2)', output)
+        finally:
+            if slave is not None:
+                os.close(slave)
+            os.close(master)
+
+    def test_menu_rule_fits_phone(self):
+        output = self.shell('COLUMNS=36; ui_rule')
+        self.assertEqual(len(output.rstrip('\n')), 36)
 
     def update(self, records, expected=0):
         fixture = json.dumps({'success': True, 'result': records})
@@ -163,7 +219,7 @@ api() { case "$*" in *--get*) echo '{"result":[]}' ;; *zones/aaaaaaaaaaaaaaaaaaa
 get_ip() { echo 8.8.8.8; }
 install_ddns'''
                 result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
-                                        input='test-token\n' + 'a' * 32 + '\nnat.example.com\n1\nprovider.example.com\nYES\n', capture_output=True)
+                                        input='test-token\n' + 'a' * 32 + '\nnat.example.com\n1\nprovider.example.com\ny\n', capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 config = root / 'etc/cloudflare-ddns/config.json'
                 self.assertEqual(config.stat().st_mode & 0o777, 0o600)
@@ -176,14 +232,14 @@ install_ddns'''
                 before = config.read_bytes()
                 # Existing shell installations upgrade without re-entering the token.
                 result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
-                                        input='确认\n', capture_output=True)
+                                        input='y\n', capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(config.read_bytes(), before)
                 self.assertEqual(len(list(installed.parent.glob('*.bak.*'))), 1)
                 self.assertNotIn('test-token', result.stdout + result.stderr)
                 # Rejecting an upgrade must not create a backup or modify files.
                 result = subprocess.run(['sh', '-c', body, str(script)], env=env, text=True,
-                                        input='否决\n', capture_output=True)
+                                        input='n\n', capture_output=True)
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(len(list(installed.parent.glob('*.bak.*'))), 1)
                 if init == 'systemd':
@@ -201,10 +257,10 @@ install_ddns'''
             config.write_text(json.dumps(original))
             config.chmod(0o600)
             prefix = 'CONFIG=' + str(config) + '; get_ip() { echo 8.8.8.8; }; '
-            self.shell(prefix + "printf '3\\nYES\\n否决\\n' | change_source")
+            self.shell(prefix + "printf '3\\ny\\nn\\n' | change_source")
             self.assertEqual(json.loads(config.read_text()), original)
             self.assertEqual(len(list(config.parent.glob('*.bak.*'))), 0)
-            output = self.shell(prefix + "printf '3\\nYES\\n确认\\n' | change_source")
+            output = self.shell(prefix + "printf '3\\ny\\ny\\n' | change_source")
             self.assertNotIn('test-token', output)
             saved = json.loads(config.read_text())
             self.assertEqual(saved, dict(original, source_mode='egress', source=''))
