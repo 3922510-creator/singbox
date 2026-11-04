@@ -70,18 +70,20 @@ show_changes() {
     else printf '%s\n' '  暂无 IP 更换记录（只保留最近 10 条）'; fi
 }
 validate_bark() {
-    # Only the base push URL (server/device_key), never title/body or query parameters.
-    printf '%s' "$1" | jq -Re 'test("^https?://[^/?#[:space:]@]+(/[A-Za-z0-9_.~%-]+)+/?$") and
-        (contains("\\\"") | not) and (contains("\\\\") | not)' >/dev/null
+    # Optional user:password@ is handled by curl as Basic Auth, over the same URL.
+    # Reject quotes, backslashes and controls before feeding the URL to curl's config.
+    printf '%s' "$1" | jq -Rse 'test("^https?://([^/?#[:space:]@]+:[^/?#[:space:]@]*@)?[^/?#[:space:]@]+(/[A-Za-z0-9_.~%-]+)+/?$") and
+        (contains("\"") | not) and (contains("\\") | not) and
+        (test("[[:cntrl:]]") | not)' >/dev/null
 }
 send_bark() {
     [ -n "${bark_url:-}" ] || return 0
     validate_bark "$bark_url" || { printf '%s\n' 'Bark 链接格式无效' >&2; return 1; }
     payload=$(jq -nc --arg title "$1" --arg body "$2" '{title:$title,body:$body,group:"DDNS"}') || return 1
-    # The device key stays out of argv and error messages.
+    # The device key and Basic Auth credentials stay out of argv and error messages.
     notify_response=$(printf 'url = "%s"\n' "${bark_url%/}" |
         curl -fsS --noproxy '*' --proto '=http,https' --connect-timeout 10 --max-time 25 \
-            --config - -X POST -H 'Content-Type: application/json' --data "$payload" 2>/dev/null) || {
+            --config - --basic -X POST -H 'Content-Type: application/json' --data "$payload" 2>/dev/null) || {
         printf '%s\n' 'Bark 请求失败（网络、证书或 HTTP 错误）' >&2; return 1;
     }
     printf '%s' "$notify_response" | jq -e '.code == 200' >/dev/null 2>&1 || {
@@ -176,7 +178,7 @@ save_bark() (
 )
 configure_bark() {
     load_config || return 1
-    printf '%s\n' '  填自建或官方 Bark 基础推送链接：' '  http(s)://服务器[:端口]/[反代前缀/]设备Key' '  不要带标题、正文或查询参数；留空关闭通知。' '  链接隐藏输入，不会显示或写入日志。'
+    printf '%s\n' '  填自建或官方 Bark 基础推送链接：' '  http(s)://[用户名:密码@]服务器[:端口]/[反代前缀/]设备Key' '  不要带标题、正文或查询参数；留空关闭通知。' '  链接隐藏输入，不会显示或写入日志。'
     tty_state=$(stty -g) || return 1
     trap 'stty "$tty_state"' EXIT
     trap 'exit 1' HUP INT TERM

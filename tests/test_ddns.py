@@ -1,5 +1,6 @@
 """Offline tests for the sh implementation; never touch host services or real DNS."""
 import json
+import base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import os
@@ -295,9 +296,14 @@ send_bark() { exit 9; }
 update''', expected=1)
 
     def test_bark_url_and_response(self):
-        for url in ['https://api.day.app/key-123/', 'http://192.168.1.3:8080/key', 'https://bark.example.com/prefix/key']:
+        for url in ['https://api.day.app/key-123/', 'http://192.168.1.3:8080/key', 'https://bark.example.com/prefix/key',
+                    'https://test-user:test-pass@bark.example.com/key',
+                    'http://test-user:p%40ss%3Aword@localhost:8080/prefix/key']:
             self.shell("validate_bark '" + url + "'")
-        for url in ['file:///etc/passwd', 'http://example.com', 'https://example.com/key?x=1', 'https://user:pass@example.com/key']:
+        for url in ['file:///etc/passwd', 'http://example.com', 'https://example.com/key?x=1',
+                    'https://user@example.com/key', 'https://user:p@ss@example.com/key',
+                    'https://user:pa"ss@example.com/key', r'https://user:pa\\ss@example.com/key',
+                    'https://example.com/key\n']:
             self.shell("validate_bark '" + url + "'", expected=1)
         body = '''bark_url=http://localhost:8080/test-secret
 curl() {
@@ -345,6 +351,44 @@ send_bark 'DDNS test' 'old -> new'
             server.shutdown()
             server.server_close()
             worker.join(timeout=5)
+
+    def test_basic_auth_self_hosted_roundtrip(self):
+        received = []
+        expected = 'Basic ' + base64.b64encode(b'test-user:p@ss:word').decode()
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                auth = self.headers.get('Authorization')
+                received.append((self.path, auth))
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                ok = auth == expected
+                self.send_response(200 if ok else 401)
+                self.end_headers()
+                self.wfile.write(b'{"code":200}' if ok else b'{"code":401}')
+            def log_message(self, *_):
+                pass
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            url = 'http://test-user:p%40ss%3Aword@127.0.0.1:' + str(server.server_port) + '/prefix/device-key'
+            self.shell('bark_url=' + url + '; send_bark "DDNS test" "test body"')
+            self.assertEqual(received[0], ('/prefix/device-key', expected))
+            self.shell('bark_url=' + url.replace('p%40ss%3Aword', 'wrong-pass') + '; send_bark "test" "test"', expected=1)
+            self.assertEqual(len(received), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+    def test_basic_auth_credentials_stay_out_of_argv(self):
+        self.shell('''bark_url=https://test-user:test-password@example.com/device-key
+curl() {
+  case "$*" in *test-user*|*test-password*|*device-key*) exit 9 ;; esac
+  line=$(cat)
+  [ "$line" = 'url = "https://test-user:test-password@example.com/device-key"' ] || exit 8
+  echo '{"code":200}'
+}
+send_bark 'test' 'test' ''')
 
     def test_notification_failure_does_not_undo_dns(self):
         output = self.shell('''record=nat.example.com; zone_id=abc; bark_url=http://localhost:8080/key

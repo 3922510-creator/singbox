@@ -216,9 +216,10 @@ sh /usr/local/lib/cloudflare-ddns.sh --once
 https://api.day.app/你的设备Key
 http://192.168.1.3:8080/你的设备Key
 https://bark.example.com/反代前缀/你的设备Key
+https://用户名:密码@bark.example.com/你的设备Key
 ```
 
-支持 HTTP / HTTPS、自建端口和反代前缀，**不要附推送标题、正文或查询参数**。HTTP 会明文传输设备 Key，跨公网建议 HTTPS；URL 不出现在进程参数、换 IP 日志或首页。菜单 `8` 留空后确认可以关闭通知。
+支持 HTTP / HTTPS、自建端口、反代前缀和 URL 内的 **HTTP Basic Auth（`用户名:密码@`）**，无需再填写鉴权字段。用户名或密码包含 `@`、`/`、`#` 等保留字符时须使用 URL 百分号编码。**不要附推送标题、正文或查询参数**。HTTP 会明文传输设备 Key，跨公网建议 HTTPS；URL 不出现在进程参数、换 IP 日志或首页。菜单 `8` 留空后确认可以关闭通知。
 
 成功换 IP 后以 JSON POST 发送域名和 `原 IP -> 现 IP`，不变更 DNS 时不推送。菜单 `9` 发送测试通知，严格检查 HTTP 成功和 Bark JSON `code=200`，不修改 DNS、不写换 IP 日志。显示成功只代表 Bark 服务端确认接收，手机是否实际收到还需自行核对。通知失败不会回滚已成功的 DNS 更新，也不自动重复推送，可用菜单 `9` 检查连接。
 
