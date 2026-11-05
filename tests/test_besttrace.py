@@ -45,7 +45,7 @@ assert_clean() {
 
     def test_cancel_and_eof_do_not_download(self):
         self.run_shell(r'''
-for answer in 否决 y ''; do
+for answer in n N 确认 yes ''; do
     besttrace_check <<< "$answer"
 done
 besttrace_check < /dev/null
@@ -59,7 +59,7 @@ exec 200>"$ROOT/lock"
 PAYLOAD='[[ ! -e /proc/$$/fd/200 ]] || exit 91
 printf "ran\n" > "$MARKER"
 exit 0'
-besttrace_check <<< 确认
+besttrace_check <<< Y
 [[ $(cat "$MARKER") == ran ]]
 [[ -e /proc/$$/fd/200 ]]
 grep -Fxq -- '--proto' "$ROOT/curl-args"
@@ -72,7 +72,7 @@ assert_clean
         self.run_shell(r'''
 DOWNLOAD_RC=22
 rc=0
-besttrace_check <<< 确认 || rc=$?
+besttrace_check <<< y || rc=$?
 [[ "$rc" == 1 && ! -e "$MARKER" ]]
 assert_clean
 ''')
@@ -81,7 +81,7 @@ assert_clean
         self.run_shell(r'''
 for PAYLOAD in '' '<html>error</html>' 'if then'; do
     rc=0
-    besttrace_check <<< 确认 || rc=$?
+    besttrace_check <<< y || rc=$?
     [[ "$rc" == 1 && ! -e "$MARKER" ]]
     assert_clean
 done
@@ -91,7 +91,7 @@ done
         output = self.run_shell(r'''
 PAYLOAD='exit 17'
 rc=0
-besttrace_check <<< 确认 || rc=$?
+besttrace_check <<< y || rc=$?
 [[ "$rc" == 17 ]]
 assert_clean
 printf 'parent-alive\n'

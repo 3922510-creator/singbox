@@ -1311,8 +1311,8 @@ besttrace_check() {
     echo "支持电信 / 联通 / 移动 / 教育网，线路识别结果仅供参考。"
     echo -e "${YELLOW}将以 root 权限下载并运行 https://besttrace.sh/ 的第三方脚本。${PLAIN}"
     echo "首次运行可能由上游下载并安装 NextTrace；不会主动修改 sing-box 配置。"
-    read -rp "确认执行第三方脚本及其可能的 NextTrace 安装？回复 确认 / 否决: " answer || return 0
-    [[ "$answer" == "确认" ]] || return 0
+    read -rp "运行第三方脚本（可能安装 NextTrace）？[y/N]: " answer || return 0
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
     (
         # 不让上游安装器启动的后台进程继承面板锁。
         exec 200>&-
