@@ -1304,6 +1304,41 @@ media_check_full() {
     bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh)
 }
 
+# BestTrace 保持独立子进程，避免上游的变量、exit 和 trap 影响面板。
+besttrace_check() {
+    local answer rc tmp
+    echo -e "${CYAN}=== 回程路由测试（BestTrace.sh）===${PLAIN}"
+    echo "支持电信 / 联通 / 移动 / 教育网，线路识别结果仅供参考。"
+    echo -e "${YELLOW}将以 root 权限下载并运行 https://besttrace.sh/ 的第三方脚本。${PLAIN}"
+    echo "首次运行可能由上游下载并安装 NextTrace；不会主动修改 sing-box 配置。"
+    read -rp "确认执行第三方脚本及其可能的 NextTrace 安装？回复 确认 / 否决: " answer || return 0
+    [[ "$answer" == "确认" ]] || return 0
+    (
+        # 不让上游安装器启动的后台进程继承面板锁。
+        exec 200>&-
+        tmp=$(mktemp -d) || exit 1
+        trap 'rm -rf -- "$tmp"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        if ! curl --proto '=https' --proto-redir '=https' -fSL \
+            --connect-timeout 15 --max-time 120 --retry 2 \
+            https://besttrace.sh/ -o "$tmp/besttrace.sh"; then
+            echo -e "${RED}BestTrace 下载失败，未执行。${PLAIN}" >&2
+            exit 1
+        fi
+        if [[ ! -s "$tmp/besttrace.sh" ]] || ! bash -n "$tmp/besttrace.sh"; then
+            echo -e "${RED}BestTrace 内容为空或语法检查失败，未执行。${PLAIN}" >&2
+            exit 1
+        fi
+        bash "$tmp/besttrace.sh"
+    )
+    rc=$?
+    if (( rc != 0 )); then
+        echo -e "${YELLOW}BestTrace 未正常完成（退出码 ${rc}），已返回面板。${PLAIN}"
+    fi
+    return "$rc"
+}
+
 # ---------- DNS 设置 ----------
 DNS_BACKUP="$META_DIR/resolv.conf.bak"
 
@@ -1879,16 +1914,18 @@ menu_tools() {
         menu_section "网络检测"
         menu_option 1 "流媒体解锁检测（快速）"
         menu_option 2 "流媒体解锁检测（完整社区脚本）"
+        menu_option 7 "回程路由测试（BestTrace / 三网及教育网）"
         menu_section "系统网络"
         menu_option 3 "DNS 设置"
         menu_option 4 "防火墙设置（ufw）"
         menu_option 5 "网络加速（BBR / BBRv3 + fq）"
         menu_option 6 "Swap 管理（添加 / 删除）"
         menu_back
-        read_menu_choice "请选择 [0-6]"; c="$REPLY"
+        read_menu_choice "请选择 [0-7]"; c="$REPLY"
         case "$c" in
             1) media_check_quick; pause ;; 2) media_check_full; pause ;;
-            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 6) menu_swap ;; 0) return ;;
+            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 6) menu_swap ;;
+            7) besttrace_check; pause ;; 0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
     done
