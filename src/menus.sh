@@ -5,9 +5,10 @@ menu_add() {
         menu_header '搭建 / 添加节点' '端口可自定义；Argo 还需填写路径、域名、Tunnel Token'
         menu_option 1 'VLESS Reality（推荐，无需域名）'
         menu_option 2 'AnyTLS Reality'
-        menu_option 3 'Argo 隧道节点（VLESS + WS + TLS）'; menu_back
+        menu_option 3 'Argo 隧道节点（VLESS + WS + TLS）'
+        menu_option 4 '清理旧版并重新搭建（旧节点失效）'; menu_back
         read_menu_choice; choice="$REPLY"
-        case "$choice" in 1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;; 0) return ;; esac
+        case "$choice" in 1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;; 4) legacy_reinstall ;; 0) return ;; esac
         pause
     done
 }
@@ -122,12 +123,13 @@ menu_system() {
         menu_option 1 '安装 / 更新核心'; menu_option 2 '启动 sing-box'; menu_option 3 '停止 sing-box'
         menu_option 4 '重启 sing-box'; menu_option 5 '查看核心版本'; menu_option 6 'Argo 隧道服务'
         menu_option 7 '卸载核心与服务（保留配置和备份）'; menu_option 8 '安装必要依赖'
-        menu_option 9 '安装二维码工具（可选）'; menu_back
+        menu_option 9 '安装二维码工具（可选）'
+        menu_option 10 '清理旧版并重新搭建（旧节点失效）'; menu_back
         read_menu_choice; choice="$REPLY"
         case "$choice" in
             1) install_singbox ;; 2) service_action start ;; 3) service_action stop ;; 4) service_action restart ;;
             5) [ ! -x "$BIN_FILE" ] || "$BIN_FILE" version ;; 6) menu_argo ;; 7) uninstall_singbox ;;
-            8) install_dependencies ;; 9) install_qrencode ;; 0) return ;;
+            8) install_dependencies ;; 9) install_qrencode ;; 10) legacy_reinstall ;; 0) return ;;
         esac
         pause
     done

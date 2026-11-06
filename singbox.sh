@@ -2,7 +2,7 @@
 # Sing-box 管理面板 v4。源文件在 src/，tools/build.py 生成单文件分发。
 # 不迁移 v3 或接管未知服务。打开菜单不安装依赖、不写配置、不更新服务定义。
 set -o pipefail
-SCRIPT_VERSION="v4.0.0"
+SCRIPT_VERSION="v4.0.1"
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'
 CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'
 CONFIG_DIR="/etc/sing-box"
@@ -555,6 +555,139 @@ backup_system_file() {
     directory=$(mktemp -d "$BACKUP_DIR/system-XXXXXX") || return 1
     cp -p "$path" "$directory/$(basename "$path")" || return 1
     printf '系统配置备份：%s\n' "$directory"
+}
+
+# shellcheck shell=bash
+# ==================== 显式清理 v3；绝不在启动时自动执行 ====================
+LEGACY_PANEL="/usr/local/bin/sb"
+LEGACY_ALIAS="/usr/local/bin/SB"
+LEGACY_COPY="/root/singbox.sh"
+
+legacy_script_owned() {
+    [ -f "$1" ] && [ ! -L "$1" ] &&
+        grep -Fq 'Sing-box 管理面板' "$1" &&
+        grep -Eq '^SCRIPT_VERSION="v3\.[0-9]+\.[0-9]+"$' "$1"
+}
+legacy_service_known() {
+    local path="$1"
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    ! grep -Fq '# sb-v4-managed' "$path" || return 1
+    if [ "$path" = "$SERVICE_FILE" ]; then
+        grep -Fxq 'Description=Sing-box Service' "$path" &&
+            grep -Fxq "ExecStart=$BIN_FILE run -C $CONFIG_DIR" "$path" &&
+            [ "$(grep -c '^Exec' "$path")" = 1 ]
+    else
+        grep -Eq '^# sb-service-rev=[0-9]+$' "$path" &&
+            grep -Fxq '# 由 sb 管理面板生成；手动改完请 rc-service sing-box restart' "$path" &&
+            grep -Fxq "command=\"$BIN_FILE\"" "$path" &&
+            grep -Fxq "command_args=\"run -C $CONFIG_DIR\"" "$path"
+    fi
+}
+legacy_preflight() {
+    local path found=0 fragment dropins
+    case "$INIT_SYS" in systemd|openrc) ;; *) error '需要 systemd / OpenRC，不能安全清理无服务托管的旧进程。'; return 1 ;; esac
+    # 不以 jq 解析失败作为“旧版”证据；v4 的整个状态文件存在就拒绝。
+    [ ! -e "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] || { error '存在 v4 状态或未知元数据，拒绝按旧版清理。'; return 1; }
+    for path in "$CONFIG_DIR" "$BIN_FILE" "$SINGBOX_LOG"; do
+        [ ! -L "$path" ] || { error "拒绝清理符号链接：$path"; return 1; }
+    done
+    [ ! -e "$CONFIG_DIR" ] || [ -d "$CONFIG_DIR" ] || return 1
+    # BusyBox rm 没有 --one-file-system；清理前拒绝目录内任何挂载点。
+    if awk -v p="$CONFIG_DIR" '$5 == p || index($5, p "/") == 1 { found=1 } END { exit !found }' /proc/self/mountinfo; then
+        error '配置目录含挂载点，拒绝递归删除。'; return 1
+    fi
+    for path in "$SERVICE_FILE" "$OPENRC_FILE"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            legacy_service_known "$path" || { error "无法确认旧版服务归属，保留：$path"; return 1; }
+            found=1
+        fi
+    done
+    [ "$found" = 1 ] || { error '没有可识别的旧版服务，拒绝猜测归属。'; return 1; }
+    if [ "$INIT_SYS" = systemd ]; then
+        [ -f "$SERVICE_FILE" ] || return 1
+        fragment=$(systemctl show sing-box -p FragmentPath --value) || return 1
+        dropins=$(systemctl show sing-box -p DropInPaths --value) || return 1
+        [ "$fragment" = "$SERVICE_FILE" ] && [ -z "$dropins" ] || {
+            error '服务来源不匹配或含额外 drop-in，拒绝自动清理。'; return 1;
+        }
+    else
+        [ -f "$OPENRC_FILE" ] || return 1
+    fi
+    # v3 没有 Argo 安装逻辑；发现隧道资源时不能当作旧版附属品删除。
+    [ ! -d "$ARGO_DIR" ] || { error '发现隧道元数据，请先核实归属；本入口不清理共享 cloudflared。'; return 1; }
+}
+legacy_stop() {
+    # 普通 svc_stop 只接受 v4；旧版在独立归属检查通过后才走此入口。
+    case "$INIT_SYS" in
+        systemd) (exec 200>&-; systemctl stop sing-box) ;;
+        openrc) (exec 200>&-; rc-service sing-box stop) ;;
+        *) return 1 ;;
+    esac
+}
+legacy_still_running() {
+    local proc
+    local -a argv=()
+    case "$INIT_SYS" in
+        systemd) systemctl is-active --quiet sing-box && return 0 ;;
+        openrc) rc-service sing-box status >/dev/null 2>&1 && return 0 ;;
+    esac
+    # 同时查旧版 -C 参数的孤儿进程；不按名字盲目 pkill。
+    for proc in /proc/[0-9]*; do
+        mapfile -d '' -t argv < "$proc/cmdline" 2>/dev/null || continue
+        [ "${#argv[@]}" -ge 4 ] || continue
+        if [ "${argv[-4]}" = "$BIN_FILE" ] && [ "${argv[-3]}" = run ] &&
+            [ "${argv[-2]}" = -C ] && [ "${argv[-1]}" = "$CONFIG_DIR" ]; then return 0; fi
+    done
+    return 1
+}
+legacy_cleanup() {
+    local path directory name
+    local -a scripts=()
+    legacy_preflight || return 1
+    for path in "$LEGACY_PANEL" "$LEGACY_COPY"; do
+        if legacy_script_owned "$path"; then scripts+=("$path"); fi
+    done
+    if [ -L "$LEGACY_ALIAS" ] && [ "$(readlink -f "$LEGACY_ALIAS")" = "$LEGACY_PANEL" ] && legacy_script_owned "$LEGACY_PANEL"; then
+        scripts+=("$LEGACY_ALIAS")
+    elif legacy_script_owned "$LEGACY_ALIAS"; then scripts+=("$LEGACY_ALIAS"); fi
+    printf '\n将停止旧 sing-box，全部旧节点将失效。清理范围：\n'
+    for path in "$CONFIG_DIR" "$BIN_FILE" "$SERVICE_FILE" "$OPENRC_FILE" "$SINGBOX_LOG" "${scripts[@]}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then printf '  %s\n' "$path"; fi
+    done
+    printf '保留：当前 v4 脚本、全部备份、共享依赖 / cloudflared、云端 Tunnel / DNS、系统 DNS / 防火墙 / BBR / Swap。\n'
+    confirm '清理旧版脚本、核心、服务、自启与全部旧配置；先保存私密恢复备份' && acquire_lock || return 1
+    legacy_preflight || return 1
+    # 清理前备份不可重建内容；旧目录整体复制，包含 .meta 与旧 .bak。
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR" || return 1
+    directory=$(mktemp -d "$BACKUP_DIR/legacy-XXXXXXXX") || return 1
+    chmod 700 "$directory" || return 1
+    for name in config systemd openrc log; do
+        case "$name" in
+            config) path="$CONFIG_DIR" ;; systemd) path="$SERVICE_FILE" ;;
+            openrc) path="$OPENRC_FILE" ;; log) path="$SINGBOX_LOG" ;;
+        esac
+        if [ -e "$path" ]; then cp -a "$path" "$directory/$name" || return 1; fi
+    done
+    mkdir "$directory/scripts" || return 1
+    local index=0
+    for path in "${scripts[@]}"; do
+        cp -a "$path" "$directory/scripts/$index" || return 1
+        printf '%s\t%s\n' "$index" "$path" >> "$directory/scripts/paths"
+        index=$((index + 1))
+    done
+    printf '私密恢复备份：%s（包含旧配置和密钥，请勿公开）\n' "$directory"
+    legacy_stop || { error '停止失败，未删除配置。'; return 1; }
+    if legacy_still_running; then error '旧核心仍在运行，停止清理。'; return 1; fi
+    svc_disable || { error '移除自启失败，停止清理。'; return 1; }
+    rm -f -- "$BIN_FILE" "$SERVICE_FILE" "$OPENRC_FILE" "$SINGBOX_LOG" "${scripts[@]}" || return 1
+    rm -rf -- "$CONFIG_DIR" || return 1
+    [ "$INIT_SYS" != systemd ] || systemctl daemon-reload || return 1
+    printf '旧版已清理。备份保留在 %s；当前 v4 脚本继续可用。\n' "$directory"
+}
+legacy_reinstall() {
+    legacy_cleanup || return 1
+    printf '\n接下来可安装全新 v4；安装仍需单独确认，取消不会恢复旧节点。\n'
+    install_singbox
 }
 
 # ==================== 节点：统一列表和元数据 ====================
@@ -1941,9 +2074,10 @@ menu_add() {
         menu_header '搭建 / 添加节点' '端口可自定义；Argo 还需填写路径、域名、Tunnel Token'
         menu_option 1 'VLESS Reality（推荐，无需域名）'
         menu_option 2 'AnyTLS Reality'
-        menu_option 3 'Argo 隧道节点（VLESS + WS + TLS）'; menu_back
+        menu_option 3 'Argo 隧道节点（VLESS + WS + TLS）'
+        menu_option 4 '清理旧版并重新搭建（旧节点失效）'; menu_back
         read_menu_choice; choice="$REPLY"
-        case "$choice" in 1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;; 0) return ;; esac
+        case "$choice" in 1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;; 4) legacy_reinstall ;; 0) return ;; esac
         pause
     done
 }
@@ -2058,12 +2192,13 @@ menu_system() {
         menu_option 1 '安装 / 更新核心'; menu_option 2 '启动 sing-box'; menu_option 3 '停止 sing-box'
         menu_option 4 '重启 sing-box'; menu_option 5 '查看核心版本'; menu_option 6 'Argo 隧道服务'
         menu_option 7 '卸载核心与服务（保留配置和备份）'; menu_option 8 '安装必要依赖'
-        menu_option 9 '安装二维码工具（可选）'; menu_back
+        menu_option 9 '安装二维码工具（可选）'
+        menu_option 10 '清理旧版并重新搭建（旧节点失效）'; menu_back
         read_menu_choice; choice="$REPLY"
         case "$choice" in
             1) install_singbox ;; 2) service_action start ;; 3) service_action stop ;; 4) service_action restart ;;
             5) [ ! -x "$BIN_FILE" ] || "$BIN_FILE" version ;; 6) menu_argo ;; 7) uninstall_singbox ;;
-            8) install_dependencies ;; 9) install_qrencode ;; 0) return ;;
+            8) install_dependencies ;; 9) install_qrencode ;; 10) legacy_reinstall ;; 0) return ;;
         esac
         pause
     done

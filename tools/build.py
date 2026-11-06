@@ -3,7 +3,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PARTS = ("header", "core", "nodes", "argo", "warp", "system-tools", "menus")
+PARTS = ("header", "core", "legacy", "nodes", "argo", "warp", "system-tools", "menus")
 
 
 def build():

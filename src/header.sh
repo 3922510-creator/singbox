@@ -2,7 +2,7 @@
 # Sing-box 管理面板 v4。源文件在 src/，tools/build.py 生成单文件分发。
 # 不迁移 v3 或接管未知服务。打开菜单不安装依赖、不写配置、不更新服务定义。
 set -o pipefail
-SCRIPT_VERSION="v4.0.0"
+SCRIPT_VERSION="v4.0.1"
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'
 CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'
 CONFIG_DIR="/etc/sing-box"
