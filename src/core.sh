@@ -127,9 +127,10 @@ menu_firewall() {
     while true; do
         menu_header '防火墙设置' '只修改明确选择的规则；云安全组需另行设置'
         ufw status verbose
+        menu_section '端口与开关'
         menu_option 1 '开放端口'; menu_option 2 '删除端口规则'
-        menu_option 3 '启用（先保留实际 SSH 端口）'; menu_option 4 '关闭防火墙'; menu_option 5 '重载'; menu_back
-        read_menu_choice; choice="$REPLY"
+        menu_option 3 '启用防火墙（先放行当前 SSH 端口）'; menu_option 4 '关闭防火墙'; menu_option 5 '重载规则'; menu_back
+        read_menu_choice '请选择 [0-5]'; choice="$REPLY"
         case "$choice" in
             1|2)
                 port=$(read_valid_port '端口: ' '' 0) || continue

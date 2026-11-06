@@ -32,7 +32,8 @@ cp "$LEGACY_PANEL" "$LEGACY_COPY"
 ln -s "$LEGACY_PANEL" "$LEGACY_ALIAS"
 systemctl() {
     case "$*" in
-        'show sing-box -p FragmentPath --value') printf '%s\n' "$SERVICE_FILE" ;;
+        'show sing-box -p LoadState --value') if [ -e "$ROOT/foreign" ]; then printf loaded; else printf not-found; fi ;;
+        'show sing-box -p FragmentPath --value') if [ -f "$SERVICE_FILE" ]; then printf '%s\n' "$SERVICE_FILE"; fi ;;
         'show sing-box -p DropInPaths --value') [ ! -e "$ROOT/dropin" ] || printf other ;;
         'stop sing-box') printf stop >> "$ROOT/actions"; [ ! -e "$ROOT/stop-fail" ] ;;
         'is-active --quiet sing-box') [ -e "$ROOT/still-running" ] ;;
@@ -166,6 +167,41 @@ trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true' EXIT
 sleep 0.1
 if legacy_cleanup <<< y; then exit 1; fi
 [ -f "$CONFIG_FILE" ] && [ "$(cat "$ROOT/actions")" = stop ]
+''')
+
+    def test_service_missing_leftover_directory_can_be_cleaned(self):
+        self.run_shell(r'''
+rm "$SERVICE_FILE"
+legacy_cleanup <<< y
+[ ! -e "$CONFIG_DIR" ] && [ ! -e "$BIN_FILE" ]
+backup=("$BACKUP_DIR"/legacy-*)
+[ -f "${backup[0]}/config/config.json" ]
+[ "$(cat "$ROOT/actions")" = reload ]
+''')
+
+    def test_service_missing_cancel_preserves_directory(self):
+        self.run_shell(r'''
+rm "$SERVICE_FILE"
+if legacy_cleanup <<< n; then exit 1; fi
+[ -f "$CONFIG_FILE" ] && [ ! -e "$ROOT/actions" ]
+''')
+
+    def test_service_missing_foreign_unit_or_active_process_blocks(self):
+        self.run_shell(r'''
+rm "$SERVICE_FILE"
+touch "$ROOT/foreign"
+if legacy_cleanup <<< y; then exit 1; fi
+rm "$ROOT/foreign"; touch "$ROOT/still-running"
+if legacy_cleanup <<< y; then exit 1; fi
+[ -f "$CONFIG_FILE" ] && [ ! -e "$ROOT/actions" ]
+''')
+
+    def test_openrc_missing_service_cleans_residue(self):
+        self.run_shell(r'''
+INIT_SYS=openrc
+rm "$SERVICE_FILE"
+legacy_cleanup <<< y
+[ ! -e "$CONFIG_DIR" ] && [ ! -e "$BIN_FILE" ] && [ ! -e "$ROOT/actions" ]
 ''')
 
     def test_cleanup_failure_never_installs(self):

@@ -85,7 +85,7 @@ if apply_config "$config" "$(cat "$STATE_FILE")" 'forced port conflict' <<< y; t
 svc_active
 source /work/isolated-argo.sh
 # Actual script entry/menu navigation, no host tty inside this namespace.
-printf '2\n0\n3\n0\n4\n0\n5\n0\n0\n' | bash /work/singbox.sh > /work/menu.log
+printf '1\n0\n2\n0\n4\n0\n5\n0\n6\n0\n7\n0\n0\n' | bash /work/singbox.sh > /work/menu.log
 svc_stop
 # The glibc/gcompat path is still identified correctly if a user selects such an ELF.
 install_binary /work/official-core "$BIN_FILE"

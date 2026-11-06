@@ -94,16 +94,28 @@ delete_warp_rule() {
     save_and_check_config "$config"
 }
 menu_warp() {
-    local choice
+    local choice warp_status rule_count
     while true; do
-        menu_header 'WARP 出口与分流' '出口与入站独立；Reality 和 Argo 节点均可分流'
-        menu_option 1 '添加 / 重置 WARP'; menu_option 2 '查看出口信息'; menu_option 3 '移除出口及相关规则'
-        menu_option 4 'AI 服务走 WARP'; menu_option 5 '流媒体走 WARP'; menu_option 6 '自定义域名走 WARP'
-        menu_option 7 '指定节点全部走 WARP'; menu_option 8 '查看分流规则'; menu_option 9 '删除指定规则'; menu_back
-        read_menu_choice; choice="$REPLY"
+        warp_status=$([ "$(has_warp_endpoint)" -gt 0 ] && printf '%b已启用%b' "$GREEN" "$PLAIN" || printf '%b未启用%b' "$YELLOW" "$PLAIN")
+        rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+        menu_header 'WARP 出口与分流' '出口与入站独立；Reality 和 Argo 节点均可分流' "$warp_status"
+        menu_section '出口管理'
+        menu_option 1 '添加 / 重置 WARP（自动注册账号）'
+        menu_option 2 '查看出口信息'
+        menu_option 3 '移除出口及相关规则'
+        menu_section "分流规则（当前 ${rule_count:-0} 条）"
+        menu_option 4 'AI 服务走 WARP'
+        menu_option 5 '流媒体走 WARP'
+        menu_option 6 '自定义域名走 WARP'
+        menu_option 7 '指定节点全部走 WARP'
+        menu_option 8 '查看已添加的分流规则'
+        menu_option 9 '删除指定分流规则'
+        menu_back
+        read_menu_choice '请选择 [0-9]'; choice="$REPLY"
         case "$choice" in
             1) add_warp ;; 2) view_warp ;; 3) delete_warp ;; 4) add_warp_ai ;; 5) add_warp_media ;;
-            6) add_warp_route ;; 7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;; 0) return ;;
+            6) add_warp_route ;; 7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;;
+            0) return ;; *) error '请输入 0-9 之间的数字。' ;;
         esac
         pause
     done

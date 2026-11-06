@@ -57,7 +57,7 @@ exec 200>&-
 SB_LOCKED=0
 acquire_lock
 source /work/isolated-argo.sh
-printf '2\n0\n3\n0\n4\n0\n5\n0\n0\n' | bash /work/singbox.sh > /work/menu.log
+printf '1\n0\n2\n0\n4\n0\n5\n0\n6\n0\n7\n0\n0\n' | bash /work/singbox.sh > /work/menu.log
 uninstall_singbox <<< y
 [ ! -e "$BIN_FILE" ] && [ -f "$STATE_FILE" ] && [ -f "$CONFIG_FILE" ]
 install_singbox <<< y

@@ -2,9 +2,9 @@
 # Sing-box 管理面板 v4。源文件在 src/，tools/build.py 生成单文件分发。
 # 不迁移 v3 或接管未知服务。打开菜单不安装依赖、不写配置、不更新服务定义。
 set -o pipefail
-SCRIPT_VERSION="v4.0.1"
+SCRIPT_VERSION="v4.1.0"
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'
-CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'
+CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 META_DIR="$CONFIG_DIR/.meta"
@@ -32,29 +32,46 @@ platform_detect() {
     else INIT_SYS=none; fi
 }
 
-pause() { printf '\n'; read -rp '按回车键继续…' _ || return 0; }
+pause() { printf '\n'; read -rp '  按回车键继续...' _ || return 0; }
 confirm() {
     local answer
     printf '\n%s\n' "$1"
     read -rp '确认执行？回复 y / n [默认 n]: ' answer || return 1
     [ "$answer" = y ]
 }
-ui_rule() { printf '%s\n' '────────────────────────────────'; }
+ui_width() {
+    local w="${COLUMNS:-0}"
+    case "$w" in ''|*[!0-9]*) w=0 ;; esac
+    if [ "$w" -eq 0 ]; then w=$(stty size 2>/dev/null | awk '{print $2}') || w=''; fi
+    case "$w" in ''|*[!0-9]*) w=46 ;; esac
+    [ "$w" -ge 34 ] || w=34
+    [ "$w" -le 56 ] || w=56
+    printf '%s' "$w"
+}
+ui_rule() {
+    local w i=2 line=''
+    w=$(ui_width)
+    while [ "$i" -lt "$w" ]; do line="${line}─"; i=$((i + 1)); done
+    printf '  %b%s%b\n' "${DIM}${BLUE}" "$line" "$PLAIN"
+}
 menu_header() {
-    [ ! -t 1 ] || clear
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[H\033[2J'; fi
     printf '\n'; ui_rule
-    printf '%b%s%b\n' "$BOLD" "$1" "$PLAIN"
-    [ -z "${2:-}" ] || printf '%s\n' "$2"
-    [ -z "${3:-}" ] || printf '状态：%s\n' "$3"
+    printf '  %b%s%b\n' "$BOLD" "$1" "$PLAIN"
+    [ -z "${2:-}" ] || printf '  %b%s%b\n' "$DIM" "$2" "$PLAIN"
+    [ -z "${3:-}" ] || printf '  %b状态%b  %s\n' "$DIM" "$PLAIN" "$3"
     ui_rule
 }
-menu_section() { printf '\n%s\n' "$1"; }
-menu_option() { printf '  %s. %s\n' "$1" "$2"; }
-menu_back() { menu_option 0 返回; }
+menu_section() { printf '\n  %b▌%b %b%s%b\n' "$BLUE" "$PLAIN" "$BOLD" "$1" "$PLAIN"; }
+menu_option() { printf '    %b%2s)%b %s\n' "$GREEN" "$1" "$PLAIN" "$2"; }
+menu_back() { printf '\n    %b 0)%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
+menu_exit() { printf '\n    %b 0)%b 退出脚本\n' "$YELLOW" "$PLAIN"; }
 read_menu_choice() {
-    read -rp "${1:-请选择}: " REPLY || REPLY=0
+    local prompt="${1:-请选择}"
+    printf '\n  %b>%b %s: ' "$BLUE" "$PLAIN" "$prompt"
+    read -r REPLY || REPLY=0
 }
-error() { printf '%s\n' "$*" >&2; return 1; }
+error() { printf '%b[!] %s%b\n' "$RED" "$*" "$PLAIN" >&2; return 1; }
 
 # 锁只在明确执行变更后获取；浏览与测试 source 均不创建任何文件。
 acquire_lock() {
@@ -186,9 +203,14 @@ svc_status() {
     case "$INIT_SYS" in systemd) systemctl status sing-box --no-pager ;; openrc) rc-service sing-box status ;; *) error '没有服务管理器。' ;; esac
 }
 get_singbox_status() {
-    if [ ! -x "$BIN_FILE" ]; then printf '未安装'
-    elif svc_active >/dev/null 2>&1; then printf '运行中'
-    else printf '已停止'; fi
+    local ver=''
+    if [ -x "$BIN_FILE" ]; then
+        ver=$("$BIN_FILE" version 2>/dev/null | awk 'NR==1 {print $3}')
+        [ -z "$ver" ] || ver=" v$ver"
+    fi
+    if [ ! -x "$BIN_FILE" ]; then printf '%b[未安装]%b' "$YELLOW" "$PLAIN"
+    elif svc_active >/dev/null 2>&1; then printf '%b[运行中%s]%b' "$GREEN" "$ver" "$PLAIN"
+    else printf '%b[已停止%s]%b' "$RED" "$ver" "$PLAIN"; fi
 }
 
 install_service_file() {
@@ -279,15 +301,15 @@ release_arch() {
 install_singbox() {
     [ "$INIT_SYS" != none ] || { error '需要 systemd / OpenRC。'; return 1; }
     # 没有任何旧版迁移或隐式接管；包括已有但损坏的目录。
-    if [ -e "$CONFIG_DIR" ] && [ ! -f "$STATE_FILE" ]; then error "发现已有目录 $CONFIG_DIR；v4 不覆盖旧版或未知配置。"; return 1; fi
+    if [ -e "$CONFIG_DIR" ] && [ ! -f "$STATE_FILE" ]; then error "发现旧版或残留目录 $CONFIG_DIR；请先在首页选 9「清理旧版并重新搭建」。"; return 1; fi
     if [ -e "$STATE_FILE" ]; then require_owned || return 1; fi
     local path="$SERVICE_FILE"
     [ "$INIT_SYS" != openrc ] || path="$OPENRC_FILE"
-    if [ -e "$path" ] && ! service_owned; then error '发现未知 sing-box 服务，拒绝覆盖。'; return 1; fi
+    if [ -e "$path" ] && ! service_owned; then error '发现旧版或未知 sing-box 服务；若为 v3 旧版请在首页选 9 清理。'; return 1; fi
     if [ "$INIT_SYS" = systemd ] && [ ! -e "$path" ] && systemctl cat sing-box >/dev/null 2>&1; then
         error '发现其他位置的 sing-box systemd 服务，拒绝创建覆盖单元。'; return 1
     fi
-    if [ -e "$BIN_FILE" ] && [ ! -f "$STATE_FILE" ]; then error '发现已有核心，拒绝接管。'; return 1; fi
+    if [ -e "$BIN_FILE" ] && [ ! -f "$STATE_FILE" ]; then error '发现旧版或未知核心；若为 v3 旧版请在首页选 9 清理。'; return 1; fi
     confirm '安装 / 更新 sing-box 核心和 v4 服务；已有 v4 服务将短暂重启' || return 1
     install_dependencies && acquire_lock || return 1
     local directory arch release url binary suffix active=0 previous=0
@@ -481,9 +503,10 @@ menu_firewall() {
     while true; do
         menu_header '防火墙设置' '只修改明确选择的规则；云安全组需另行设置'
         ufw status verbose
+        menu_section '端口与开关'
         menu_option 1 '开放端口'; menu_option 2 '删除端口规则'
-        menu_option 3 '启用（先保留实际 SSH 端口）'; menu_option 4 '关闭防火墙'; menu_option 5 '重载'; menu_back
-        read_menu_choice; choice="$REPLY"
+        menu_option 3 '启用防火墙（先放行当前 SSH 端口）'; menu_option 4 '关闭防火墙'; menu_option 5 '重载规则'; menu_back
+        read_menu_choice '请选择 [0-5]'; choice="$REPLY"
         case "$choice" in
             1|2)
                 port=$(read_valid_port '端口: ' '' 0) || continue
@@ -584,7 +607,7 @@ legacy_service_known() {
     fi
 }
 legacy_preflight() {
-    local path found=0 fragment dropins
+    local path found=0 fragment dropins load_state
     case "$INIT_SYS" in systemd|openrc) ;; *) error '需要 systemd / OpenRC，不能安全清理无服务托管的旧进程。'; return 1 ;; esac
     # 不以 jq 解析失败作为“旧版”证据；v4 的整个状态文件存在就拒绝。
     [ ! -e "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] || { error '存在 v4 状态或未知元数据，拒绝按旧版清理。'; return 1; }
@@ -602,7 +625,22 @@ legacy_preflight() {
             found=1
         fi
     done
-    [ "$found" = 1 ] || { error '没有可识别的旧版服务，拒绝猜测归属。'; return 1; }
+    [ ! -d "$ARGO_DIR" ] || { error '发现隧道元数据，请先核实归属；本入口不清理共享 cloudflared。'; return 1; }
+    if [ "$found" = 0 ]; then
+        # 卸载后仅剩目录 / 核心时，不应要求已被删除的旧 unit 作为证据。
+        # 仍拒绝发行版其他路径的服务，以及任何残留运行进程。
+        if [ "$INIT_SYS" = systemd ]; then
+            load_state=$(systemctl show sing-box -p LoadState --value) || return 1
+            fragment=$(systemctl show sing-box -p FragmentPath --value) || return 1
+            dropins=$(systemctl show sing-box -p DropInPaths --value) || return 1
+            [ "$load_state" = not-found ] && [ -z "$fragment$dropins" ] || {
+                error '其他位置仍有 sing-box 服务或缓存的服务定义，拒绝按残留目录清理。'; return 1;
+            }
+        fi
+        if legacy_still_running; then error '无服务文件但仍有 sing-box 进程，请先核实托管方式。'; return 1; fi
+        printf '未发现服务文件；将按残留安装清理，确认前不会删除任何文件。\n'
+        return 0
+    fi
     if [ "$INIT_SYS" = systemd ]; then
         [ -f "$SERVICE_FILE" ] || return 1
         fragment=$(systemctl show sing-box -p FragmentPath --value) || return 1
@@ -613,8 +651,6 @@ legacy_preflight() {
     else
         [ -f "$OPENRC_FILE" ] || return 1
     fi
-    # v3 没有 Argo 安装逻辑；发现隧道资源时不能当作旧版附属品删除。
-    [ ! -d "$ARGO_DIR" ] || { error '发现隧道元数据，请先核实归属；本入口不清理共享 cloudflared。'; return 1; }
 }
 legacy_stop() {
     # 普通 svc_stop 只接受 v4；旧版在独立归属检查通过后才走此入口。
@@ -635,8 +671,11 @@ legacy_still_running() {
     for proc in /proc/[0-9]*; do
         mapfile -d '' -t argv < "$proc/cmdline" 2>/dev/null || continue
         [ "${#argv[@]}" -ge 4 ] || continue
-        if [ "${argv[-4]}" = "$BIN_FILE" ] && [ "${argv[-3]}" = run ] &&
-            [ "${argv[-2]}" = -C ] && [ "${argv[-1]}" = "$CONFIG_DIR" ]; then return 0; fi
+        if [ "${argv[-3]}" = run ]; then
+            [ "${argv[-4]}" != "$BIN_FILE" ] || return 0
+            if { [ "${argv[-2]}" = -C ] && [ "${argv[-1]}" = "$CONFIG_DIR" ]; } ||
+                { [ "${argv[-2]}" = -c ] && [ "${argv[-1]}" = "$CONFIG_FILE" ]; }; then return 0; fi
+        fi
     done
     return 1
 }
@@ -676,9 +715,13 @@ legacy_cleanup() {
         index=$((index + 1))
     done
     printf '私密恢复备份：%s（包含旧配置和密钥，请勿公开）\n' "$directory"
-    legacy_stop || { error '停止失败，未删除配置。'; return 1; }
-    if legacy_still_running; then error '旧核心仍在运行，停止清理。'; return 1; fi
-    svc_disable || { error '移除自启失败，停止清理。'; return 1; }
+    if [ -f "$SERVICE_FILE" ] || [ -f "$OPENRC_FILE" ]; then
+        legacy_stop || { error '停止失败，未删除配置。'; return 1; }
+        if legacy_still_running; then error '旧核心仍在运行，停止清理。'; return 1; fi
+        svc_disable || { error '移除自启失败，停止清理。'; return 1; }
+    elif legacy_still_running; then
+        error '发现运行中的残留进程，停止清理。'; return 1
+    fi
     rm -f -- "$BIN_FILE" "$SERVICE_FILE" "$OPENRC_FILE" "$SINGBOX_LOG" "${scripts[@]}" || return 1
     rm -rf -- "$CONFIG_DIR" || return 1
     [ "$INIT_SYS" != systemd ] || systemctl daemon-reload || return 1
@@ -1216,16 +1259,28 @@ delete_warp_rule() {
     save_and_check_config "$config"
 }
 menu_warp() {
-    local choice
+    local choice warp_status rule_count
     while true; do
-        menu_header 'WARP 出口与分流' '出口与入站独立；Reality 和 Argo 节点均可分流'
-        menu_option 1 '添加 / 重置 WARP'; menu_option 2 '查看出口信息'; menu_option 3 '移除出口及相关规则'
-        menu_option 4 'AI 服务走 WARP'; menu_option 5 '流媒体走 WARP'; menu_option 6 '自定义域名走 WARP'
-        menu_option 7 '指定节点全部走 WARP'; menu_option 8 '查看分流规则'; menu_option 9 '删除指定规则'; menu_back
-        read_menu_choice; choice="$REPLY"
+        warp_status=$([ "$(has_warp_endpoint)" -gt 0 ] && printf '%b已启用%b' "$GREEN" "$PLAIN" || printf '%b未启用%b' "$YELLOW" "$PLAIN")
+        rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+        menu_header 'WARP 出口与分流' '出口与入站独立；Reality 和 Argo 节点均可分流' "$warp_status"
+        menu_section '出口管理'
+        menu_option 1 '添加 / 重置 WARP（自动注册账号）'
+        menu_option 2 '查看出口信息'
+        menu_option 3 '移除出口及相关规则'
+        menu_section "分流规则（当前 ${rule_count:-0} 条）"
+        menu_option 4 'AI 服务走 WARP'
+        menu_option 5 '流媒体走 WARP'
+        menu_option 6 '自定义域名走 WARP'
+        menu_option 7 '指定节点全部走 WARP'
+        menu_option 8 '查看已添加的分流规则'
+        menu_option 9 '删除指定分流规则'
+        menu_back
+        read_menu_choice '请选择 [0-9]'; choice="$REPLY"
         case "$choice" in
             1) add_warp ;; 2) view_warp ;; 3) delete_warp ;; 4) add_warp_ai ;; 5) add_warp_media ;;
-            6) add_warp_route ;; 7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;; 0) return ;;
+            6) add_warp_route ;; 7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;;
+            0) return ;; *) error '请输入 0-9 之间的数字。' ;;
         esac
         pause
     done
@@ -2067,17 +2122,39 @@ menu_swap() {
     done
 }
 
-# ==================== 交互层 ====================
+# ==================== 交互层（最多二级菜单，小白优先） ====================
+node_summary_lines() {
+    command -v jq >/dev/null && jq -e '.format==4' "$STATE_FILE" >/dev/null 2>&1 || return 1
+    local t count=0 meta kind port extra
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        count=$((count + 1))
+        meta=$(node_state "$t" 2>/dev/null) || continue
+        kind=$(jq -r '.kind' <<< "$meta")
+        port=$(jq -r --arg t "$t" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE" 2>/dev/null)
+        case "$kind" in
+            argo) extra="Argo  $(jq -r '.domain' <<< "$meta"):443 -> 127.0.0.1:$port" ;;
+            anytls) extra="AnyTLS-Reality  端口 $port" ;;
+            *) extra="VLESS-Reality   端口 $port" ;;
+        esac
+        printf '    %b%d.%b %s  %b(%s)%b\n' "$GREEN" "$count" "$PLAIN" "$(node_display_name "$t")" "$DIM" "$extra" "$PLAIN"
+    done < <(node_tags 2>/dev/null)
+    [ "$count" -gt 0 ]
+}
 menu_add() {
     local choice
     while true; do
-        menu_header '搭建 / 添加节点' '端口可自定义；Argo 还需填写路径、域名、Tunnel Token'
-        menu_option 1 'VLESS Reality（推荐，无需域名）'
-        menu_option 2 'AnyTLS Reality'
-        menu_option 3 'Argo 隧道节点（VLESS + WS + TLS）'
-        menu_option 4 '清理旧版并重新搭建（旧节点失效）'; menu_back
-        read_menu_choice; choice="$REPLY"
-        case "$choice" in 1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;; 4) legacy_reinstall ;; 0) return ;; esac
+        menu_header '添加节点' '自动准备核心与服务；直连节点无需域名' "$(get_singbox_status)"
+        menu_section '选择节点类型'
+        menu_option 1 'VLESS Reality（推荐 · 免域名直连）'
+        menu_option 2 'AnyTLS Reality（免域名直连）'
+        menu_option 3 'Argo 固定隧道（VLESS + WS + TLS · 需域名与 Token）'
+        menu_back
+        read_menu_choice '请选择 [0-3]'; choice="$REPLY"
+        case "$choice" in
+            1) add_reality_node ;; 2) add_anytls_node ;; 3) add_argo_node ;;
+            0) return ;; *) error '请输入 0-3 之间的数字。' ;;
+        esac
         pause
     done
 }
@@ -2085,14 +2162,29 @@ menu_nodes() {
     require_owned || return 1
     local choice tag
     while true; do
-        menu_header '我的节点' '查看、重命名、检查和删除'
-        menu_option 1 '选择一个节点'; menu_option 2 '查看全部链接 / 二维码'; menu_back
-        read_menu_choice; choice="$REPLY"
+        menu_header '我的节点' '查看分享链接、二维码、测活、改备注与删除' "$(get_singbox_status)"
+        menu_section '当前节点'
+        node_summary_lines || printf '    %b还没有节点，请返回首页选 1 添加。%b\n' "$YELLOW" "$PLAIN"
+        menu_section '节点操作'
+        menu_option 1 '查看全部节点链接 / 二维码'
+        menu_option 2 '查看单个节点详情 / 二维码'
+        menu_option 3 '测试节点连通性（真实验证）'
+        menu_option 4 '修改节点备注（无需重启）'
+        menu_option 5 '删除节点'
+        menu_option 6 '安装二维码显示工具（可选）'
+        menu_back
+        read_menu_choice '请选择 [0-6]'; choice="$REPLY"
         case "$choice" in
-            1) tag=$(select_node) || continue; menu_node "$tag" ;;
-            2) view_node_links; pause ;;
+            1) view_node_links ;;
+            2) tag=$(select_node) && show_node "$tag" ;;
+            3) tag=$(select_node) && probe_node "$tag" ;;
+            4) rename_node ;;
+            5) delete_node ;;
+            6) install_qrencode ;;
             0) return ;;
+            *) error '请输入 0-6 之间的数字。' ;;
         esac
+        pause
     done
 }
 menu_node() {
@@ -2101,7 +2193,7 @@ menu_node() {
         menu_header "节点：$(node_display_name "$tag")"
         menu_option 1 '查看参数 / 链接 / 二维码'; menu_option 2 '修改备注（无需重启）'
         menu_option 3 '检查完整代理链路'; menu_option 4 '删除节点'; menu_back
-        read_menu_choice; choice="$REPLY"
+        read_menu_choice '请选择 [0-4]'; choice="$REPLY"
         case "$choice" in 1) show_node "$tag" ;; 2) rename_node "$tag" ;; 3) probe_node "$tag" ;; 4) delete_node "$tag" ;; 0) return ;; esac
         pause
     done
@@ -2109,54 +2201,75 @@ menu_node() {
 menu_forward() {
     local choice
     while true; do
-        menu_header 'TCP / UDP 端口转发'
-        menu_option 1 '添加转发'; menu_option 2 '查看转发'; menu_option 3 '删除转发'; menu_back
-        read_menu_choice; choice="$REPLY"
-        case "$choice" in 1) add_port_forward ;; 2) view_port_forwards ;; 3) delete_port_forward ;; 0) return ;; esac
+        menu_header 'TCP / UDP 端口转发' '监听本机端口并转发到目标地址'
+        menu_section '当前转发规则'
+        if command -v jq >/dev/null && [ -f "$CONFIG_FILE" ] && [ "$(count_by_type direct)" -gt 0 ]; then
+            view_port_forwards | sed 's/^/    /'
+        else
+            printf '    %b暂无端口转发规则%b\n' "$DIM" "$PLAIN"
+        fi
+        menu_section '转发操作'
+        menu_option 1 '添加端口转发'; menu_option 2 '查看转发规则'; menu_option 3 '删除转发规则'; menu_back
+        read_menu_choice '请选择 [0-3]'; choice="$REPLY"
+        case "$choice" in 1) add_port_forward ;; 2) view_port_forwards ;; 3) delete_port_forward ;; 0) return ;; *) error '请输入 0-3 之间的数字。' ;; esac
         pause
     done
 }
 menu_network() {
     while true; do
-        menu_header '转发与分流'
+        menu_header '转发与分流' '端口转发与 Cloudflare WARP 分流'
         menu_option 1 'TCP / UDP 端口转发'; menu_option 2 'WARP 出口与分流'; menu_back
-        read_menu_choice
+        read_menu_choice '请选择 [0-2]'
         case "$REPLY" in 1) menu_forward ;; 2) menu_warp ;; 0) return ;; esac
     done
 }
 diagnose_config() {
     local choice
     while true; do
-        menu_header '配置维护' '配置和元数据一起备份；不会因语法错误自动清空'
-        menu_option 1 '查看原始配置（含私密信息）'; menu_option 2 '查看节点元数据（不含 Tunnel Token）'
-        menu_option 3 '编辑副本并校验应用'; menu_option 4 '重置为空配置'; menu_option 5 '从备份回滚'
-        menu_option 6 '只校验当前配置'; menu_back
-        read_menu_choice; choice="$REPLY"
+        menu_header '配置维护与备份回滚' '每次变更自动备份；语法错误不会自动清空配置'
+        menu_section '查看与校验'
+        menu_option 1 '查看原始配置 JSON（含私密信息）'
+        menu_option 2 '查看节点元数据（不含 Tunnel Token）'
+        menu_option 6 '校验当前配置文件'
+        menu_section '修改与恢复'
+        menu_option 3 '手动编辑配置并校验应用'
+        menu_option 5 '从历史备份回滚配置'
+        menu_option 4 '清空全部节点与规则（保留备份）'
+        menu_back
+        read_menu_choice '请选择 [0-6]'; choice="$REPLY"
         case "$choice" in
             1) show_full_config ;; 2) cat "$STATE_FILE" ;; 3) edit_config ;; 4) reset_config ;; 5) rollback_config ;;
-            6) require_owned && "$BIN_FILE" check -c "$CONFIG_FILE" ;; 0) return ;;
+            6) require_owned && "$BIN_FILE" check -c "$CONFIG_FILE" && printf '配置校验通过。\n' ;; 0) return ;;
+            *) error '请输入 0-6 之间的数字。' ;;
         esac
         pause
     done
 }
 menu_argo() {
     require_owned || return 1
-    local id action refs
+    local id action refs found
     while true; do
-        menu_header '本机固定隧道管理' '云端 Tunnel 和 DNS 由用户管理'
+        menu_header 'Argo 固定隧道管理' '云端 Tunnel 和 DNS 由用户管理'
+        menu_section '本机隧道实例'
+        found=0
         local directory
         for directory in "$ARGO_DIR"/*; do
             [ -d "$directory" ] || continue
             id=${directory##*/}
             valid_tunnel_id "$id" || continue
-            if argo_active "$id"; then printf '%s：运行中\n' "$id"; else printf '%s：已停止或资源异常\n' "$id"; fi
+            found=1
+            if argo_active "$id"; then printf '    %s  %b[运行中]%b\n' "$id" "$GREEN" "$PLAIN"
+            else printf '    %s  %b[已停止]%b\n' "$id" "$RED" "$PLAIN"; fi
         done
-        read -rp '填写隧道 ID（留空返回）: ' id || return
+        [ "$found" = 1 ] || printf '    %b暂无本机隧道实例%b\n' "$DIM" "$PLAIN"
+        printf '\n'
+        read -rp '  填写隧道 ID 管理（直接回车返回）: ' id || return
         [ -n "$id" ] || return
         argo_owned "$id" || { error '未找到本面板管理的隧道。'; pause; continue; }
-        menu_option 1 '查看日志'; menu_option 2 '启动'; menu_option 3 '停止'; menu_option 4 '重启'
+        menu_section "操作隧道 $id"
+        menu_option 1 '查看隧道日志'; menu_option 2 '启动隧道'; menu_option 3 '停止隧道'; menu_option 4 '重启隧道'
         menu_option 5 '移除无节点引用的本机隧道'; menu_back
-        read_menu_choice; action="$REPLY"
+        read_menu_choice '请选择 [0-5]'; action="$REPLY"
         case "$action" in
             1) argo_logs "$id" ;;
             2|3|4)
@@ -2170,66 +2283,95 @@ menu_argo() {
         pause
     done
 }
-menu_diagnostics() {
-    local choice
-    while true; do
-        menu_header '检查与维护' '检查默认只读；不自动重置、不静默修复'
-        menu_option 1 '一键检查'; menu_option 2 'sing-box 状态与日志'; menu_option 3 'Argo 状态 / 日志 / 服务'
-        menu_option 4 '配置查看 / 编辑 / 校验 / 回滚'; menu_option 5 '流媒体解锁（快速）'
-        menu_option 6 '流媒体解锁（完整社区脚本）'; menu_option 7 '回程路由测试'; menu_back
-        read_menu_choice; choice="$REPLY"
-        case "$choice" in
-            1) check_all ;; 2) svc_status; svc_logs ;; 3) menu_argo ;; 4) diagnose_config ;;
-            5) media_check_quick ;; 6) media_check_full ;; 7) besttrace_check ;; 0) return ;;
-        esac
-        pause
-    done
-}
 menu_system() {
     local choice
     while true; do
-        menu_header '核心与服务' '新版不迁移旧版、不接管未知服务'
-        menu_option 1 '安装 / 更新核心'; menu_option 2 '启动 sing-box'; menu_option 3 '停止 sing-box'
-        menu_option 4 '重启 sing-box'; menu_option 5 '查看核心版本'; menu_option 6 'Argo 隧道服务'
-        menu_option 7 '卸载核心与服务（保留配置和备份）'; menu_option 8 '安装必要依赖'
-        menu_option 9 '安装二维码工具（可选）'
-        menu_option 10 '清理旧版并重新搭建（旧节点失效）'; menu_back
-        read_menu_choice; choice="$REPLY"
+        menu_header '运行状态与核心维护' '查看状态、日志、启停服务、回滚配置与卸载' "$(get_singbox_status)"
+        menu_section '体检与日志（只读，不改配置）'
+        menu_option 1 '一键全面检查（核心 + 配置 + 监听端口 + 隧道）'
+        menu_option 2 '查看 sing-box 状态与最近日志'
+        menu_option 3 'Argo 隧道状态与日志'
+        menu_section '服务控制'
+        menu_option 4 '重启 sing-box 服务'
+        menu_option 5 '启动 sing-box 服务'
+        menu_option 6 '停止 sing-box 服务'
+        menu_option 7 '安装 / 更新 sing-box 核心'
+        menu_section '配置与清理'
+        menu_option 8 '从历史备份回滚配置'
+        menu_option 9 '高级配置维护（查看 / 编辑 / 清空）'
+        menu_option 10 '卸载 v4 核心与服务（保留配置和备份）'
+        menu_option 11 '彻底清理旧版 v3 并重新搭建（旧节点失效）'
+        menu_back
+        read_menu_choice '请选择 [0-11]'; choice="$REPLY"
         case "$choice" in
-            1) install_singbox ;; 2) service_action start ;; 3) service_action stop ;; 4) service_action restart ;;
-            5) [ ! -x "$BIN_FILE" ] || "$BIN_FILE" version ;; 6) menu_argo ;; 7) uninstall_singbox ;;
-            8) install_dependencies ;; 9) install_qrencode ;; 10) legacy_reinstall ;; 0) return ;;
+            1) check_all ;; 2) svc_status; svc_logs ;; 3) menu_argo ;;
+            4) service_action restart ;; 5) service_action start ;; 6) service_action stop ;;
+            7) install_singbox ;; 8) rollback_config ;; 9) diagnose_config ;;
+            10) uninstall_singbox ;; 11) legacy_reinstall ;; 0) return ;;
+            *) error '请输入 0-11 之间的数字。' ;;
         esac
         pause
     done
 }
+menu_diagnostics() { menu_system; }
+menu_advanced() { menu_tools; }
 install_qrencode() {
-    command -v qrencode >/dev/null && return 0
+    command -v qrencode >/dev/null && { printf '二维码工具 qrencode 已安装。\n'; return 0; }
     confirm '安装可选二维码工具 qrencode' && acquire_lock || return 1
     case "$OS_FAMILY" in
         debian) apt-get install -y qrencode ;; redhat) yum install -y qrencode ;;
         alpine) apk add --no-cache libqrencode-tools ;; *) error '请手动安装 qrencode。' ;;
     esac
 }
-menu_advanced() {
-    while true; do
-        menu_header '系统与高级设置' '系统改动按项确认，不参与节点搭建的默认操作'
-        menu_option 1 '核心与服务'; menu_option 2 'DNS 设置'; menu_option 3 '防火墙'
-        menu_option 4 '网络加速 / BBR / TCP 缓冲区'; menu_option 5 'Swap 管理'; menu_back
-        read_menu_choice
-        case "$REPLY" in 1) menu_system ;; 2) menu_dns ;; 3) menu_firewall ;; 4) menu_bbr ;; 5) menu_swap ;; 0) return ;; esac
-    done
+show_dashboard() {
+    if command -v jq >/dev/null && jq -e '.format==4' "$STATE_FILE" >/dev/null 2>&1; then
+        local direct argo fwd warp warp_text
+        direct=$(jq '[.nodes[] | select(.kind != "argo")] | length' "$STATE_FILE")
+        argo=$(jq '[.nodes[] | select(.kind == "argo")] | length' "$STATE_FILE")
+        fwd=$(count_by_type direct)
+        warp=$(has_warp_endpoint)
+        if [ "$warp" -gt 0 ]; then warp_text="${GREEN}已开启${PLAIN}"; else warp_text="${DIM}未开启${PLAIN}"; fi
+        printf '  %b概览%b  直连 %b%s%b 个 · Argo %b%s%b 个 · 转发 %b%s%b 条 · WARP %b\n' \
+            "$DIM" "$PLAIN" "$BOLD" "$direct" "$PLAIN" "$BOLD" "$argo" "$PLAIN" "$BOLD" "$fwd" "$PLAIN" "$warp_text"
+        ui_rule
+    elif [ -e "$CONFIG_DIR" ] && [ ! -f "$STATE_FILE" ]; then
+        printf '  %b提示%b  %b检测到旧版或残留配置；首次使用 v4 请选 9 清理旧版并重新搭建%b\n' "$YELLOW" "$PLAIN" "$YELLOW" "$PLAIN"
+        ui_rule
+    else
+        printf '  %b新手提示%b  直接选 %b1%b 添加节点，脚本会自动安装核心并生成分享链接\n' "$BLUE" "$PLAIN" "$GREEN" "$PLAIN"
+        ui_rule
+    fi
 }
 show_menu() {
-    menu_header 'Sing-box 管理面板' "$SCRIPT_VERSION · 首次使用请选择搭建节点" "$(get_singbox_status)"
-    if command -v jq >/dev/null && jq -e '.format==4' "$STATE_FILE" >/dev/null 2>&1; then
-        jq -r '"直连节点：\([.nodes[] | select(.kind != "argo")] | length)  Argo 节点：\([.nodes[] | select(.kind == "argo")] | length)"' "$STATE_FILE"
-        printf '转发规则：%s  WARP 出口：%s\n' "$(count_by_type direct)" "$(has_warp_endpoint)"
-    fi
-    menu_option 1 '搭建 / 添加节点'; menu_option 2 '我的节点'; menu_option 3 '转发与分流'
-    menu_option 4 '检查与维护'; menu_option 5 '系统与高级设置'; menu_option 0 '退出'
-    read_menu_choice
-    case "$REPLY" in 1) menu_add ;; 2) menu_nodes ;; 3) menu_network ;; 4) menu_diagnostics ;; 5) menu_advanced ;; 0) return 10 ;; esac
+    menu_header 'Sing-box 管理面板' "极简搭建 · Reality / Argo 固定隧道 / WARP 分流 · ${SCRIPT_VERSION}" "$(get_singbox_status)"
+    show_dashboard
+    menu_section '常用操作（新手从这里开始）'
+    menu_option 1 '快速搭建 / 添加节点（自动装核心）'
+    menu_option 2 '我的节点（链接 / 二维码 / 测活 / 改名 / 删除）'
+    menu_option 3 '查看全部节点链接与二维码'
+    menu_section '进阶功能'
+    menu_option 4 'WARP 出口与分流（解锁 AI / 流媒体 / 换出口 IP）'
+    menu_option 5 'TCP / UDP 端口转发'
+    menu_option 6 'BBR 网络加速 / 流媒体检测 / DNS / Swap / 防火墙'
+    menu_section '状态与维护'
+    menu_option 7 '运行状态 / 日志 / 重启 / 配置回滚 / 更新核心'
+    menu_option 8 '安装 / 更新 sing-box 核心'
+    menu_option 9 '清理旧版 v3 并重新搭建（旧节点失效）'
+    menu_exit
+    read_menu_choice '请选择 [0-9]'
+    case "$REPLY" in
+        1) menu_add ;;
+        2) menu_nodes ;;
+        3) view_node_links; pause ;;
+        4) menu_warp ;;
+        5) menu_forward ;;
+        6) menu_tools ;;
+        7) menu_system ;;
+        8) install_singbox; pause ;;
+        9) legacy_reinstall; pause ;;
+        0) return 10 ;;
+        *) error '请输入 0-9 之间的数字。'; sleep 1 ;;
+    esac
     return 0
 }
 main() {

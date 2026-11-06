@@ -290,7 +290,9 @@ if ssh_ports; then exit 1; fi
         output = self.shell(r'''
 if show_menu <<< 0; then exit 1; else [ "$?" = 10 ]; fi
 ''')
-        for text in ('搭建 / 添加节点', '我的节点', '转发与分流', '检查与维护', '系统与高级设置'):
+        for text in ('快速搭建 / 添加节点', '我的节点', '查看全部节点链接与二维码',
+                     'WARP 出口与分流', 'TCP / UDP 端口转发', 'BBR 网络加速',
+                     '运行状态 / 日志 / 重启', '安装 / 更新 sing-box 核心', '清理旧版 v3 并重新搭建'):
             self.assertIn(text, output)
 
     def test_rollback_recovers_deleted_argo_credentials_from_backup(self):

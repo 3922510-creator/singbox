@@ -2,9 +2,9 @@
 # Sing-box 管理面板 v4。源文件在 src/，tools/build.py 生成单文件分发。
 # 不迁移 v3 或接管未知服务。打开菜单不安装依赖、不写配置、不更新服务定义。
 set -o pipefail
-SCRIPT_VERSION="v4.0.1"
+SCRIPT_VERSION="v4.1.0"
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'
-CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'
+CYAN='\033[35m'; PLAIN='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 META_DIR="$CONFIG_DIR/.meta"
@@ -32,29 +32,46 @@ platform_detect() {
     else INIT_SYS=none; fi
 }
 
-pause() { printf '\n'; read -rp '按回车键继续…' _ || return 0; }
+pause() { printf '\n'; read -rp '  按回车键继续...' _ || return 0; }
 confirm() {
     local answer
     printf '\n%s\n' "$1"
     read -rp '确认执行？回复 y / n [默认 n]: ' answer || return 1
     [ "$answer" = y ]
 }
-ui_rule() { printf '%s\n' '────────────────────────────────'; }
+ui_width() {
+    local w="${COLUMNS:-0}"
+    case "$w" in ''|*[!0-9]*) w=0 ;; esac
+    if [ "$w" -eq 0 ]; then w=$(stty size 2>/dev/null | awk '{print $2}') || w=''; fi
+    case "$w" in ''|*[!0-9]*) w=46 ;; esac
+    [ "$w" -ge 34 ] || w=34
+    [ "$w" -le 56 ] || w=56
+    printf '%s' "$w"
+}
+ui_rule() {
+    local w i=2 line=''
+    w=$(ui_width)
+    while [ "$i" -lt "$w" ]; do line="${line}─"; i=$((i + 1)); done
+    printf '  %b%s%b\n' "${DIM}${BLUE}" "$line" "$PLAIN"
+}
 menu_header() {
-    [ ! -t 1 ] || clear
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\033[H\033[2J'; fi
     printf '\n'; ui_rule
-    printf '%b%s%b\n' "$BOLD" "$1" "$PLAIN"
-    [ -z "${2:-}" ] || printf '%s\n' "$2"
-    [ -z "${3:-}" ] || printf '状态：%s\n' "$3"
+    printf '  %b%s%b\n' "$BOLD" "$1" "$PLAIN"
+    [ -z "${2:-}" ] || printf '  %b%s%b\n' "$DIM" "$2" "$PLAIN"
+    [ -z "${3:-}" ] || printf '  %b状态%b  %s\n' "$DIM" "$PLAIN" "$3"
     ui_rule
 }
-menu_section() { printf '\n%s\n' "$1"; }
-menu_option() { printf '  %s. %s\n' "$1" "$2"; }
-menu_back() { menu_option 0 返回; }
+menu_section() { printf '\n  %b▌%b %b%s%b\n' "$BLUE" "$PLAIN" "$BOLD" "$1" "$PLAIN"; }
+menu_option() { printf '    %b%2s)%b %s\n' "$GREEN" "$1" "$PLAIN" "$2"; }
+menu_back() { printf '\n    %b 0)%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
+menu_exit() { printf '\n    %b 0)%b 退出脚本\n' "$YELLOW" "$PLAIN"; }
 read_menu_choice() {
-    read -rp "${1:-请选择}: " REPLY || REPLY=0
+    local prompt="${1:-请选择}"
+    printf '\n  %b>%b %s: ' "$BLUE" "$PLAIN" "$prompt"
+    read -r REPLY || REPLY=0
 }
-error() { printf '%s\n' "$*" >&2; return 1; }
+error() { printf '%b[!] %s%b\n' "$RED" "$*" "$PLAIN" >&2; return 1; }
 
 # 锁只在明确执行变更后获取；浏览与测试 source 均不创建任何文件。
 acquire_lock() {
@@ -186,9 +203,14 @@ svc_status() {
     case "$INIT_SYS" in systemd) systemctl status sing-box --no-pager ;; openrc) rc-service sing-box status ;; *) error '没有服务管理器。' ;; esac
 }
 get_singbox_status() {
-    if [ ! -x "$BIN_FILE" ]; then printf '未安装'
-    elif svc_active >/dev/null 2>&1; then printf '运行中'
-    else printf '已停止'; fi
+    local ver=''
+    if [ -x "$BIN_FILE" ]; then
+        ver=$("$BIN_FILE" version 2>/dev/null | awk 'NR==1 {print $3}')
+        [ -z "$ver" ] || ver=" v$ver"
+    fi
+    if [ ! -x "$BIN_FILE" ]; then printf '%b[未安装]%b' "$YELLOW" "$PLAIN"
+    elif svc_active >/dev/null 2>&1; then printf '%b[运行中%s]%b' "$GREEN" "$ver" "$PLAIN"
+    else printf '%b[已停止%s]%b' "$RED" "$ver" "$PLAIN"; fi
 }
 
 install_service_file() {
@@ -279,15 +301,15 @@ release_arch() {
 install_singbox() {
     [ "$INIT_SYS" != none ] || { error '需要 systemd / OpenRC。'; return 1; }
     # 没有任何旧版迁移或隐式接管；包括已有但损坏的目录。
-    if [ -e "$CONFIG_DIR" ] && [ ! -f "$STATE_FILE" ]; then error "发现已有目录 $CONFIG_DIR；v4 不覆盖旧版或未知配置。"; return 1; fi
+    if [ -e "$CONFIG_DIR" ] && [ ! -f "$STATE_FILE" ]; then error "发现旧版或残留目录 $CONFIG_DIR；请先在首页选 9「清理旧版并重新搭建」。"; return 1; fi
     if [ -e "$STATE_FILE" ]; then require_owned || return 1; fi
     local path="$SERVICE_FILE"
     [ "$INIT_SYS" != openrc ] || path="$OPENRC_FILE"
-    if [ -e "$path" ] && ! service_owned; then error '发现未知 sing-box 服务，拒绝覆盖。'; return 1; fi
+    if [ -e "$path" ] && ! service_owned; then error '发现旧版或未知 sing-box 服务；若为 v3 旧版请在首页选 9 清理。'; return 1; fi
     if [ "$INIT_SYS" = systemd ] && [ ! -e "$path" ] && systemctl cat sing-box >/dev/null 2>&1; then
         error '发现其他位置的 sing-box systemd 服务，拒绝创建覆盖单元。'; return 1
     fi
-    if [ -e "$BIN_FILE" ] && [ ! -f "$STATE_FILE" ]; then error '发现已有核心，拒绝接管。'; return 1; fi
+    if [ -e "$BIN_FILE" ] && [ ! -f "$STATE_FILE" ]; then error '发现旧版或未知核心；若为 v3 旧版请在首页选 9 清理。'; return 1; fi
     confirm '安装 / 更新 sing-box 核心和 v4 服务；已有 v4 服务将短暂重启' || return 1
     install_dependencies && acquire_lock || return 1
     local directory arch release url binary suffix active=0 previous=0

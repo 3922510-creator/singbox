@@ -25,7 +25,7 @@ legacy_service_known() {
     fi
 }
 legacy_preflight() {
-    local path found=0 fragment dropins
+    local path found=0 fragment dropins load_state
     case "$INIT_SYS" in systemd|openrc) ;; *) error '需要 systemd / OpenRC，不能安全清理无服务托管的旧进程。'; return 1 ;; esac
     # 不以 jq 解析失败作为“旧版”证据；v4 的整个状态文件存在就拒绝。
     [ ! -e "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] || { error '存在 v4 状态或未知元数据，拒绝按旧版清理。'; return 1; }
@@ -43,7 +43,22 @@ legacy_preflight() {
             found=1
         fi
     done
-    [ "$found" = 1 ] || { error '没有可识别的旧版服务，拒绝猜测归属。'; return 1; }
+    [ ! -d "$ARGO_DIR" ] || { error '发现隧道元数据，请先核实归属；本入口不清理共享 cloudflared。'; return 1; }
+    if [ "$found" = 0 ]; then
+        # 卸载后仅剩目录 / 核心时，不应要求已被删除的旧 unit 作为证据。
+        # 仍拒绝发行版其他路径的服务，以及任何残留运行进程。
+        if [ "$INIT_SYS" = systemd ]; then
+            load_state=$(systemctl show sing-box -p LoadState --value) || return 1
+            fragment=$(systemctl show sing-box -p FragmentPath --value) || return 1
+            dropins=$(systemctl show sing-box -p DropInPaths --value) || return 1
+            [ "$load_state" = not-found ] && [ -z "$fragment$dropins" ] || {
+                error '其他位置仍有 sing-box 服务或缓存的服务定义，拒绝按残留目录清理。'; return 1;
+            }
+        fi
+        if legacy_still_running; then error '无服务文件但仍有 sing-box 进程，请先核实托管方式。'; return 1; fi
+        printf '未发现服务文件；将按残留安装清理，确认前不会删除任何文件。\n'
+        return 0
+    fi
     if [ "$INIT_SYS" = systemd ]; then
         [ -f "$SERVICE_FILE" ] || return 1
         fragment=$(systemctl show sing-box -p FragmentPath --value) || return 1
@@ -54,8 +69,6 @@ legacy_preflight() {
     else
         [ -f "$OPENRC_FILE" ] || return 1
     fi
-    # v3 没有 Argo 安装逻辑；发现隧道资源时不能当作旧版附属品删除。
-    [ ! -d "$ARGO_DIR" ] || { error '发现隧道元数据，请先核实归属；本入口不清理共享 cloudflared。'; return 1; }
 }
 legacy_stop() {
     # 普通 svc_stop 只接受 v4；旧版在独立归属检查通过后才走此入口。
@@ -76,8 +89,11 @@ legacy_still_running() {
     for proc in /proc/[0-9]*; do
         mapfile -d '' -t argv < "$proc/cmdline" 2>/dev/null || continue
         [ "${#argv[@]}" -ge 4 ] || continue
-        if [ "${argv[-4]}" = "$BIN_FILE" ] && [ "${argv[-3]}" = run ] &&
-            [ "${argv[-2]}" = -C ] && [ "${argv[-1]}" = "$CONFIG_DIR" ]; then return 0; fi
+        if [ "${argv[-3]}" = run ]; then
+            [ "${argv[-4]}" != "$BIN_FILE" ] || return 0
+            if { [ "${argv[-2]}" = -C ] && [ "${argv[-1]}" = "$CONFIG_DIR" ]; } ||
+                { [ "${argv[-2]}" = -c ] && [ "${argv[-1]}" = "$CONFIG_FILE" ]; }; then return 0; fi
+        fi
     done
     return 1
 }
@@ -117,9 +133,13 @@ legacy_cleanup() {
         index=$((index + 1))
     done
     printf '私密恢复备份：%s（包含旧配置和密钥，请勿公开）\n' "$directory"
-    legacy_stop || { error '停止失败，未删除配置。'; return 1; }
-    if legacy_still_running; then error '旧核心仍在运行，停止清理。'; return 1; fi
-    svc_disable || { error '移除自启失败，停止清理。'; return 1; }
+    if [ -f "$SERVICE_FILE" ] || [ -f "$OPENRC_FILE" ]; then
+        legacy_stop || { error '停止失败，未删除配置。'; return 1; }
+        if legacy_still_running; then error '旧核心仍在运行，停止清理。'; return 1; fi
+        svc_disable || { error '移除自启失败，停止清理。'; return 1; }
+    elif legacy_still_running; then
+        error '发现运行中的残留进程，停止清理。'; return 1
+    fi
     rm -f -- "$BIN_FILE" "$SERVICE_FILE" "$OPENRC_FILE" "$SINGBOX_LOG" "${scripts[@]}" || return 1
     rm -rf -- "$CONFIG_DIR" || return 1
     [ "$INIT_SYS" != systemd ] || systemctl daemon-reload || return 1
