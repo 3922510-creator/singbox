@@ -13,7 +13,7 @@
 #      而主脚本 singbox.sh 需要 bash，所以这里会把 bash 一并装好。
 # ====================================================================
 
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
+RED="\033[31m"; GREEN="\033[32m"
 BLUE="\033[36m"; PLAIN="\033[0m"
 
 REPO_RAW="${SINGBOX_RAW:-https://raw.githubusercontent.com/3922510-creator/singbox/main/singbox.sh}"  # 可用 SINGBOX_RAW 指定镜像/加速地址
@@ -21,8 +21,8 @@ INSTALL_PATH="/usr/local/bin/sb"
 ALIAS_PATH="/usr/local/bin/SB"
 
 msg() { printf '%b[*]%b %b\n' "$BLUE" "$PLAIN" "$1"; }
-ok()  { printf '%b[✓]%b %b\n' "$GREEN" "$PLAIN" "$1"; }
-err() { printf '%b[✗]%b %b\n' "$RED" "$PLAIN" "$1" >&2; }
+ok()  { printf '%b[OK]%b %b\n' "$GREEN" "$PLAIN" "$1"; }
+err() { printf '%b[ERROR]%b %b\n' "$RED" "$PLAIN" "$1" >&2; }
 
 [ "$(id -u)" -ne 0 ] && err "请使用 root 用户运行安装器！" && exit 1
 
@@ -42,46 +42,35 @@ detect_family() {
     echo unknown
 }
 
-# Alpine 默认镜像可能只启用 main 仓库；qrencode 在 community 里
-apk_ensure_community() {
-    repos=/etc/apk/repositories
-    [ -f "$repos" ] || return 0
-    grep -qE '/community$' "$repos" && return 0
-    base=$(sed -n 's#^\([^#]*\)/main$#\1#p' "$repos" | head -1)
-    [ -n "$base" ] || return 0
-    printf '%s/community\n' "$base" >> "$repos"
-    msg "已启用 Alpine community 仓库：${base}/community"
-}
-
 # ---------- 安装依赖 ----------
 install_deps() {
     family=$(detect_family)
     missing=0
-    for c in curl jq wget qrencode flock bash; do
+    for c in curl jq ss flock bash tar base64; do
         command -v "$c" >/dev/null 2>&1 || missing=1
     done
     if [ "$missing" -eq 0 ]; then ok "依赖已就绪"; return 0; fi
 
-    msg "安装依赖 (curl jq wget qrencode flock bash)  系统: ${family}"
+    msg "安装必要依赖（不安装防火墙、不修改 DNS） 系统: ${family}"
     case "$family" in
         debian)
-            apt-get update -qq && apt-get install -y -qq curl jq wget ufw qrencode util-linux bash
+            apt-get update -qq && apt-get install -y -qq curl jq iproute2 util-linux bash ca-certificates tar
             ;;
         redhat)
-            yum install -y -q curl jq wget firewalld qrencode util-linux bash
+            yum install -y -q curl jq iproute util-linux bash ca-certificates tar
             ;;
         alpine)
             apk update -q 2>/dev/null
-            apk add --no-cache curl jq wget util-linux bash ca-certificates kmod iproute2
-            apk_ensure_community
-            apk add --no-cache libqrencode-tools 2>/dev/null \
-                || printf '%b提示：qrencode（二维码）未能安装，不影响节点功能%b\n' "$YELLOW" "$PLAIN"
+            apk add --no-cache curl jq util-linux bash ca-certificates iproute2 tar
             ;;
         *)
-            err "暂不支持的系统（${family}），请手动安装 curl jq wget qrencode flock bash"
+            err "暂不支持的系统（${family}），请手动安装 curl jq iproute2 util-linux bash ca-certificates tar"
             return 1
             ;;
     esac
+    for c in curl jq ss flock bash tar base64; do
+        command -v "$c" >/dev/null 2>&1 || { err "缺少必要命令：$c"; return 1; }
+    done
     ok "依赖安装完成"
 }
 
@@ -89,7 +78,7 @@ install_deps() {
 download_script() {
     msg "下载管理脚本 -> ${INSTALL_PATH}"
     tmp=$(mktemp)
-    if ! curl -sL --max-time 60 -o "$tmp" "$REPO_RAW"; then
+    if ! curl -fSL --proto '=https' --proto-redir '=https' --max-time 60 -o "$tmp" "$REPO_RAW"; then
         err "下载失败，请检查网络或稍后重试"
         rm -f "$tmp"; return 1
     fi
@@ -98,7 +87,13 @@ download_script() {
         err "下载内容异常（非脚本），已放弃安装"
         rm -f "$tmp"; return 1
     fi
-    install -m 755 "$tmp" "$INSTALL_PATH" || { cp "$tmp" "$INSTALL_PATH" && chmod 755 "$INSTALL_PATH"; }
+    if ! bash -n "$tmp"; then err "脚本语法校验失败"; rm -f "$tmp"; return 1; fi
+    if [ -e "$INSTALL_PATH" ]; then
+        backup="${INSTALL_PATH}.bak-$(date +%Y%m%d-%H%M%S)-$$"
+        cp -p "$INSTALL_PATH" "$backup" || { rm -f "$tmp"; return 1; }
+        msg "旧面板已备份：$backup"
+    fi
+    install -m 755 "$tmp" "$INSTALL_PATH" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
     ok "主脚本已安装"
 }
@@ -113,6 +108,11 @@ main() {
     printf '%b==================================================%b\n' "$BLUE" "$PLAIN"
     printf '        Sing-box 管理面板 · 一键安装\n'
     printf '%b==================================================%b\n' "$BLUE" "$PLAIN"
+    printf 'v4 不迁移旧配置；将安装必要依赖并写入 sb / SB 命令，不启动代理服务。\n'
+    if [ ! -t 0 ] && [ -r /dev/tty ]; then exec < /dev/tty; fi
+    printf '确认安装 / 更新面板？回复 y / n [默认 n]: '
+    read -r answer || exit 1
+    [ "$answer" = y ] || exit 0
     install_deps      || exit 1
     download_script   || exit 1
     register_shortcut

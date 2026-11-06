@@ -1,253 +1,158 @@
-# Sing-box 管理面板
+# Sing-box 管理面板 v4
 
-面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality / AnyTLS-Reality 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
+面向 SSH 终端的小白用户：默认值减少技术选择，端口仍可自定义，Argo 还会询问 WS 路径。所有原有核心能力保留，新增固定 Cloudflare Tunnel 节点。
 
-## 一键安装
+**v4 是独立新版，不迁移 v3、不接管未知 sing-box 配置或服务。** 检测到旧版安装时拒绝覆盖；不要直接在仍需使用的 v3 生产安装上执行核心安装。单独的 DDNS 工具不受本次重构影响，说明见 [DDNS 文档](docs/ddns.md)。
 
-```bash
-bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh)
-```
+## 使用与构建
 
-Alpine（自带 ash、没有 bash）用这一行：
+运行入口仍为 `sb` / `SB`，安装器仍为 POSIX sh，适用于尚无 Bash 的 Alpine。
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh | sh
+# 远端地址指向已发布 main；不会自动获取尚未发布的本地开发改动。
+curl -fsSL https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh -o install.sh
+sh install.sh
+sb
 ```
 
-安装器是 POSIX sh 写的，会把 `bash`、`curl`、`jq`、`qrencode` 等依赖一并装好（Alpine 上自动用 `apk`，需要时自动补 `community` 仓库）。
-Alpine 上安装/更新核心时，脚本会实测官方二进制能否运行，不能就自动 `apk add gcompat libc6-compat`（官方 release 是 glibc 构建，Alpine 是 musl）。
+安装器先确认，只安装必要依赖和面板命令，不启动代理，不安装防火墙，不修改 DNS。二维码工具可在“核心与服务”中按需安装。安装器支持 `SINGBOX_RAW` 指定 HTTPS 主脚本镜像。
 
-安装完成后运行：
+开发工作区：
 
-```bash
-SB      # 或 sb
-```
-
-也可以直接下载脚本：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/3922510-creator/singbox/main/singbox.sh -o singbox.sh
-chmod +x singbox.sh
-sudo bash singbox.sh
-```
-
-## 主要功能
-
-### 节点与转发
-
-- VLESS-Reality 节点添加、删除与管理
-- AnyTLS-Reality 节点添加、删除与管理（需 sing-box ≥ 1.12.0，低于该版本菜单会直接拒绝并提示升级）
-- 自动生成分享链接和二维码（VLESS 与 AnyTLS 节点一起按序号列出，选序号即可看对应二维码）
-- TCP / UDP 端口转发规则增删查
-
-> **AnyTLS + Reality 的客户端限制**：服务端只有 sing-box 内核能跑；客户端需 sing-box 内核（官方 sing-box、Karing、Hiddify、v2rayN 等），
-> 或 Shadowrocket 2.2.65+（类型选 AnyTLS，TLS 开启后填 SNI / 公钥 / 短 ID / 指纹，导入 `anytls://…?security=reality&pbk=&sid=` 链接会自动带上）。
-> mihomo（Clash Meta）明确不支持 AnyTLS+Reality（服务端与客户端都不支持），Xray 不支持 AnyTLS。
-> 想要全平台可用的节点用 VLESS-Reality，要抗 TLS-in-TLS 长度特征时用 AnyTLS-Reality。
-
-### Cloudflare WARP 分流
-
-- 基于 sing-box 1.11+ `endpoint` 架构配置 WARP
-- WARP 账号自动注册与配置
-- AI 服务分流（ChatGPT、Claude、Gemini 等）
-- 流媒体分流（Netflix、Disney+、YouTube 等）
-- 自定义域名、域名后缀、关键词和 IP 网段分流
-- 指定入站节点全部走 WARP
-- 查看和删除已添加的 WARP 规则
-
-### 网络加速（BBR / BBRv3）
-
-菜单入口：实用工具 → 网络加速
-
-- 一键切换 `BBR + fq` / `BBRv3 + fq`，或恢复系统默认 `CUBIC + fq_codel`
-- 即时生效：写入 `/etc/sysctl.d/99-zz-bbr-mode.conf` 持久化，同时替换网卡根队列（默认队列只对新网卡生效）
-- 先 `tc` 实测内核支不支持目标队列，不支持就直接拒绝且**一点配置都不改**（避免把内核没编译的 qdisc 写进 sysctl.d），回读校验失败还会把配置文件恢复原样
-- 自动判定内核是否 BBRv3（内核 release 名 + `tcp_bbr` 模块 version 字段），不靠猜
-- 从第三方源（`XDflight/bbr3-debs`）安装 BBRv3 内核（仅 deb 系；Alpine 用官方内核），可自选版本，不自动重启
-- 查看已安装内核与完整状态判定依据
-
-### 系统与网络工具
-
-- 安装 / 更新 Sing-box 核心
-- 服务启停、状态查看和日志查看
-- 流媒体与 AI 服务连通性检测
-- 回程路由测试：实用工具 → `7`，接入 [BestTrace.sh](https://besttrace.sh/)，支持电信 / 联通 / 移动 / 教育网及上游线路识别。原有工具编号不变。
-  - 输入 `y` / `Y` 后才下载并以 root 权限运行上游脚本，`n` 或直接回车取消；首次运行可能安装 NextTrace，结果仅供参考。
-  - HTTPS 下载、超时和语法检查，结束后清理面板下载的临时文件；失败会返回面板。不修改 sing-box 配置、不重启服务。
-  - 此入口运行在线第三方代码（包括其后续安装器），不是内置离线检测；检测目标、线路判定、架构与发行版兼容性由上游维护。
-- DNS 设置（Cloudflare、Google、Quad9、AliDNS、自定义）
-- UFW 防火墙端口管理，自动保留 SSH 端口避免锁死
-- 配置查看、手动编辑、校验、重置和回滚
-
-## 安全与可靠性
-
-- 必须使用 root 运行
-- 配置修改先写入临时文件，校验通过后才正式替换
-- 自动保留上一次有效配置，失败时自动回滚
-- 使用并发锁，避免多个管理实例同时修改配置
-- 规则集首次使用时自动下载，服务器需要能够访问 GitHub
-
-## 系统要求
-
-- Debian / Ubuntu / RHEL 系，或 Alpine（OpenRC）；init 系统自动识别
-- root 权限
-- 建议使用支持 UTF-8 的终端
-- 安装脚本会自动安装 `curl`、`jq`、`wget`、`qrencode`、`bash` 等依赖
-
-## 各发行版差异
-
-| 项目 | Debian / Ubuntu / RHEL | Alpine |
-| --- | --- | --- |
-| 服务管理 | systemd (`systemctl`)，`Restart=on-failure` | OpenRC (`rc-service` / `rc-update`)，服务文件 `/etc/init.d/sing-box`；由 `supervise-daemon` 托管，进程崩溃/被 OOM 杀掉后 10s 内自动拉起（v3.4.8+） |
-| 官方二进制 | 直接可用 | 需 `gcompat` + `libc6-compat`（脚本实测不能跑就自动装）；备选 `apk add sing-box`（musl 原生，版本略旧） |
-| 日志 | `journalctl -u sing-box` | `/var/log/sing-box.log` |
-| 包管理 | `apt` / `yum` | `apk`（二维码在 `libqrencode-tools`，需 community 仓库） |
-| 防火墙 | ufw / firewalld | 默认无防火墙；若自建了 DROP 规则，添加节点时会用 `iptables` 放行 |
-| BBR 切换 | 支持 | 支持（首次自动 `apk add iproute2` 拿到 `tc`） |
-| BBRv3 内核安装 | 支持（deb） | 不支持，用官方内核：`apk add linux-lts` 等 |
-| 无 init 的容器 | — | 自动降级为 `nohup` 托管，重启后需手动拉起 |
-
-## 更新
-
-重新执行一键安装命令即可更新脚本：
-
-```bash
-bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/install.sh)
-```
-
-## 项目文件
-
-- `singbox.sh`：主管理脚本（需要 bash；systemd / OpenRC 兼容）
-- `install.sh`：一键安装与更新脚本（POSIX sh，Alpine 可直接用 `sh` 跑）
-
-## 免责声明
-
-本项目仅用于合法的服务器运维和网络测试。请遵守所在地区法律法规以及服务提供商的使用条款。
-
-## 节点备注
-
-- 添加 VLESS-Reality / AnyTLS-Reality 节点时可输入备注（最多 80 字），支持中文、空格及特殊符号；分享链接的名称会自动 URL 编码。
-- 已有节点：`sb → 节点管理 → 5 修改节点备注`，留空恢复默认名称。
-- 列表、分享链接及二维码同步使用备注；已经导入客户端的名称不会自动变化，需重新导入或在客户端手动修改。
-- 备注保存在 `/etc/sing-box/.meta/node-names.json`（权限 600），不修改节点内部 tag、端口、认证或路由，修改备注无需重启服务；原有节点未设置备注时继续显示 tag。
-
-备注功能回归测试（隔离临时目录，不操作生产配置/服务）：
-
-```bash
+```sh
+python3 tools/build.py
+bash -n singbox.sh
+sh -n install.sh
 python3 -m unittest discover -s tests -v
+# 实际安装/配置需在干净测试机手动运行，且逐项确认：
+bash singbox.sh
 ```
 
-## Swap 管理
+`src/` 是开发源码，`singbox.sh` 是自动拼接出的单文件分发产物。服务器不需要 Python，也不需要下载模块目录。请勿直接修改分发产物。
 
-入口：`sb → 实用工具 → 6 Swap 管理`。
-
-- 查看系统全部 Swap 和内存状态；自定义 128–65536 MiB 创建 Swap，并写入 `/etc/fstab` 开机启用。
-- 只创建和删除 `/var/lib/sb-swap/swapfile`，使用独立标记识别归属，不接管已有 `/swapfile`、Swap 分区或 zram；目录已存在时拒绝覆盖。
-- 添加、删除都需输入 `确认`；删除前检查可用内存，`swapoff` 失败不会删文件或持久化条目。
-- 修改 fstab 前保留 `/etc/fstab.sb-swap.bak.*` 备份，以同目录临时文件原子替换；不修改其他条目。持久化失败会尝试撤销创建/恢复启用，失败则保留文件并提示人工处理。
-- 当前仅提供普通磁盘文件系统上的通用 Swap 文件流程；拒绝 Btrfs/ZFS、内存文件系统、NFS 和 overlay。容器没有 `swapon` 权限时会报错并清理本次创建文件，不改 fstab。
-- 调整容量请先删除再添加；不会调整 swappiness，也不会重启 sing-box 或服务器。面板卸载 sing-box 不会删除 Swap。
-
-## NAT 服务器 Cloudflare DDNS（独立脚本）
-
-适合共享公网 IPv4 会变化、商家映射端口固定的 NAT 服务器。独立安装，**不依赖、不修改、不重启 sing-box**。
-
-```sh
-curl -fSL https://raw.githubusercontent.com/3922510-creator/singbox/main/install-ddns.sh -o /tmp/install-cloudflare-ddns.sh && sudo sh /tmp/install-cloudflare-ddns.sh
-```
-
-已经是 root 时可以去掉 `sudo`。支持 Debian / Ubuntu / RHEL 系（systemd）与 Alpine（OpenRC）；仅依赖 `sh`、`curl`、`jq` 和 CA 证书，不需要 Python。
-
-安装过程中输入：
-
-1. Cloudflare **API Token**：权限 `Zone / DNS / Edit` 和 `Zone / Zone / Read`，资源限制为对应域名，不用 Global API Key。
-2. **Zone ID**：Cloudflare 域名概述页面可查看。
-3. 目标完整域名，例如 `nat.example.com`。
-
-IP 来源固定为三个免费 HTTPS 接口，无需选择：
-
-- ip.sb：`https://api.ip.sb/ip`
-- ipify：`https://api4.ipify.org`
-- icanhazip：`https://ipv4.icanhazip.com`
-
-**三个接口必须全部返回相同且有效的公网 IPv4 才更新**，不是二比一多数投票。任一个超时、失败、返回无效内容或结果不一致，都保留原 DNS，等待下次检查。查询强制 IPv4，绕过环境代理；不读取本地网卡、不查询商家域名、不接受自定义来源。
-
-**注意：接口获取的是公网出口 IPv4。** 三方一致不代表能验证 NAT 入站映射，使用前仍应核实出口与入站映射 IP 相同。
-
-脚本每 60 秒检查一次，变化后更新 A 记录并设为**仅 DNS（灰云）**、TTL 60 秒。首次写 DNS 前展示地址并要求确认；无变化不写入，获取失败保留原 DNS；已有 Shell 安装会进入确认升级流程，未知同名文件拒绝覆盖，遇到同名 CNAME 或多条 A 记录会拒绝。域名生效速度受 DNS 缓存影响，不保证一分钟内全球生效。不会改 AAAA，若目标域名已有 AAAA，请自行核对，避免客户端优先连接错误 IPv6。
-
-访问仍需带商家分配的**外部端口**，例如：
-
-```sh
-ssh -p 30001 root@nat.example.com
-```
-
-### SSH 终端管理菜单
-
-安装或升级后，以 root 执行：
-
-```sh
-ddns
-```
-
-**首页直接显示目标域名、三接口校验策略、开机自启状态、自动更新运行状态、当前 Cloudflare A 记录和灰云状态**，无需进入子菜单。首页只读查询，不更新 DNS、不执行三接口 IP 检测；选 `1` 刷新状态。菜单另有三接口检测、立即更新 DNS、查看查询接口、最近 10 条换 IP 记录、开启/关闭自动更新、Bark 配置（`8`）和测试通知（`9`）。它是 SSH 终端菜单，**不开放 Web 端口，不改 SSH 服务**。状态展示使用中文，不输出 Token；菜单自动清屏，操作结果按回车返回，不再反复堆叠。所有 DDNS 确认统一使用 `[y/N]`：`y` / `Y` 执行，`n` 或直接回车取消。
-
-**已安装 Shell 版**：重新运行上面的一键安装命令，输入 `y` 后升级，原 Token、域名和自启设置保留，不用重新填写，IP 来源统一切换为三个接口交叉验证。升级前自动备份旧脚本到 `/usr/local/lib/cloudflare-ddns.sh.bak.*`，校验新脚本并原子替换；systemd 同时备份并精确更新 DDNS service（`--scheduled` 静默运行、`StateDirectory=cloudflare-ddns` 可写目录），校验并 reload，下次运行加载新版本，不改变 timer 的开关；OpenRC 会在确认后重启 DDNS 服务。旧配置中的 `source_mode` / `source` 字段不再读取，不需要手动清理；无论旧版选过哪种来源，升级后均只走三个固定接口。
-
-Token 仅在本机隐藏输入，存放于 `/etc/cloudflare-ddns/config.json`（目录 700、文件 600），不要发给别人或提交到 Git。安装后手动检查：
-
-```sh
-sh /usr/local/lib/cloudflare-ddns.sh --once
-```
-
-### 换 IP 日志：只保留最近 10 条
-
-菜单 `5` 读取 `/var/lib/cloudflare-ddns/changes.log`（目录 700、文件 600），格式：
+## 五个主入口
 
 ```text
-2026-11-04 13:00:00 +0800  nat.example.com  1.1.1.1 -> 8.8.8.8
+1. 搭建 / 添加节点
+2. 我的节点
+3. 转发与分流
+4. 检查与维护
+5. 系统与高级设置
+0. 退出
 ```
 
-只有**已有 A 记录的 IP 改变且 Cloudflare 更新成功**才记一条；无变化、首次创建、仅灰云设置变化、查询失败或 DNS 更新失败均不写记录。每次原子替换，仅保留最新 10 条，时间为服务器本地时间并附 UTC 偏移。更新加锁，避免手动更新和定时任务同时写日志或重复推送。
+### 搭建 / 添加节点
 
-后台正常轮询不再输出接口 IP 或“无变化”；系统 journal 自身的服务启停消息不属于这 10 条记录。升级不删除历史 journal、旧 OpenRC 日志或备份，也不会把旧调试日志导入新的换 IP 记录。
+- VLESS Reality：推荐、无需自有域名，可设置端口、SNI 和备注，自动生成 UUID、密钥和短 ID。
+- AnyTLS Reality：自动生成密码与密钥；需要 sing-box >= 1.12 和支持 AnyTLS + Reality 的客户端。mihomo 不支持该组合。
+- Argo：固定 Cloudflare Tunnel，VLESS + WebSocket + TLS，询问端口、路径、域名、Tunnel Token。
+- 未安装时将引导确认安装核心、依赖和系统服务，无需先在多个菜单之间跳转。
+- 检查配置与真实 TCP/UDP 监听端口，避免抢占其他程序端口；端口 1–65535，不接受前导零。
+- 普通节点会提示本机防火墙和云安全组放行要求；只在用户单独确认后修改受支持的本机防火墙。
 
-### Bark Webhook（支持自建）
+### 我的节点
 
-在菜单 `8` 只填写一条基础推送链接，隐藏输入并保存到现有的私有配置文件：
+统一选择 Reality / Argo 节点，再查看链接和二维码、修改备注、检查完整链路或删除。备注只影响显示和分享链接的名称，不需要重启；中文、空格和特殊字符进行 URL 编码。
+
+删除节点时同步清理其分流关联；共享规则保留其余节点，不会因为删除一个节点而误删整条共享规则。
+
+### 转发与分流
+
+- TCP / UDP 转发：添加、查看、删除；保留直连到目标地址的默认行为。
+- WARP：通过 warp-reg 注册 / 重置账号、查看出口、删除出口与相关规则。
+- AI、流媒体、自定义域名后缀、指定节点全部走 WARP。
+- 查看 / 删除具体分流规则，避免重复添加相同预设。
+- Argo 是入口，WARP 是出口；两者独立，可以组合使用。AnyTLS 和 VLESS 节点都可按节点分流。
+
+### 检查与维护
+
+- 一键检查只读，不重置、不静默修复。
+- sing-box / cloudflared 服务状态与日志。
+- 配置查看、在副本上编辑、核心校验、重置、按备份目录回滚。
+- 流媒体快速检测、完整社区脚本检测、BestTrace 回程路由测试。
+- 第三方检测脚本需用户确认；HTTPS 下载并做 Bash 语法检查，独立子进程运行、结束清理。语法检查不代表第三方脚本已经经过安全审计。
+
+### 系统与高级设置
+
+- 核心安装 / 更新、启停 / 重启、查看版本、卸载（保留配置和备份）。
+- Argo 本机隧道的启停、日志和无引用资源移除。
+- DNS 预设 / 自定义 / 备份恢复。遇到由其他网络管理器维护的 `resolv.conf` 符号链接时拒绝直接覆盖，不关闭 systemd-resolved，不强行解锁文件。
+- UFW 规则开放 / 删除 / 启用 / 关闭 / 重载。启用前识别实际监听的 SSH 端口，不能确认时拒绝自动启用，不假定端口是 22。面板不能修改云安全组。
+- BBR + fq_codel、BBR + fq、CUBIC + fq_codel；BBRv3 内核安装 / 查看。
+- TCP 缓冲区推荐值、8 / 16 / 32 MB、自定义、带宽 × RTT 估算和恢复。
+- Swap 状态、创建、删除；只管理面板自己的 Swap，不接管系统或其他程序创建的 Swap。
+
+系统工具不会作为节点搭建的默认附加步骤执行。内核安装后不自动重启服务器。
+
+## Argo 配置流程
+
+1. 在面板选择 Argo，填写本机回源端口、WS 路径，可回车采用默认值。
+2. 面板显示回源地址；用户自行在 Cloudflare 创建固定 Tunnel，并配置公开主机名：
+   - 类型：`HTTP`
+   - 服务地址：`127.0.0.1:所选端口`
+   - 此服务地址不附加 WS 路径。
+3. 回到面板填写节点域名与 **Tunnel Token**。只粘贴 Token 本身，不是整条安装命令，也不是 Cloudflare API Token。
+4. 确认后安装 cloudflared、创建或复用本机隧道服务、生成节点入站与 UUID、设置自启。
+5. 通过真实 sing-box 客户端发起代理请求验证完整链路。失败则回退本次节点变更；不会拿 cloudflared 进程存活冒充连接成功。
 
 ```text
-https://api.day.app/你的设备Key
-http://192.168.1.3:8080/你的设备Key
-https://bark.example.com/反代前缀/你的设备Key
-https://用户名:密码@bark.example.com/你的设备Key
+客户端 -- WSS / 域名:443 --> Cloudflare
+                               |
+                          固定加密隧道
+                               |
+                          cloudflared
+                               |
+             HTTP / WS / 127.0.0.1:用户端口
+                               |
+                    sing-box VLESS 入站
+                               |
+                      直连 / WARP 出口
 ```
 
-支持 HTTP / HTTPS、自建端口、反代前缀和 URL 内的 **HTTP Basic Auth（`用户名:密码@`）**，无需再填写鉴权字段。用户名或密码包含 `@`、`/`、`#` 等保留字符时须使用 URL 百分号编码。**不要附推送标题、正文或查询参数**。HTTP 会明文传输设备 Key，跨公网建议 HTTPS；URL 不出现在进程参数、换 IP 日志或首页。菜单 `8` 留空后确认可以关闭通知。
+- 本机回源端口仅监听 `127.0.0.1`，不向公网开放。客户端连接端口始终是 443。
+- WS 路径由 sing-box 校验，分享链接自动填写同一路径。
+- 每个固定 Tunnel ID 托管一个 cloudflared 服务；多个不同域名的节点可以复用同一隧道，云端各自配置对应回源端口。
+- 相同域名不重复创建节点；本版不做一个域名按不同路径映射多个回源的复杂配置。
+- 最后一个关联节点删除后，移除对应本机服务和 Token；仍有关联时不停止共享隧道。
+- 没有 Cloudflare API 权限，因此不创建、不修改、不删除云端 Tunnel 或 DNS。
 
-成功换 IP 后以 JSON POST 发送域名和 `原 IP -> 现 IP`，不变更 DNS 时不推送。菜单 `9` 发送测试通知，严格检查 HTTP 成功和 Bark JSON `code=200`，不修改 DNS、不写换 IP 日志。显示成功只代表 Bark 服务端确认接收，手机是否实际收到还需自行核对。通知失败不会回滚已成功的 DNS 更新，也不自动重复推送，可用菜单 `9` 检查连接。
+## 安全、存储与恢复
 
-systemd 管理：
+- 打开菜单不安装依赖、不创建配置、不更新服务定义。非交互 EOF 返回或退出，不死循环。
+- root 权限；systemd / OpenRC 服务管理。没有可靠 init 系统时，拒绝部署服务，不使用 nohup 凑合托管。
+- 配置和节点元数据必须保持关联；手动编辑不能将 Argo 回源改成公网监听。
+- 修改流程：生成候选 → 核心校验 → 展示影响与确认 → 加锁 → 备份 → 原子写入 → 重启验收。失败恢复本次变更前的配置和元数据；服务恢复失败会明确报错。
+- 共享 sing-box 配置变更会短暂重启核心，可能中断所有节点的现有连接，确认时明确提示。
+- 核心升级前使用候选二进制校验现有配置；更新失败恢复上一核心。不使用过时版本兜底，不清理 `/tmp/sing-box*` 之类通配路径。
+- Tunnel Token 隐藏输入，文件权限 `600`，所在目录 `700`；cloudflared 使用 `--token-file`，Token 不进入进程参数、分享链接或面板日志。
+- `/etc/sing-box/config.json`：核心配置。
+- `/etc/sing-box/.meta/state.json`：v4 格式标记及节点元数据。
+- `/etc/sing-box/.meta/tunnels/<Tunnel ID>/`：私密 Token 与隧道归属记录。
+- `/var/lib/sb/backups/change-*`：每次已确认配置变更的配置、元数据和隧道凭据快照。含私密信息，目录权限 `700`，不上传、不自动删除。
+- 配置回滚可从快照恢复已删除节点所需的本机隧道资源；云端资源始终由用户管理。回滚后应再次运行节点检查。
+- DNS、BBR、TCP 缓冲区、Swap 的系统变更使用各自备份 / 恢复入口，不随节点配置回滚自动改变。
 
-```sh
-systemctl status cloudflare-ddns.timer
-journalctl -u cloudflare-ddns.service -n 30 --no-pager
-# 停用自动更新
-systemctl disable --now cloudflare-ddns.timer
-```
+## 验证范围
 
-Alpine / OpenRC 管理：
+自动测试覆盖原有 DDNS、Swap、BestTrace，以及 v4 节点、菜单、端口与输入校验、配置失败回退、Token 存储、共享隧道和资源恢复。
 
-```sh
-rc-service cloudflare-ddns status
-cat /var/lib/cloudflare-ddns/changes.log
-# 停用自动更新
-rc-service cloudflare-ddns stop
-rc-update del cloudflare-ddns default
-```
+当本机存在真实核心时，额外校验 Reality / AnyTLS / WS / 转发 / WARP 配置，并执行仅绑定 loopback 的真实 VLESS + WS 代理测试。可用 `SB_TEST_CORE=/path/to/sing-box` 指定测试核心。
 
-修改配置前先备份；systemd / OpenRC 均会在下次检查时重新读取配置。此安装器不会覆盖旧版 Python 安装，已装旧版的机器需先停用旧服务并备份、迁移，不会自动卸载系统 Python。新的换 IP 日志自动保留 10 条，无需 logrotate。离线测试（不会访问 Cloudflare、不会通知真实设备，也不会操作宿主服务；Webhook 测试仅在本地随机空闲端口运行模拟服务器）：
+已在私有 mount / PID / network / UTS / IPC 命名空间中运行真实 systemd 和 Alpine OpenRC：安装、启用自启、启动、停止、节点添加、崩溃重拉、端口冲突回滚、卸载后重装均通过。Alpine 优先安装上游原生 musl 包，另覆盖 glibc + gcompat 的进程识别。
 
-```sh
-python3 -m unittest discover -s tests -p 'test_ddns.py' -v
+真实 cloudflared 在上述隔离环境启动，并以虚构 Token、断网条件验证探测失败后的配置与资源回退。**这不是 Cloudflare 真实固定隧道成功验收，也不是整机重启自启验收。** 云端全链路和小白交互体验仍待验证；生产安装未替换。详见 [验证记录](docs/v4-validation.md)。
+
+## 文件结构
+
+```text
+src/header.sh         常量、平台、配置事务、核心与服务
+src/core.sh           维护、恢复、DNS 和防火墙
+src/nodes.sh          节点与转发
+src/argo.sh           固定隧道和完整节点检测
+src/warp.sh           WARP 出口与分流
+src/system-tools.sh   网络调优、Swap、解锁和回程检测
+src/menus.sh          五个入口与交互
+singbox.sh            生成的单文件
+install.sh            POSIX 安装器
+DDNS 相关文件          独立工具，见 docs/ddns.md
 ```
