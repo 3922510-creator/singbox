@@ -13,7 +13,8 @@ class NodeNamesTests(unittest.TestCase):
         source = SCRIPT.read_text()
         names = ["node_display_name", "read_node_name", "save_node_name",
                  "node_link_fragment", "rename_node", "prompt_delete_index",
-                 "inbound_count", "inbound_field", "count_by_type", "view_node_links",
+                 "inbound_count", "inbound_field", "inbound_node_type", "count_by_type",
+                 "ss2022_count", "view_node_links",
                  "add_reality_node", "add_anytls_node", "menu_nodes", "delete_node"]
         functions = []
         for name in names:

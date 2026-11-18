@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.7.0"
+SCRIPT_VERSION="v3.7.1"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -25,6 +25,8 @@ BLUE="\033[36m"; CYAN="\033[35m"; PLAIN="\033[0m"
 # ---------- 路径 ----------
 CONFIG_FILE="/etc/sing-box/config.json"
 BIN_FILE="/usr/local/bin/sing-box"
+PANEL_FILE="/usr/local/bin/sb"
+PANEL_ALIAS="/usr/local/bin/SB"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"   # systemd 单元（systemd 系统）
 OPENRC_FILE="/etc/init.d/sing-box"                     # OpenRC 服务脚本（Alpine 等）
 SINGBOX_LOG="/var/log/sing-box.log"                    # 无 journald 时 sing-box 的输出落这里
@@ -350,10 +352,13 @@ count_by_type() {
 
 save_and_check_config() {
     local new_json="$1"
-    local test_file="/tmp/sing-box-test.json"
-
-    printf '%s\n' "$new_json" > "$test_file"
-    chmod 600 "$test_file"
+    local test_file
+    # 在同一目录准备候选配置，校验后用 rename 原子替换。
+    test_file=$(mktemp "${CONFIG_FILE%/*}/.sb-config.XXXXXX") || return 1
+    if ! printf '%s\n' "$new_json" > "$test_file"; then
+        rm -f "$test_file"
+        return 1
+    fi
 
     echo -e "${BLUE}⏳ 正在校验配置...${PLAIN}"
     if ! "$BIN_FILE" check -c "$test_file" &>/dev/null; then
@@ -365,13 +370,17 @@ save_and_check_config() {
     fi
 
     if [ -f "$CONFIG_FILE" ] && jq empty "$CONFIG_FILE" 2>/dev/null; then
-        install -m 600 "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+        if ! install -m 600 "$CONFIG_FILE" "${CONFIG_FILE}.bak"; then
+            rm -f "$test_file"
+            return 1
+        fi
+    fi
+    if ! mv -f -- "$test_file" "$CONFIG_FILE"; then
+        rm -f "$test_file"
+        return 1
     fi
 
-    install -m 600 "$test_file" "$CONFIG_FILE"
-    rm -f "$test_file"
-
-    echo -e "${GREEN}✨ 配置校验通过，已应用；备份已刷新为上一版有效配置。${PLAIN}"
+    echo -e "${GREEN}配置校验通过，已保存；备份已刷新为上一版配置。${PLAIN}"
     return 0
 }
 
@@ -409,16 +418,17 @@ get_public_ip() {
 
 open_firewall_port() {
     local port="$1"
-    if command -v ufw &>/dev/null && case "$(ufw status 2>/dev/null)" in *active*) true ;; *) false ;; esac; then
-        ufw allow "$port"/tcp &>/dev/null; ufw allow "$port"/udp &>/dev/null
+    if command -v ufw &>/dev/null && [[ $(LC_ALL=C ufw status 2>/dev/null) == 'Status: active'* ]]; then
+        ufw allow "$port"/tcp &>/dev/null || return 1
+        ufw allow "$port"/udp &>/dev/null || return 1
     elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
-        firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null
-        firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null
-        firewall-cmd --reload &>/dev/null
+        firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null || return 1
+        firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null || return 1
+        firewall-cmd --reload &>/dev/null || return 1
     elif command -v iptables &>/dev/null && case "$(iptables -S INPUT 2>/dev/null)" in *'-P INPUT DROP'*) true ;; *) false ;; esac; then
         # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT || return 1
         echo -e "${YELLOW}💡 已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
     fi
 }
@@ -556,6 +566,16 @@ rename_node() {
 }
 
 # ==================== 删除项选择 ====================
+inbound_node_type() {
+    local type
+    type=$(inbound_field "$1" type)
+    # 仅把面板生成的 Shadowsocks 入站列入节点操作。
+    if [[ "$type" == shadowsocks && $(inbound_field "$1" tag) == ss2022-* ]]; then
+        type=ss2022
+    fi
+    printf '%s\n' "$type"
+}
+
 prompt_delete_index() {
     local title="$1" filter_type="$2"
     local total idxs=() i=0 n=0
@@ -563,8 +583,8 @@ prompt_delete_index() {
     total=$(inbound_count)
     while [ $i -lt "$total" ]; do
         local t
-        t=$(inbound_field "$i" "type")
-        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls ]]; }; then
+        t=$(inbound_node_type "$i")
+        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls || "$t" = ss2022 ]]; }; then
             idxs+=("$i")
         fi
         i=$((i+1))
@@ -583,7 +603,7 @@ prompt_delete_index() {
         tag=$(inbound_field "$real" "tag")
         port=$(inbound_field "$real" "listen_port")
         local display="$tag"
-        case "$(inbound_field "$real" type)" in vless|anytls) display=$(node_display_name "$tag") ;; esac
+        case "$(inbound_node_type "$real")" in vless|anytls|ss2022) display=$(node_display_name "$tag") ;; esac
         printf '  [%s] %s  (端口: %s)\n' "$n" "$display" "$port" >&2
     done
     echo -e "--------------------------------------------------" >&2
@@ -725,14 +745,31 @@ ensure_service_def_fresh() {
 }
 
 uninstall_singbox() {
-    read -rp "⚠️ 确定完全卸载 Sing-box 及其配置吗？[y/N]: " c
-    [[ ! "$c" =~ ^[Yy]$ ]] && return
-    svc_stop &>/dev/null
-    svc_disable
-    rm -f "$SERVICE_FILE" "$OPENRC_FILE" "$BIN_FILE"
-    rm -rf /etc/sing-box /tmp/sing-box* /tmp/sing-box-test.json
-    svc_daemon_reload
-    echo -e "${GREEN}✅ 已完全卸载。${PLAIN}"
+    local mode="${1:-core}" c config_dir="${CONFIG_FILE%/*}"
+    printf '将停止并卸载 Sing-box 核心和服务，并删除 %s（含节点、规则和备份）。防火墙规则不变。\n' "$config_dir"
+    if [ "$mode" = full ]; then
+        printf '同时删除 %s 和 %s，并退出面板。\n' "$PANEL_FILE" "$PANEL_ALIAS"
+    fi
+    read -rp '确认卸载？[y/N]: ' c || return 0
+    [[ "$c" == y ]] || return 0
+    if svc_active || [ -f "$SERVICE_FILE" ] || [ -f "$OPENRC_FILE" ]; then
+        if ! svc_stop || svc_active; then
+            printf '未能停止服务，未删除脚本或配置。\n' >&2
+            return 1
+        fi
+        svc_disable
+    fi
+    rm -f -- "$SERVICE_FILE" "$OPENRC_FILE" "$BIN_FILE" || return 1
+    if [ "$INIT_SYS" = systemd ]; then
+        svc_daemon_reload || return 1
+    fi
+    rm -rf -- "$config_dir" || return 1
+    if [ "$mode" = full ]; then
+        rm -f -- "$PANEL_FILE" "$PANEL_ALIAS" || return 1
+        printf '已卸载核心、服务、配置和面板。\n'
+        exit 0
+    fi
+    printf '已卸载核心、服务和配置；面板保留。\n'
 }
 
 show_service_status() {
@@ -896,6 +933,81 @@ add_anytls_node() {
     fi
 }
 
+# SIP002 要求 AEAD-2022 使用 URI 转义的明文 userinfo，而非整体 Base64。
+ss2022_link() {
+    local method="$1" password="$2" host="$3" port="$4" tag="$5" encoded
+    encoded=$(jq -rn --arg p "$password" '$p | @uri') || return 1
+    [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
+    printf 'ss://%s:%s@%s:%s#%s\n' "$method" "$encoded" "$host" "$port" "$(node_link_fragment "$tag")"
+}
+
+ss2022_count() {
+    jq '[.inbounds[]? | select(.type == "shadowsocks" and ((.tag // "") | startswith("ss2022-")))] | length' "$CONFIG_FILE"
+}
+
+add_ss2022_node() {
+    if [ ! -x "$BIN_FILE" ]; then
+        printf '请先安装 Sing-box 核心。\n' >&2
+        return 1
+    fi
+    ensure_config
+    local port name tag password method=2022-blake3-aes-256-gcm temp_json ip link show_qr was_active=0 restore_file
+    while true; do
+        read -rp '监听端口 [默认 8388]: ' port || return 0
+        port=${port:-8388}
+        if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || ! validate_port "$port"; then
+            printf '端口无效。\n' >&2; continue
+        fi
+        port=$((10#$port))
+        if port_in_use "$port"; then
+            printf '端口已被现有入站使用。\n' >&2; continue
+        fi
+        break
+    done
+    name=$(read_node_name) || return 1
+    tag="ss2022-$port"
+    password=$("$BIN_FILE" generate rand 32 --base64) || return 1
+    if ! [[ "$password" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+        printf '生成 SS2022 密钥失败。\n' >&2
+        return 1
+    fi
+    temp_json=$(jq --argjson port "$port" --arg tag "$tag" --arg method "$method" \
+        --arg pw "$password" '.inbounds += [{type:"shadowsocks",tag:$tag,listen:"::",listen_port:$port,method:$method,password:$pw}]' "$CONFIG_FILE") || return 1
+    if svc_active; then was_active=1; fi
+    save_and_check_config "$temp_json" || return 1
+    if ! { svc_restart && sleep 1 && svc_active; }; then
+        printf '新节点未能启动，正在恢复上一份配置。\n' >&2
+        restore_file=$(mktemp "${CONFIG_FILE%/*}/.sb-restore.XXXXXX") || return 1
+        if ! cp -- "${CONFIG_FILE}.bak" "$restore_file" || ! mv -f -- "$restore_file" "$CONFIG_FILE"; then
+            rm -f -- "$restore_file"
+            printf '自动恢复失败；备份仍在 %s.bak。\n' "$CONFIG_FILE" >&2
+            return 1
+        fi
+        if (( was_active )); then
+            if ! { svc_restart && sleep 1 && svc_active; }; then
+                printf '配置已恢复，但服务未能恢复运行，请查看日志。\n' >&2
+            fi
+        elif svc_active; then
+            svc_stop || printf '配置已恢复，但未能恢复原来的停止状态。\n' >&2
+        fi
+        return 1
+    fi
+    save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
+    open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+    ip=$(get_public_ip)
+    if [[ "$ip" == 127.0.0.1 || -z "$ip" ]]; then
+        printf '节点已保存；未获取到公网 IP，请稍后在节点管理中查看链接。\n'
+        return 0
+    fi
+    link=$(ss2022_link "$method" "$password" "$ip" "$port" "$tag") || return 1
+    printf 'SS2022 | %s | 端口: %s\n分享链接: %s\n' "$(node_display_name "$tag")" "$port" "$link"
+    if command -v qrencode &>/dev/null; then
+        read -rp '显示二维码？[y/N]: ' show_qr
+        [[ "$show_qr" =~ ^[Yy]$ ]] && qrencode -t ANSIUTF8 "$link"
+    fi
+    return 0
+}
+
 view_node_links() {
     ensure_config
     local ip; ip=$(get_public_ip)
@@ -903,11 +1015,12 @@ view_node_links() {
     echo -e "${BLUE}服务器 IP: $ip${PLAIN}"
     echo -e "--------------------------------------------------"
 
-    local vless_total anytls_total
+    local vless_total anytls_total ss_total
     vless_total=$(count_by_type "vless")
     anytls_total=$(count_by_type "anytls")
-    if [ "$vless_total" -eq 0 ] && [ "$anytls_total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有配置任何 Reality 节点（VLESS / AnyTLS）。${PLAIN}"
+    ss_total=$(ss2022_count) || return 1
+    if (( vless_total + anytls_total + ss_total == 0 )); then
+        echo -e "${YELLOW}当前没有可分享的节点。${PLAIN}"
         return
     fi
 
@@ -970,6 +1083,22 @@ view_node_links() {
         done
     fi
 
+    if [ "$ss_total" -gt 0 ]; then
+        for ((i=0; i<total_all; i++)); do
+            [[ $(inbound_node_type "$i") == ss2022 ]] || continue
+            local method password
+            method=$(inbound_field "$i" method)
+            password=$(inbound_field "$i" password)
+            tag=$(inbound_field "$i" tag)
+            port=$(inbound_field "$i" listen_port)
+            link=$(ss2022_link "$method" "$password" "$ip" "$port" "$tag") || continue
+            links+=("$link")
+            tags+=("$(node_display_name "$tag")")
+            idx=$((idx+1))
+            printf '  [%s] SS2022 | %s | 端口: %s\n      链接: %s\n' "$idx" "$(node_display_name "$tag")" "$port" "$link"
+        done
+    fi
+
     if command -v qrencode &>/dev/null; then
         read -rp "输入要显示二维码的序号 (0 跳过): " qr_idx
         if [[ "$qr_idx" =~ ^[0-9]+$ ]] && [ "$qr_idx" -ge 1 ] && [ "$qr_idx" -le "${#links[@]}" ]; then
@@ -982,31 +1111,27 @@ view_node_links() {
 
 delete_node() {
     ensure_config
-    local vless_total anytls_total node_type
-    vless_total=$(count_by_type "vless")
-    anytls_total=$(count_by_type "anytls")
-    if [ "$vless_total" -eq 0 ] && [ "$anytls_total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有可删除的节点。${PLAIN}"; return
-    fi
-
-    # 两种节点都在时让用户先选类型；只有一种时直接用那一种
-    node_type="vless"
-    if [ "$vless_total" -gt 0 ] && [ "$anytls_total" -gt 0 ]; then
-        echo -e "${CYAN}=== 删除节点：请选择类型 ===${PLAIN}"
-        echo -e "  [${GREEN}1${PLAIN}] VLESS-Reality（$vless_total 个）"
-        echo -e "  [${GREEN}2${PLAIN}] AnyTLS-Reality（$anytls_total 个）"
-        local type_choice
-        read -rp "请选择 (0 取消): " type_choice
-        [[ "$type_choice" == "0" ]] && return
-        case "$type_choice" in
-            1) node_type="vless" ;;
-            2) node_type="anytls" ;;
-            *) echo -e "${RED}无效选项！${PLAIN}"; return ;;
-        esac
-        echo ""
-    elif [ "$vless_total" -eq 0 ]; then
-        node_type="anytls"
-    fi
+    local node_type type_choice i ss_total
+    local types=(vless anytls ss2022) labels=(VLESS-Reality AnyTLS-Reality SS2022) counts available=()
+    ss_total=$(ss2022_count) || return 1
+    counts=("$(count_by_type vless)" "$(count_by_type anytls)" "$ss_total")
+    for i in 0 1 2; do
+        if [ "${counts[i]}" -gt 0 ]; then available+=("$i"); fi
+    done
+    case "${#available[@]}" in
+        0) printf '当前没有可删除的节点。\n'; return 0 ;;
+        1) node_type=${types[${available[0]}]} ;;
+        *) printf '=== 删除节点：请选择类型 ===\n'
+           for i in "${available[@]}"; do
+               printf '  [%s] %s（%s 个）\n' "$((i+1))" "${labels[i]}" "${counts[i]}"
+           done
+           read -rp '请选择 (0 取消): ' type_choice || return 0
+           [[ "$type_choice" == 0 ]] && return 0
+           if ! [[ "$type_choice" =~ ^[1-3]$ && ${counts[type_choice-1]} -gt 0 ]]; then
+               printf '无效选项。\n'; return 1
+           fi
+           node_type=${types[type_choice-1]} ;;
+    esac
 
     echo -e "${CYAN}=== 删除 ${node_type} 节点 ===${PLAIN}"
     local real_idx
@@ -1187,12 +1312,15 @@ menu_system() {
         menu_option 6 "查看服务状态"
         menu_option 7 "查看当前配置"
         menu_option 8 "查看运行日志"
+        menu_section "危险操作"
+        menu_option 9 "彻底卸载（核心、配置和 sb 脚本）"
         menu_back
-        read_menu_choice "请选择 [0-8]"; c="$REPLY"
+        read_menu_choice "请选择 [0-9]"; c="$REPLY"
         case "$c" in
             1) install_singbox ;; 2) start_service ;;
             3) svc_stop && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
             5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
+            9) uninstall_singbox full ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
@@ -1201,17 +1329,18 @@ menu_system() {
 
 menu_nodes() {
     while true; do
-        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality 节点与分享信息"
+        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022"
         menu_option 1 "添加 VLESS-Reality 节点"
         menu_option 2 "添加 AnyTLS-Reality 节点"
         menu_option 3 "查看分享链接 / 二维码（全部节点）"
         menu_option 4 "删除节点"
         menu_option 5 "修改节点备注（无需重启）"
+        menu_option 6 "添加 Shadowsocks 2022 节点"
         menu_back
-        read_menu_choice "请选择 [0-5]"; c="$REPLY"
+        read_menu_choice "请选择 [0-6]"; c="$REPLY"
         case "$c" in
             1) add_reality_node ;; 2) add_anytls_node ;; 3) view_node_links ;; 4) delete_node ;;
-            5) rename_node ;;
+            5) rename_node ;; 6) add_ss2022_node ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
         pause
@@ -2126,7 +2255,7 @@ show_menu() {
     menu_header "Sing-box 管理面板" "Reality / 转发 / WARP 分流  ·  ${SCRIPT_VERSION}" "$(get_singbox_status)"
     menu_section "核心管理"
     menu_option 1 "系统管理（安装、服务、日志、卸载）"
-    menu_option 2 "节点管理（VLESS / AnyTLS-Reality、链接、二维码）"
+    menu_option 2 "节点管理（VLESS / AnyTLS-Reality / SS2022）"
     menu_option 3 "端口转发（TCP / UDP）"
     menu_option 4 "WARP 出口与分流"
     menu_section "配置与工具"
