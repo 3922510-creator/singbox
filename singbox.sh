@@ -2272,10 +2272,156 @@ show_menu() {
 
 # ==================== WARP 出口 ====================
 # sing-box 1.11+ 将 wireguard 从 outbound 迁移为 endpoint，这里采用 endpoint 架构。
-# 账号通过 warp-reg 本地注册（不依赖不稳定的第三方 API）。
-WARP_REG_AMD64="https://github.com/badafans/warp-reg/releases/download/v1.0/main-linux-amd64"
-WARP_REG_ARM64="https://github.com/badafans/warp-reg/releases/download/v1.0/main-linux-arm64"
-WARP_PEER_PUBKEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+# Shared Zero Trust enrollment adapter. Keep in sync in singbox and sbx.
+_zero_trust_enroll() (
+    set +x
+    umask 077
+    local output="$1" dir file
+    local upstream='https://raw.githubusercontent.com/BlizzardSaber/zerotrust-warp-masque/7cae14a10eb181538662a6d16fea29c05c47f06d'
+    if ! [ -t 0 ]; then printf '请使用交互式 SSH 终端登录 Zero Trust。\n' >&2; exit 1; fi
+    if ! command -v python3 openssl curl sha256sum >/dev/null; then
+        printf 'Zero Trust 登录需要 python3、openssl、curl 和 sha256sum。\n' >&2; exit 1
+    fi
+    dir=$(mktemp -d) || exit 1
+    trap 'rm -rf -- "$dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+    for file in zt_login.py zerotrust2wg.py; do
+        curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 \
+            "$upstream/$file" -o "$dir/$file" || exit 1
+    done
+    ( cd "$dir" && sha256sum -c --status <<'SUMS'
+d08cd613b3cc554099b17ffa90b4f3f061be6134714cc88d2442e426190bbe99  zt_login.py
+8a6b1aa9bb70f3be116b3643aa172e7d3fde98c817a70436e2cc43c7ad07234b  zerotrust2wg.py
+SUMS
+    ) || { printf 'Zero Trust 登录组件校验失败，未执行。\n' >&2; exit 1; }
+    cat > "$dir/enroll.py" <<'PYTHON' || exit 1
+#!/usr/bin/env python3
+"""SBX interactive WireGuard enrollment, using pinned Cloudflare login helpers."""
+import base64
+import getpass
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import zt_login as login
+import zerotrust2wg as wg
+
+
+def require_origin(url, host):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != 'https' or u.netloc != host:
+        raise ValueError('Cloudflare 返回了非预期的登录地址，已停止。')
+
+
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, host):
+        self.host = host
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_origin(newurl, self.host)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class TeamLogin(login.AccessLogin):
+    def __init__(self, org):
+        super().__init__(org)
+        self.host = f'{org}.cloudflareaccess.com'
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), SameOriginRedirect(self.host),
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.opener.addheaders = [('User-Agent', login.UA)]
+
+    def _open(self, url, data=None):
+        require_origin(url, self.host)
+        return super()._open(url, data)
+
+
+def enrollment_token(access, url, html):
+    candidates = [cookie.value for cookie in access.jar]
+    candidates += login.JWT_RE.findall(html)
+    for values in urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).values():
+        candidates += values
+    for token in candidates:
+        claims = login.jwt_payload(token)
+        if (isinstance(claims, dict) and claims.get('iss') == access.base
+                and claims.get('type') == 'app' and claims.get('warp') is True
+                and isinstance(claims.get('exp'), (float, int))
+                and claims['exp'] > time.time()):
+            return token
+    raise ValueError('未收到有效的组织注册令牌，请检查邮箱验证码和设备注册策略。')
+
+
+def endpoint(response, private_key):
+    v4, v6 = wg.pick_addresses(response)
+    peers = (response.get("config", {}).get("peers") or response.get("peers") or [])
+    public_key = peers[0].get("public_key") if peers else None
+    if not isinstance(public_key, str) or len(base64.b64decode(public_key, validate=True)) != 32:
+        raise ValueError('设备返回的 WireGuard 公钥无效。')
+    addresses = [str(ipaddress.IPv4Interface(f'{v4}/32'))]
+    if v6:
+        addresses.append(str(ipaddress.IPv6Interface(f'{v6}/128')))
+    remote = {'address': '162.159.193.1', 'port': 2408,
+              'public_key': public_key, 'allowed_ips': ['0.0.0.0/0', '::/0']}
+    client_id = response.get('config', {}).get('client_id')
+    if client_id:
+        remote['reserved'] = list(base64.b64decode(client_id, validate=True))
+        if len(remote['reserved']) != 3:
+            raise ValueError('设备返回的 WireGuard reserved 长度无效。')
+    return {'type': 'wireguard', 'tag': 'warp-out', 'mtu': 1280, 'address': addresses,
+            'private_key': private_key, 'peers': [remote]}
+
+
+def main(destination):
+    os.umask(0o077)
+    if not sys.stdin.isatty():
+        raise ValueError('请通过交互式 SSH 终端登录。')
+    org = input('Zero Trust 组织名（不含 .cloudflareaccess.com）：').strip().lower()
+    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', org):
+        raise ValueError('组织名无效。')
+    email = input('注册邮箱：').strip()
+    if not email or '@' not in email:
+        raise ValueError('邮箱无效。')
+    urllib.request.install_opener(urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), SameOriginRedirect('api.cloudflareclient.com')))
+    access = TeamLogin(org)
+    access.start()
+    _, html = access.submit_email(email)
+    if not access.parse_code_form(html):
+        raise ValueError('组织未返回邮箱验证码表单，请检查是否允许邮箱验证码注册。')
+    code = getpass.getpass('邮件验证码（不回显）：').strip()
+    if not code:
+        raise ValueError('验证码为空。')
+    url, html = access.submit_code(code)
+    token = enrollment_token(access, url, html)
+    private, public = wg.gen_keypair()
+    response = wg.register(public, token)
+    wg.validate_team_or_cleanup(response)
+    Path(destination).write_text(json.dumps(endpoint(response, private)), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1])
+    except (KeyboardInterrupt, EOFError):
+        sys.exit('\n已取消。')
+    except urllib.error.HTTPError as exc:
+        sys.exit(f'Cloudflare 请求失败：HTTP {exc.code}。')
+    except wg.TeamTokenError as exc:
+        sys.exit(f'Cloudflare 设备注册失败：HTTP {exc.code}。')
+    except ValueError:
+        sys.exit('输入或 Cloudflare 响应无效，请检查组织名、邮箱验证码及设备注册策略。')
+    except Exception:
+        sys.exit('无法完成 Cloudflare 登录或导出，原配置未改动。')
+PYTHON
+    python3 -I -B -c 'import runpy, sys; d = sys.argv.pop(1); sys.path.insert(0, d); runpy.run_path(d + "/enroll.py", run_name="__main__")' "$dir" "$output"
+)
 
 # geosite 规则集（SagerNet/sing-geosite rule-set 分支，.srs 二进制）
 GEOSITE_BASE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
@@ -2284,79 +2430,37 @@ WARP_AI_SITES="category-ai-!cn openai anthropic"
 # 流媒体
 WARP_MEDIA_SITES="netflix disney hbo youtube primevideo tiktok spotify hulu"
 
-save_warp_meta() { mkdir -p "$META_DIR"; printf '%s' "$1" > "$WARP_META"; chmod 600 "$WARP_META"; }
-
 has_warp_endpoint() {
     local c
     c=$(jq '[.endpoints[]? | select(.tag == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
     [[ "$c" =~ ^[0-9]+$ ]] && echo "$c" || echo "0"
 }
 
-register_warp_account() {
-    # 下载 warp-reg 并注册，输出 JSON {ipv6, private_key, reserved:[..]}（写到 stdout）
-    local url="$WARP_REG_AMD64" tmp out pk v6 reserved
-    [[ "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && url="$WARP_REG_ARM64"
-    tmp=$(mktemp)
-    if ! curl -sL --max-time 60 -o "$tmp" "$url"; then
-        rm -f "$tmp"; echo -e "${RED}❌ warp-reg 下载失败${PLAIN}" >&2; return 1
+add_warp() (
+    set +x
+    umask 077
+    local dir candidate answer
+    if [ ! -x "$BIN_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+        printf '请先安装并配置 Sing-box。\n' >&2; exit 1
     fi
-    chmod +x "$tmp"
-    out=$("$tmp" 2>/dev/null)
-    rm -f "$tmp"
-
-    pk=$(sed -n 's/^private_key:[[:space:]]*//p' <<<"$out")
-    v6=$(sed -n 's/^v6:[[:space:]]*//p' <<<"$out")
-    reserved=$(sed -n 's/^reserved:[[:space:]]*//p' <<<"$out" | tr -d ' ')
-    if [[ -z "$pk" || -z "$v6" || -z "$reserved" ]]; then
-        echo -e "${RED}❌ WARP 账号注册失败或返回异常${PLAIN}" >&2; return 1
+    read -rp '通过邮箱验证码注册 Zero Trust 设备（下载并校验固定版本登录组件）？[y/N] ' answer || exit 1
+    [ "$answer" = y ] || exit 1
+    dir=$(mktemp -d) || exit 1
+    trap 'rm -rf -- "$dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+    _zero_trust_enroll "$dir/endpoint.json" || exit 1
+    candidate=$(jq --slurpfile ep "$dir/endpoint.json" '
+        .endpoints = ([.endpoints[]? | select(.tag != "warp")] + [$ep[0] | .tag = "warp"]) |
+        .outbounds = [.outbounds[]? | select(.tag != "warp")]' "$CONFIG_FILE") || exit 1
+    read -rp '应用 Zero Trust 端点并重启 sing-box？保留当前分流及默认出口。[y/N] ' answer || exit 1
+    [ "$answer" = y ] || exit 1
+    save_and_check_config "$candidate" || exit 1
+    if ! svc_restart; then
+        printf '配置已保存，但服务重启失败；上一版配置在 %s.bak。\n' "$CONFIG_FILE" >&2
+        exit 1
     fi
-    jq -cn --arg pk "$pk" --arg v6 "$v6" --argjson reserved "$reserved" \
-        '{ipv6:$v6, private_key:$pk, reserved:$reserved}'
-}
-
-add_warp() {
-    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
-    ensure_config
-
-    if [ "$(has_warp_endpoint)" -gt 0 ]; then
-        echo -e "${YELLOW}已存在 WARP 出口，将重新注册并覆盖。${PLAIN}"
-    fi
-
-    echo -e "${BLUE}⏳ 正在注册 WARP 账号...${PLAIN}"
-    local meta
-    meta=$(register_warp_account) || return 1
-
-    local ip6 pk reserved
-    ip6=$(jq -r '.ipv6' <<<"$meta")
-    pk=$(jq -r '.private_key' <<<"$meta")
-    reserved=$(jq -c '.reserved' <<<"$meta")
-
-    local temp_json
-    temp_json=$(jq --arg ip6 "$ip6" --arg pk "$pk" --argjson reserved "$reserved" --arg pub "$WARP_PEER_PUBKEY" '
-        .endpoints = (.endpoints // [])
-        | .endpoints |= (map(select(.tag != "warp")))
-        | .endpoints += [{
-            "type": "wireguard", "tag": "warp", "mtu": 1280,
-            "address": ["172.16.0.2/32", ($ip6 + "/128")],
-            "private_key": $pk,
-            "peers": [{
-                "address": "162.159.192.1", "port": 2408,
-                "public_key": $pub,
-                "allowed_ips": ["0.0.0.0/0", "::/0"],
-                "reserved": $reserved
-            }]
-        }]' "$CONFIG_FILE")
-
-    if save_and_check_config "$temp_json"; then
-        save_warp_meta "$meta"
-        svc_restart
-        echo -e "${GREEN}✅ WARP 出口添加成功！${PLAIN}"
-        echo -e "  出口标签 : ${BLUE}warp${PLAIN}（wireguard endpoint）"
-        echo -e "  WARP IPv6: ${BLUE}$ip6${PLAIN}"
-        echo -e "  元数据   : $WARP_META"
-        echo -e "${YELLOW}💡 使用方式：菜单选 3 添加分流规则，或手动把路由规则的 outbound 指向 \"warp\"。${PLAIN}"
-    fi
-}
+    printf 'Zero Trust WARP 端点已接入。\n'
+)
 
 add_warp_node_route() {
     ensure_config
@@ -2546,7 +2650,7 @@ menu_warp() {
         warp_status=$([ "$(has_warp_endpoint)" -gt 0 ] && echo -e "${GREEN}已配置${PLAIN}" || echo -e "${YELLOW}未配置${PLAIN}")
         menu_header "WARP 出口" "Cloudflare WARP · 出口与分流规则" "$warp_status"
         menu_section "出口"
-        menu_option 1 "添加 / 重置 WARP（自动注册账号）"
+        menu_option 1 "Zero Trust 登录 / 重置 WARP"
         menu_option 2 "查看 WARP 出口信息"
         menu_option 3 "删除 WARP 出口及相关规则"
         menu_section "分流规则"
