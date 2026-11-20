@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.7.2  |  快捷指令: SB / sb
+#  版本: v3.8.0  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.7.2"
+SCRIPT_VERSION="v3.8.0"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -189,10 +189,10 @@ svc_active_name() {
 }
 
 # ---------- 通用交互 ----------
-pause() { echo ""; read -rp "  按回车键继续..." _; }
+pause() { echo ""; read -rp "  按回车键继续..." _ || true; }
 
 # ====================================================================
-#  UI 渲染层（v3.7 新皮肤）
+#  UI 渲染层（v3.8 统一布局）
 #  硬约束：手机 SSH 客户端 + 中文 + ANSI 会让「固定宽度右边框」错位，所以全部
 #  左对齐、只用水平规则线；规则线宽度随终端自适应（手机竖屏不折行）。
 #  只用基础 ANSI + 粗体/暗色，不碰 256/truecolor，保证各终端渲染一致。
@@ -215,28 +215,89 @@ ui_rule() {
     while [ "$i" -lt "$w" ]; do line="${line}─"; i=$((i+1)); done
     printf '%b%s%b\n' "${DIM}${BLUE}" "$line" "$PLAIN"
 }
+ui_subrule() {
+    local w i line=''
+    w=$(ui_width); i=0
+    while [ "$i" -lt "$w" ]; do line="${line}·"; i=$((i+1)); done
+    printf '%b%s%b\n' "$DIM" "$line" "$PLAIN"
+}
+ui_title() { printf '\n  %b▌%b %b%s%b\n' "$CYAN" "$PLAIN" "$BOLD" "$1" "$PLAIN"; }
+ui_kv() { printf '  %b%-8s%b %b\n' "$DIM" "$1" "$PLAIN" "$2"; }
 
 # 标题区：规则线 → 粗体标题 → 暗色副标题 → 状态 → 规则线
 menu_header() {
     local title="$1" subtitle="${2:-}" status="${3:-}"
-    clear
+    clear 2>/dev/null || true
     echo ""
     ui_rule
     printf '  %b%s%b\n' "$BOLD" "$title" "$PLAIN"
     [ -n "$subtitle" ] && printf '  %b%s%b\n' "$DIM" "$subtitle" "$PLAIN"
-    [ -n "$status" ] && printf '  %b状态%b %s\n' "$DIM" "$PLAIN" "$status"
+    [ -n "$status" ] && printf '  %b状态%b %b\n' "$DIM" "$PLAIN" "$status"
     ui_rule
 }
 
 # 分组：左侧强调条 + 粗体标签
 menu_section() { printf '\n  %b▌%b %b%s%b\n' "$BLUE" "$PLAIN" "$BOLD" "$1" "$PLAIN"; }
 # 选项：绿色右对齐序号 + 文本
-menu_option() { printf '    %b%2s)%b %s\n' "$GREEN" "$1" "$PLAIN" "$2"; }
+menu_option() { printf '    %b%2s)%b %b\n' "$GREEN" "$1" "$PLAIN" "$2"; }
 # 返回 / 退出
-menu_back() { printf '\n    %b 0)%b 返回上一级\n' "$YELLOW" "$PLAIN"; }
-menu_exit() { printf '\n    %b 0)%b 退出脚本\n' "$YELLOW" "$PLAIN"; }
-# 输入提示：强调箭头
-read_menu_choice() { local prompt="${1:-请选择}"; printf '%b  ❯%b %s: ' "$BLUE" "$PLAIN" "$prompt"; read -r REPLY; }
+menu_back() { printf '\n    %b 0)%b 返回上一级\n\n' "$YELLOW" "$PLAIN"; }
+menu_exit() { printf '\n    %b 0)%b 退出脚本\n\n' "$YELLOW" "$PLAIN"; }
+# 输入提示：强调箭头（EOF 返回非 0，首尾去空白）
+read_menu_choice() {
+    local prompt="${1:-请选择}"
+    printf '%b  ❯%b %s: ' "$BLUE" "$PLAIN" "$prompt"
+    read -r REPLY || return 1
+    REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
+    REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
+    return 0
+}
+menu_invalid() {
+    printf '  %b无效选项，请重新输入。%b\n' "$RED" "$PLAIN"
+    sleep 0.6
+}
+
+# 摘要行辅助（主菜单 / 各子菜单顶栏复用）
+nodes_total_count() {
+    local v a s
+    v=$(count_by_type vless)
+    a=$(count_by_type anytls)
+    s=$(ss2022_count 2>/dev/null || echo 0)
+    echo $((v + a + s))
+}
+nodes_summary_line() {
+    local v a s tot
+    v=$(count_by_type vless)
+    a=$(count_by_type anytls)
+    s=$(ss2022_count 2>/dev/null || echo 0)
+    tot=$((v + a + s))
+    if [ "$tot" -eq 0 ]; then
+        printf '%b暂无节点%b' "$YELLOW" "$PLAIN"
+    else
+        printf '%b共 %s 个%b（VLESS %s · AnyTLS %s · SS2022 %s）' "$GREEN" "$tot" "$PLAIN" "$v" "$a" "$s"
+    fi
+}
+warp_summary_short() {
+    if [ "$(has_warp_endpoint)" -gt 0 ]; then
+        local rc
+        rc=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+        printf '%b已配置%b（%s 条规则）' "$GREEN" "$PLAIN" "${rc:-0}"
+    else
+        printf '%b未配置%b' "$YELLOW" "$PLAIN"
+    fi
+}
+home_status_line() {
+    local sb_s n_cnt fw_cnt warp_tag
+    sb_s=$(get_singbox_status)
+    n_cnt=$(nodes_total_count)
+    fw_cnt=$(count_by_type direct)
+    if [ "$(has_warp_endpoint)" -gt 0 ]; then
+        warp_tag="${GREEN}WARP开${PLAIN}"
+    else
+        warp_tag="${DIM}WARP关${PLAIN}"
+    fi
+    printf '%b · 节点 %s · 转发 %s · %b' "$sb_s" "$n_cnt" "$fw_cnt" "$warp_tag"
+}
 
 # 并发锁
 # 坑（2026-10-11 实测）：面板用 flock 锁住 fd 200，而它调用的 rc-service/start-stop-daemon
@@ -634,19 +695,19 @@ node_link_fragment() {
 
 rename_node() {
     local idx tag name
-    idx=$(prompt_delete_index "节点备注" node)
+    idx=$(prompt_delete_index "要修改备注的节点" node)
     [ -n "$idx" ] || return 0
     tag=$(inbound_field "$idx" tag)
-    printf '当前备注: %s\n内部标识: %s\n' "$(node_display_name "$tag")" "$tag"
+    printf '  当前备注: %s\n  内部标识: %s\n' "$(node_display_name "$tag")" "$tag"
     name=$(read_node_name) || return 1
     if save_node_name "$tag" "$name"; then
-        printf '备注已更新为：%s（无需重启；已导入客户端的旧名称不会自动更新）\n' "$(node_display_name "$tag")"
+        printf '  %b备注已更新为：%s（无需重启；已导入客户端的旧名称不会自动更新）%b\n' "$GREEN" "$(node_display_name "$tag")" "$PLAIN"
     else
         return 1
     fi
 }
 
-# ==================== 删除项选择 ====================
+# ==================== 列表选择 ====================
 inbound_node_type() {
     local type
     type=$(inbound_field "$1" type)
@@ -672,28 +733,39 @@ prompt_delete_index() {
     done
 
     if [ ${#idxs[@]} -eq 0 ]; then
-        echo -e "${YELLOW}没有可操作的${title}。${PLAIN}" >&2
+        echo -e "  ${YELLOW}没有可操作的${title}。${PLAIN}" >&2
         echo ""
         return
     fi
 
-    echo -e "${CYAN}=== 请选择${title} ===${PLAIN}" >&2
+    echo -e "\n  ${CYAN}▌ 请选择${title}${PLAIN}" >&2
     for real in "${idxs[@]}"; do
         n=$((n+1))
-        local tag port
+        local tag port nt display extra=""
         tag=$(inbound_field "$real" "tag")
         port=$(inbound_field "$real" "listen_port")
-        local display="$tag"
-        case "$(inbound_node_type "$real")" in vless|anytls|ss2022) display=$(node_display_name "$tag") ;; esac
-        printf '  [%s] %s  (端口: %s)\n' "$n" "$display" "$port" >&2
+        nt=$(inbound_node_type "$real")
+        display="$tag"
+        case "$nt" in
+            vless)  display=$(node_display_name "$tag"); extra=" [VLESS]" ;;
+            anytls) display=$(node_display_name "$tag"); extra=" [AnyTLS]" ;;
+            ss2022) display=$(node_display_name "$tag"); extra=" [SS2022]" ;;
+            direct)
+                local rip rp
+                rip=$(inbound_field "$real" "override_address")
+                rp=$(inbound_field "$real" "override_port")
+                extra=" -> ${rip}:${rp}"
+                ;;
+        esac
+        printf '    %b%2s)%b %s%s (端口: %s)\n' "$GREEN" "$n" "$PLAIN" "$display" "$extra" "$port" >&2
     done
-    echo -e "--------------------------------------------------" >&2
+    printf '\n' >&2
 
     local choice
-    read -rp "请输入序号 (0 取消): " choice
-    [[ "$choice" == "0" ]] && { echo ""; return; }
+    read -rp "  请输入序号 (0 或回车取消): " choice || { echo ""; return; }
+    [[ -z "$choice" || "$choice" == "0" ]] && { echo ""; return; }
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
-        echo -e "${RED}无效序号！${PLAIN}" >&2
+        echo -e "  ${RED}无效序号！${PLAIN}" >&2
         echo ""
         return
     fi
@@ -918,21 +990,21 @@ uninstall_singbox() {
 }
 
 show_service_status() {
-    [ ! -f "$BIN_FILE" ] && echo -e "${RED}尚未安装 Sing-box！${PLAIN}" && return
-    echo -e "${CYAN}=== Sing-box 服务状态 ===${PLAIN}"
+    [ ! -f "$BIN_FILE" ] && echo -e "  ${RED}尚未安装 Sing-box！${PLAIN}" && return
+    echo -e "\n  ${CYAN}▌ Sing-box 服务状态${PLAIN}"
     svc_status
 }
 
 show_full_config() {
-    echo -e "${CYAN}=== 完整配置文件 (${CONFIG_FILE}) ===${PLAIN}"
-    [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || echo -e "${RED}配置文件不存在！${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 完整配置文件 (${CONFIG_FILE})${PLAIN}"
+    [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || echo -e "  ${RED}配置文件不存在！${PLAIN}"
 }
 
 view_logs() {
-    echo -e "${CYAN}=== Sing-box 日志 (最近 100 行) ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ Sing-box 日志 (最近 100 行)${PLAIN}"
     svc_logs 100
-    echo -e "--------------------------------------------------"
-    read -rp "是否进入实时日志? (Ctrl+C 退出) [y/N]: " f
+    ui_subrule
+    read -rp "  是否进入实时日志? (Ctrl+C 退出) [y/N]: " f || return 0
     [[ "$f" =~ ^[Yy]$ ]] && svc_logs_follow
 }
 
@@ -941,7 +1013,7 @@ add_reality_node() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
     ensure_config
 
-    echo -e "${CYAN}=== 添加 VLESS-Reality 节点 ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 添加 VLESS-Reality 节点${PLAIN}"
     local port
     port=$(read_valid_port "监听端口 [默认 443]: " 443 1) || return 1
 
@@ -986,22 +1058,21 @@ add_reality_node() {
         host=$(format_url_host "$ip")
         local link="vless://$uuid@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
-        echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
-        echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "服务器 IP  : ${BLUE}$ip${PLAIN}"
-        echo -e "端口       : ${BLUE}$port${PLAIN}"
-        echo -e "UUID       : ${BLUE}$uuid${PLAIN}"
-        echo -e "公钥 (PK)  : ${BLUE}$public_key${PLAIN}"
-        echo -e "ShortId    : ${BLUE}$short_id${PLAIN}"
-        echo -e "SNI        : ${BLUE}$sni${PLAIN}"
-        echo -e "分享链接   : ${YELLOW}$link${PLAIN}"
-        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "  ${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
+        declare -F ui_subrule >/dev/null && ui_subrule
+        echo -e "  服务器 IP  : ${BLUE}$ip${PLAIN}"
+        echo -e "  端口       : ${BLUE}$port${PLAIN}"
+        echo -e "  UUID       : ${BLUE}$uuid${PLAIN}"
+        echo -e "  公钥 (PK)  : ${BLUE}$public_key${PLAIN}"
+        echo -e "  ShortId    : ${BLUE}$short_id${PLAIN}"
+        echo -e "  SNI        : ${BLUE}$sni${PLAIN}"
+        echo -e "  分享链接   : ${YELLOW}$link${PLAIN}"
+        declare -F ui_subrule >/dev/null && ui_subrule
 
         if command -v qrencode &>/dev/null; then
-            read -rp "是否显示二维码？[y/N]: " show_qr
+            read -rp "  是否显示二维码？[y/N]: " show_qr || return 0
             if [[ "$show_qr" =~ ^[Yy]$ ]]; then
-                echo -e "${BLUE}二维码:${PLAIN}"
+                echo -e "  ${BLUE}二维码:${PLAIN}"
                 qrencode -t ANSIUTF8 "$link"
             fi
         fi
@@ -1019,7 +1090,7 @@ add_anytls_node() {
         return 1
     fi
 
-    echo -e "${CYAN}=== 添加 AnyTLS-Reality 节点 ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 添加 AnyTLS-Reality 节点${PLAIN}"
     local port
     port=$(read_valid_port "监听端口 [默认 8444]: " 8444 1) || return 1
 
@@ -1065,25 +1136,24 @@ add_anytls_node() {
         host=$(format_url_host "$ip")
         local link="anytls://$password@$host:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
-        echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
-        echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "服务器 IP  : ${BLUE}$ip${PLAIN}"
-        echo -e "端口       : ${BLUE}$port${PLAIN}"
-        echo -e "密码       : ${BLUE}$password${PLAIN}"
-        echo -e "公钥 (PK)  : ${BLUE}$public_key${PLAIN}"
-        echo -e "ShortId    : ${BLUE}$short_id${PLAIN}"
-        echo -e "SNI        : ${BLUE}$sni${PLAIN}"
-        echo -e "分享链接   : ${YELLOW}$link${PLAIN}"
-        echo -e "${GREEN}====================================================${PLAIN}"
+        echo -e "  ${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
+        declare -F ui_subrule >/dev/null && ui_subrule
+        echo -e "  服务器 IP  : ${BLUE}$ip${PLAIN}"
+        echo -e "  端口       : ${BLUE}$port${PLAIN}"
+        echo -e "  密码       : ${BLUE}$password${PLAIN}"
+        echo -e "  公钥 (PK)  : ${BLUE}$public_key${PLAIN}"
+        echo -e "  ShortId    : ${BLUE}$short_id${PLAIN}"
+        echo -e "  SNI        : ${BLUE}$sni${PLAIN}"
+        echo -e "  分享链接   : ${YELLOW}$link${PLAIN}"
+        declare -F ui_subrule >/dev/null && ui_subrule
         echo -e "${YELLOW}客户端要求：AnyTLS + Reality 需 sing-box 内核客户端（官方 sing-box /${PLAIN}"
         echo -e "${YELLOW}   Karing / Hiddify / v2rayN），或小火箭 Shadowrocket 2.2.65+（类型选 AnyTLS，${PLAIN}"
         echo -e "${YELLOW}   TLS 开启后填 SNI / 公钥 / 短 ID）；mihomo 不支持该组合。${PLAIN}"
 
         if command -v qrencode &>/dev/null; then
-            read -rp "是否显示二维码？[y/N]: " show_qr
+            read -rp "  是否显示二维码？[y/N]: " show_qr || return 0
             if [[ "$show_qr" =~ ^[Yy]$ ]]; then
-                echo -e "${BLUE}二维码:${PLAIN}"
+                echo -e "  ${BLUE}二维码:${PLAIN}"
                 qrencode -t ANSIUTF8 "$link"
             fi
         fi
@@ -1132,7 +1202,7 @@ add_ss2022_node() {
     link=$(ss2022_link "$method" "$password" "$ip" "$port" "$tag") || return 1
     printf 'SS2022 | %s | 端口: %s\n分享链接: %s\n' "$(node_display_name "$tag")" "$port" "$link"
     if command -v qrencode &>/dev/null; then
-        read -rp '显示二维码？[y/N]: ' show_qr
+        read -rp '  显示二维码？[y/N]: ' show_qr || return 0
         [[ "$show_qr" =~ ^[Yy]$ ]] && qrencode -t ANSIUTF8 "$link"
     fi
     return 0
@@ -1143,9 +1213,9 @@ view_node_links() {
     local ip host
     ip=$(get_public_ip)
     host=$(format_url_host "$ip")
-    echo -e "${CYAN}=== 节点分享链接 ===${PLAIN}"
-    echo -e "${BLUE}服务器 IP: $ip${PLAIN}"
-    echo -e "--------------------------------------------------"
+    echo -e "\n  ${CYAN}▌ 节点分享链接${PLAIN}"
+    echo -e "  ${BLUE}服务器 IP: $ip${PLAIN}"
+    declare -F ui_subrule >/dev/null && ui_subrule
 
     local records
     records=$(jq -r '
@@ -1189,7 +1259,7 @@ view_node_links() {
                 echo -e "      SNI : $f5  |  ShortId: $f6"
                 echo -e "      公钥: ${pbk:-未记录}"
                 echo -e "      链接: ${YELLOW}$link${PLAIN}"
-                echo -e "--------------------------------------------------"
+                declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
             anytls)
                 idx=$((idx+1))
@@ -1202,7 +1272,7 @@ view_node_links() {
                 echo -e "      公钥: ${pbk:-未记录}"
                 echo -e "      密码: $f4"
                 echo -e "      链接: ${YELLOW}$link${PLAIN}"
-                echo -e "--------------------------------------------------"
+                declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
             ss2022)
                 link=$(ss2022_link "$f4" "$f5" "$ip" "$port" "$tag") || continue
@@ -1210,15 +1280,16 @@ view_node_links() {
                 tags+=("$display")
                 idx=$((idx+1))
                 printf '  [%s] SS2022 | %s | 端口: %s\n      链接: %s\n' "$idx" "$display" "$port" "$link"
+                declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
         esac
     done <<< "$records"
 
     if command -v qrencode &>/dev/null && [ "${#links[@]}" -gt 0 ]; then
-        read -rp "输入要显示二维码的序号 (0 跳过): " qr_idx
+        read -rp "  输入要显示二维码的序号 (0 或回车跳过): " qr_idx || return 0
         if [[ "$qr_idx" =~ ^[0-9]+$ ]] && [ "$qr_idx" -ge 1 ] && [ "$qr_idx" -le "${#links[@]}" ]; then
             local ridx=$((qr_idx - 1))
-            printf '二维码 [%s]:\n' "${tags[$ridx]}"
+            printf '  二维码 [%s]:\n' "${tags[$ridx]}"
             qrencode -t ANSIUTF8 "${links[$ridx]}"
         fi
     fi
@@ -1226,35 +1297,17 @@ view_node_links() {
 
 delete_node() {
     ensure_config
-    local node_type type_choice i ss_total
-    local types=(vless anytls ss2022) labels=(VLESS-Reality AnyTLS-Reality SS2022) counts available=()
-    ss_total=$(ss2022_count) || return 1
-    counts=("$(count_by_type vless)" "$(count_by_type anytls)" "$ss_total")
-    for i in 0 1 2; do
-        if [ "${counts[i]}" -gt 0 ]; then available+=("$i"); fi
-    done
-    case "${#available[@]}" in
-        0) printf '当前没有可删除的节点。\n'; return 0 ;;
-        1) node_type=${types[${available[0]}]} ;;
-        *) printf '=== 删除节点：请选择类型 ===\n'
-           for i in "${available[@]}"; do
-               printf '  [%s] %s（%s 个）\n' "$((i+1))" "${labels[i]}" "${counts[i]}"
-           done
-           read -rp '请选择 (0 取消): ' type_choice || return 0
-           [[ "$type_choice" == 0 ]] && return 0
-           if ! [[ "$type_choice" =~ ^[1-3]$ && ${counts[type_choice-1]} -gt 0 ]]; then
-               printf '无效选项。\n'; return 1
-           fi
-           node_type=${types[type_choice-1]} ;;
-    esac
+    local real_idx del_tag del_display yn
+    real_idx=$(prompt_delete_index "要删除的节点" node)
+    [ -z "$real_idx" ] && return 0
 
-    echo -e "${CYAN}=== 删除 ${node_type} 节点 ===${PLAIN}"
-    local real_idx
-    real_idx=$(prompt_delete_index "节点" "$node_type")
-    [ -z "$real_idx" ] && return
-
-    local del_tag
     del_tag=$(inbound_field "$real_idx" "tag")
+    del_display=$(node_display_name "$del_tag")
+    read -rp "  确认删除节点 [${del_display}]？[y/N]: " yn || return 0
+    if ! [[ "$yn" =~ ^[Yy]$ ]]; then
+        printf '  %b已取消。%b\n' "$YELLOW" "$PLAIN"
+        return 0
+    fi
 
     local temp_json
     temp_json=$(jq --argjson i "$real_idx" --arg tag "$del_tag" '
@@ -1269,7 +1322,7 @@ delete_node() {
         if [ -e "$NODE_NAMES_META" ]; then
             save_node_name "$del_tag" "" || printf '节点已删除，但旧备注清理失败。\n' >&2
         fi
-        echo -e "${GREEN}节点 [${del_tag}] 已删除。${PLAIN}"
+        echo -e "  ${GREEN}节点 [${del_display}] 已删除。${PLAIN}"
     fi
 }
 
@@ -1278,7 +1331,7 @@ add_port_forward() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
     ensure_config
 
-    echo -e "${CYAN}=== 添加 TCP/UDP 端口转发 ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 添加 TCP/UDP 端口转发${PLAIN}"
     local local_port remote_ip remote_port
     local_port=$(read_valid_port "本机监听端口: " "" 1) || return 1
     read -rp "目标远程 IP: " remote_ip || return 1
@@ -1307,13 +1360,13 @@ add_port_forward() {
 
 view_port_forwards() {
     ensure_config
-    echo -e "${CYAN}=== 端口转发列表 ===${PLAIN}"
-    echo -e "--------------------------------------------------"
+    echo -e "\n  ${CYAN}▌ 端口转发列表${PLAIN}"
+    ui_subrule
 
     local total
     total=$(count_by_type "direct")
     if [ "$total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有端口转发。${PLAIN}"
+        echo -e "  ${YELLOW}当前没有端口转发。${PLAIN}"
         return
     fi
 
@@ -1329,11 +1382,11 @@ view_port_forwards() {
             lp=$(inbound_field  "$i" "listen_port")
             rip=$(inbound_field "$i" "override_address")
             rp=$(inbound_field  "$i" "override_port")
-            echo -e "  [${GREEN}$idx${PLAIN}] 监听 [${BLUE}$lp${PLAIN}] -> ${rip}:${rp}   ${CYAN}($tag)${PLAIN}"
+            printf '    %b%2s)%b 监听 %b%s%b -> %s:%s  %b(%s)%b\n' "$GREEN" "$idx" "$PLAIN" "$BLUE" "$lp" "$PLAIN" "$rip" "$rp" "$DIM" "$tag" "$PLAIN"
         fi
         i=$((i+1))
     done
-    echo -e "--------------------------------------------------"
+    ui_subrule
 }
 
 delete_port_forward() {
@@ -1341,16 +1394,19 @@ delete_port_forward() {
     local total
     total=$(count_by_type "direct")
     if [ "$total" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有端口转发。${PLAIN}"; return
+        echo -e "  ${YELLOW}当前没有端口转发。${PLAIN}"; return
     fi
 
-    echo -e "${CYAN}=== 删除端口转发 ===${PLAIN}"
-    local real_idx
-    real_idx=$(prompt_delete_index "端口转发" "direct")
-    [ -z "$real_idx" ] && return
+    local real_idx del_tag yn
+    real_idx=$(prompt_delete_index "要删除的端口转发" "direct")
+    [ -z "$real_idx" ] && return 0
 
-    local del_tag
     del_tag=$(inbound_field "$real_idx" "tag")
+    read -rp "  确认删除转发 [${del_tag}]？[y/N]: " yn || return 0
+    if ! [[ "$yn" =~ ^[Yy]$ ]]; then
+        printf '  %b已取消。%b\n' "$YELLOW" "$PLAIN"
+        return 0
+    fi
 
     local temp_json
     temp_json=$(jq --argjson i "$real_idx" --arg tag "$del_tag" '
@@ -1361,42 +1417,43 @@ delete_port_forward() {
                    "$CONFIG_FILE") || return 1
 
     if apply_config_and_restart "$temp_json"; then
-        echo -e "${GREEN}转发 [${del_tag}] 已删除。${PLAIN}"
+        echo -e "  ${GREEN}转发 [${del_tag}] 已删除。${PLAIN}"
     fi
 }
 
 # ==================== 配置诊断与回滚 ====================
 diagnose_config() {
+    local c cc
     while true; do
-        menu_header "配置诊断与回滚" "查看、编辑、校验与恢复配置"
-        echo -e " 配置文件: ${BLUE}$CONFIG_FILE${PLAIN}"
+        local cfg_stat="${RED}不存在${PLAIN}"
         if [ -f "$CONFIG_FILE" ]; then
             local size
             size=$(wc -c < "$CONFIG_FILE" 2>/dev/null)
-            echo -e " 文件大小: ${BLUE}${size}${PLAIN} bytes"
             if jq empty "$CONFIG_FILE" 2>/dev/null; then
-                echo -e " JSON状态: ${GREEN}语法正确${PLAIN}"
-                echo -e " 入站总数: ${BLUE}$(inbound_count)${PLAIN}  (VLESS: $(count_by_type vless), AnyTLS: $(count_by_type anytls), SS2022: $(ss2022_count 2>/dev/null || echo 0), 转发: $(count_by_type direct))"
+                cfg_stat="${GREEN}有效${PLAIN}（${size}B · 入站 $(inbound_count)）"
             else
-                echo -e " JSON状态: ${RED}语法错误${PLAIN}"
+                cfg_stat="${RED}JSON 语法错误${PLAIN}（${size}B）"
             fi
-        else
-            echo -e " 状态: ${RED}配置文件不存在${PLAIN}"
         fi
-        echo -e " 备份文件: $([ -f "${CONFIG_FILE}.bak" ] && echo -e "${GREEN}存在（上一版有效配置）${PLAIN}" || echo -e "${YELLOW}不存在${PLAIN}")"
-        menu_section "配置操作"
-        menu_option 1 "查看原始 JSON"
-        menu_option 2 "查看 Reality 元数据"
+        menu_header "配置管理与回滚" "$CONFIG_FILE" "$cfg_stat"
+        ui_kv "入站明细" "VLESS $(count_by_type vless) · AnyTLS $(count_by_type anytls) · SS2022 $(ss2022_count 2>/dev/null || echo 0) · 转发 $(count_by_type direct)"
+        ui_kv "上次备份" "$([ -f "${CONFIG_FILE}.bak" ] && echo "${GREEN}可用（上一版有效配置）${PLAIN}" || echo "${YELLOW}暂无备份${PLAIN}")"
+        menu_section "查看与编辑"
+        menu_option 1 "查看原始 JSON 配置"
+        menu_option 2 "查看 Reality 公钥元数据"
         menu_option 3 "手动编辑并校验配置"
-        menu_option 4 "重置为空配置（自动备份）"
-        menu_option 5 "回滚到上次有效备份（高风险）"
+        menu_section "恢复与重置"
+        menu_option 4 "回滚到上次有效备份"
+        menu_option 5 "重置为空配置（自动备份旧文件）"
         menu_back
-        read_menu_choice "请选择 [0-5]"; c="$REPLY"
+        read_menu_choice "请选择 [0-5]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) echo -e "${CYAN}--- 原始 JSON ---${PLAIN}"; cat "$CONFIG_FILE" 2>/dev/null ;;
-            2) echo -e "${CYAN}--- Reality 元数据 ---${PLAIN}"; [ -f "$REALITY_META" ] && cat "$REALITY_META" || echo -e "${YELLOW}无${PLAIN}" ;;
+            "") continue ;;
+            1) ui_title "原始 JSON ($CONFIG_FILE)"; cat "$CONFIG_FILE" 2>/dev/null; pause ;;
+            2) ui_title "Reality 元数据"; [ -f "$REALITY_META" ] && cat "$REALITY_META" || echo -e "  ${YELLOW}无${PLAIN}"; pause ;;
             3) if [ ! -x "$BIN_FILE" ]; then
-                   echo -e "${RED}请先安装 Sing-box 核心！${PLAIN}"
+                   echo -e "  ${RED}请先安装 Sing-box 核心！${PLAIN}"
                else
                    local editor="vi" edit_tmp edited_json
                    command -v nano &>/dev/null && editor="nano"
@@ -1405,97 +1462,133 @@ diagnose_config() {
                        "$editor" "$edit_tmp"
                        if cmp -s "$CONFIG_FILE" "$edit_tmp"; then
                            rm -f -- "$edit_tmp"
-                           echo -e "${YELLOW}配置未改动。${PLAIN}"
+                           echo -e "  ${YELLOW}配置未改动。${PLAIN}"
                        elif ! jq empty "$edit_tmp" 2>/dev/null; then
                            rm -f -- "$edit_tmp"
-                           echo -e "${RED}JSON 语法错误，已放弃更改，原配置未改动。${PLAIN}"
+                           echo -e "  ${RED}JSON 语法错误，已放弃更改，原配置未改动。${PLAIN}"
                        else
                            edited_json=$(cat "$edit_tmp")
                            rm -f -- "$edit_tmp"
                            if apply_config_and_restart "$edited_json"; then
-                               echo -e "${GREEN}配置校验通过，已保存并重启服务。${PLAIN}"
+                               echo -e "  ${GREEN}配置校验通过，已保存并重启服务。${PLAIN}"
                            fi
                        fi
                    else
                        rm -f -- "${edit_tmp:-}"
-                       echo -e "${RED}准备临时编辑文件失败。${PLAIN}"
+                       echo -e "  ${RED}准备临时编辑文件失败。${PLAIN}"
                    fi
+               fi
+               pause ;;
+            4) read -rp "  确定要回滚到上次有效备份吗？[y/N]: " cc || continue
+               if [[ "$cc" =~ ^[Yy]$ ]]; then
+                   rollback_config
+                   pause
                fi ;;
-            4) read -rp "是否备份并重置为空配置？[y/N]: " cc
+            5) read -rp "  是否备份并重置为空配置？[y/N]: " cc || continue
                if [[ "$cc" =~ ^[Yy]$ ]]; then
                    cp "$CONFIG_FILE" "${CONFIG_FILE}.broken.$(date +%s)" 2>/dev/null
                    rm -f "$CONFIG_FILE"
                    ensure_config
-                   echo -e "${GREEN}已重置（旧文件已备份）${PLAIN}"
+                   echo -e "  ${GREEN}已重置（旧文件已备份）${PLAIN}"
+                   pause
                fi ;;
-            5) read -rp "确定要回滚到上次有效备份吗？[y/N]: " cc
-               [[ "$cc" =~ ^[Yy]$ ]] && rollback_config ;;
             0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
 # ==================== 子菜单 ====================
 menu_system() {
+    local c
     while true; do
-        menu_header "系统管理" "核心、服务与运行监控" "$(get_singbox_status)"
-        menu_section "服务操作"
+        menu_header "服务与核心管理" "Sing-box 核心、服务运行与日志" "$(get_singbox_status)"
+        menu_section "核心与服务"
         menu_option 1 "安装 / 更新 Sing-box 核心"
         menu_option 2 "启动服务"
         menu_option 3 "停止服务"
         menu_option 4 "重启服务"
-        menu_option 5 "卸载 Sing-box"
-        menu_section "查看与诊断"
-        menu_option 6 "查看服务状态"
-        menu_option 7 "查看当前配置"
-        menu_option 8 "查看运行日志"
-        menu_section "危险操作"
-        menu_option 9 "彻底卸载（核心、配置和 sb 脚本）"
+        menu_section "运行诊断"
+        menu_option 5 "查看服务状态"
+        menu_option 6 "查看运行日志"
+        menu_option 7 "配置管理与回滚（查看 / 编辑 / 备份）"
+        menu_section "卸载（危险操作）"
+        menu_option 8 "卸载 Sing-box（保留 sb 面板）"
+        menu_option 9 "彻底卸载（核心、配置与 sb 面板）"
         menu_back
-        read_menu_choice "请选择 [0-9]"; c="$REPLY"
+        read_menu_choice "请选择 [0-9]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) install_singbox ;; 2) start_service ;;
-            3) svc_stop && echo -e "${YELLOW}已停止${PLAIN}" ;; 4) restart_service ;;
-            5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
-            9) uninstall_singbox full ;;
-            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            "") continue ;;
+            1) install_singbox; pause ;;
+            2) start_service; pause ;;
+            3) svc_stop && echo -e "  ${YELLOW}已停止${PLAIN}"; pause ;;
+            4) restart_service; pause ;;
+            5) show_service_status; pause ;;
+            6) view_logs; pause ;;
+            7) diagnose_config ;;
+            8) uninstall_singbox; pause ;;
+            9) uninstall_singbox full; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
 menu_nodes() {
+    local c
     while true; do
-        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022"
-        menu_option 1 "添加 VLESS-Reality 节点"
-        menu_option 2 "添加 AnyTLS-Reality 节点"
-        menu_option 3 "查看分享链接 / 二维码（全部节点）"
-        menu_option 4 "删除节点"
-        menu_option 5 "修改节点备注（无需重启）"
+        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022" "$(nodes_summary_line)"
+        menu_section "日常操作"
+        menu_option 1 "查看节点链接 / 二维码"
+        menu_option 2 "修改节点备注（无需重启）"
+        menu_option 3 "删除节点"
+        menu_section "添加节点"
+        menu_option 4 "添加 VLESS-Reality 节点"
+        menu_option 5 "添加 AnyTLS-Reality 节点"
         menu_option 6 "添加 Shadowsocks 2022 节点"
         menu_back
-        read_menu_choice "请选择 [0-6]"; c="$REPLY"
+        read_menu_choice "请选择 [0-6]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) add_reality_node ;; 2) add_anytls_node ;; 3) view_node_links ;; 4) delete_node ;;
-            5) rename_node ;; 6) add_ss2022_node ;;
-            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            "") continue ;;
+            1) view_node_links; pause ;;
+            2) rename_node; pause ;;
+            3) delete_node; pause ;;
+            4) add_reality_node; pause ;;
+            5) add_anytls_node; pause ;;
+            6) add_ss2022_node; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
 menu_forward() {
+    local c fw_count fw_stat
     while true; do
-        menu_header "端口转发" "TCP / UDP 转发规则管理"
-        menu_option 1 "添加端口转发"
-        menu_option 2 "查看转发规则"
+        fw_count=$(count_by_type direct)
+        if [ "$fw_count" -gt 0 ]; then
+            fw_stat="${GREEN}共 ${fw_count} 条转发规则${PLAIN}"
+        else
+            fw_stat="${YELLOW}暂无转发规则${PLAIN}"
+        fi
+        menu_header "端口转发" "TCP / UDP 端口转发规则" "$fw_stat"
+        menu_section "转发操作"
+        menu_option 1 "查看转发规则"
+        menu_option 2 "添加端口转发"
         menu_option 3 "删除转发规则"
         menu_back
-        read_menu_choice "请选择 [0-3]"; c="$REPLY"
-        case "$c" in 1) add_port_forward ;; 2) view_port_forwards ;; 3) delete_port_forward ;; 0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;; esac
-        pause
+        read_menu_choice "请选择 [0-3]" || return 0
+        c="$REPLY"
+        case "$c" in
+            "") continue ;;
+            1) view_port_forwards; pause ;;
+            2) add_port_forward; pause ;;
+            3) delete_port_forward; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
+        esac
     done
 }
 
@@ -1506,8 +1599,8 @@ _UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like G
 
 # ---------- 流媒体解锁检测（本机出口）----------
 media_check_quick() {
-    echo -e "${CYAN}=== 流媒体解锁检测（基于本机直连出口）===${PLAIN}"
-    echo -e "${BLUE}检测中，请稍候...${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 流媒体解锁检测（本机直连出口）${PLAIN}"
+    echo -e "  ${BLUE}检测中，请稍候...${PLAIN}"
 
     # 出口 IP / 地区
     local geo ip country org
@@ -1515,10 +1608,10 @@ media_check_quick() {
     ip=$(jq -r '.ip // "?"' <<<"$geo" 2>/dev/null)
     country=$(jq -r '.country // "?"' <<<"$geo" 2>/dev/null)
     org=$(jq -r '.org // "?"' <<<"$geo" 2>/dev/null)
-    echo -e "--------------------------------------------------"
-    echo -e " 出口 IP : ${BLUE}${ip}${PLAIN}   地区: ${BLUE}${country}${PLAIN}"
-    echo -e " ISP    : ${org}"
-    echo -e "--------------------------------------------------"
+    ui_subrule
+    echo -e "  出口 IP : ${BLUE}${ip}${PLAIN}   地区: ${BLUE}${country}${PLAIN}"
+    echo -e "  ISP     : ${org}"
+    ui_subrule
 
     # ChatGPT / OpenAI
     local loc comp gpt
@@ -1559,15 +1652,16 @@ media_check_quick() {
     local tt ttc
     ttc=$(curl -s --max-time 12 -A "$_UA" "https://www.tiktok.com/" 2>/dev/null | sed -n 's/.*"region":"\([A-Z][A-Z]\)".*/\1/p' | head -1)
     if [[ -n "$ttc" ]]; then tt="${GREEN}可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}未获取到地区${PLAIN}"; fi
-    printf ' %-12s: %b\n' "TikTok" "$tt"
-    echo -e "--------------------------------------------------"
-    echo -e "${YELLOW}提示：此结果为服务器本机直连出口。若想让某服务走 WARP，可在「WARP 出口」菜单添加分流。${PLAIN}"
+    printf '  %-10s: %b\n' "TikTok" "$tt"
+    ui_subrule
+    echo -e "  ${YELLOW}提示：此结果为服务器本机直连出口。若想让某服务走 WARP，可在「WARP 出口与分流」开启对应规则。${PLAIN}"
 }
 
 media_check_full() {
     local c rc tmp
-    echo -e "${CYAN}=== 完整流媒体解锁检测（社区脚本 RegionRestrictionCheck）===${PLAIN}"
-    echo -e "${YELLOW}将以 root 权限下载并运行外部脚本，需能访问 GitHub。${PLAIN}"
+    echo -e "\n  ${CYAN}▌ IP 质量与流媒体解锁体检（xykt/IPQuality 交互界面）${PLAIN}"
+    echo "涵盖 IP 基础信息、风控评分、常见流媒体 / AI 解锁、邮局连通性与黑名单检测。"
+    echo -e "${YELLOW}将以 root 权限下载并运行外部脚本，需能访问 GitHub / Check.Place；缺少依赖时脚本可能提示安装系统包。${PLAIN}"
     read -rp "继续？[y/N]: " c || return 0
     [[ "$c" =~ ^[Yy]$ ]] || return 0
     (
@@ -1578,19 +1672,19 @@ media_check_full() {
         trap 'exit 143' TERM
         if ! curl --proto '=https' --proto-redir '=https' -fSL \
             --connect-timeout 15 --max-time 120 --retry 2 \
-            https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh -o "$tmp/check.sh"; then
+            https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh -o "$tmp/ip.sh"; then
             echo -e "${RED}检测脚本下载失败，未执行。${PLAIN}" >&2
             exit 1
         fi
-        if [[ ! -s "$tmp/check.sh" ]] || ! bash -n "$tmp/check.sh"; then
+        if [[ ! -s "$tmp/ip.sh" ]] || ! bash -n "$tmp/ip.sh"; then
             echo -e "${RED}检测脚本内容为空或语法检查失败，未执行。${PLAIN}" >&2
             exit 1
         fi
-        bash "$tmp/check.sh"
+        bash "$tmp/ip.sh" -M
     )
     rc=$?
     if (( rc != 0 )); then
-        echo -e "${YELLOW}流媒体检测脚本未正常完成（退出码 ${rc}），已返回面板。${PLAIN}"
+        echo -e "${YELLOW}IP 质量体检脚本未正常完成（退出码 ${rc}），已返回面板。${PLAIN}"
     fi
     return "$rc"
 }
@@ -1598,7 +1692,7 @@ media_check_full() {
 # BestTrace 保持独立子进程，避免上游的变量、exit 和 trap 影响面板。
 besttrace_check() {
     local answer rc tmp
-    echo -e "${CYAN}=== 回程路由测试（BestTrace.sh）===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 回程路由测试（BestTrace.sh）${PLAIN}"
     echo "支持电信 / 联通 / 移动 / 教育网，线路识别结果仅供参考。"
     echo -e "${YELLOW}将以 root 权限下载并运行 https://besttrace.sh/ 的第三方脚本。${PLAIN}"
     echo "首次运行可能由上游下载并安装 NextTrace；不会主动修改 sing-box 配置。"
@@ -1634,10 +1728,15 @@ besttrace_check() {
 DNS_BACKUP="$META_DIR/resolv.conf.bak"
 
 show_dns() {
-    echo -e "${CYAN}=== 当前 DNS (/etc/resolv.conf) ===${PLAIN}"
-    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}未配置 nameserver${PLAIN}"
+    local ns
+    ns=$(awk '/^nameserver[[:space:]]+/{out = (out ? out ", " : "") $2} END{print out}' /etc/resolv.conf 2>/dev/null)
+    if [ -n "$ns" ]; then
+        printf '  %b当前 DNS%b  %b%s%b\n' "$DIM" "$PLAIN" "$BLUE" "$ns" "$PLAIN"
+    else
+        printf '  %b当前 DNS%b  %b未配置 nameserver%b\n' "$DIM" "$PLAIN" "$YELLOW" "$PLAIN"
+    fi
     if [ "$INIT_SYS" = "systemd" ] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        echo -e "${YELLOW}检测到 systemd-resolved 正在运行，直改 resolv.conf 可能被覆盖。${PLAIN}"
+        printf '  %b提示：systemd-resolved 正在运行，直改 resolv.conf 可能被覆盖。%b\n' "$YELLOW" "$PLAIN"
     fi
 }
 
@@ -1676,30 +1775,43 @@ set_dns() {
 }
 
 menu_dns() {
+    local c custom
     while true; do
-        menu_header "DNS 设置" "解析服务器配置"
+        menu_header "DNS 设置" "/etc/resolv.conf 解析配置"
         show_dns
         menu_section "常用 DNS"
         menu_option 1 "Cloudflare（1.1.1.1 / 1.0.0.1）"
         menu_option 2 "Google（8.8.8.8 / 8.8.4.4）"
         menu_option 3 "Quad9（9.9.9.9 / 149.112.112.112）"
         menu_option 4 "AliDNS（223.5.5.5 / 223.6.6.6）"
+        menu_section "高级"
         menu_option 5 "自定义 DNS（空格分隔多个）"
-        menu_option 6 "恢复备份 resolv.conf"
+        menu_option 6 "恢复原始 resolv.conf 备份"
         menu_back
-        read_menu_choice "请选择 [0-6]"; c="$REPLY"
+        read_menu_choice "请选择 [0-6]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) set_dns "1.1.1.1 1.0.0.1 2606:4700:4700::1111" "Cloudflare" ;;
-            2) set_dns "8.8.8.8 8.8.4.4 2001:4860:4860::8888" "Google" ;;
-            3) set_dns "9.9.9.9 149.112.112.112" "Quad9" ;;
-            4) set_dns "223.5.5.5 223.6.6.6" "AliDNS" ;;
-            5) read -rp "输入 DNS（空格分隔）: " custom
-               [[ -n "$custom" ]] && set_dns "$custom" "自定义" || echo -e "${RED}未输入。${PLAIN}" ;;
-            6) if [ -f "$DNS_BACKUP" ]; then cp "$DNS_BACKUP" /etc/resolv.conf; echo -e "${GREEN}已恢复备份。${PLAIN}"; show_dns; else echo -e "${YELLOW}无备份。${PLAIN}"; fi ;;
+            "") continue ;;
+            1) set_dns "1.1.1.1 1.0.0.1 2606:4700:4700::1111" "Cloudflare"; pause ;;
+            2) set_dns "8.8.8.8 8.8.4.4 2001:4860:4860::8888" "Google"; pause ;;
+            3) set_dns "9.9.9.9 149.112.112.112" "Quad9"; pause ;;
+            4) set_dns "223.5.5.5 223.6.6.6" "AliDNS"; pause ;;
+            5) read -rp "  输入 DNS（空格分隔，回车取消）: " custom || continue
+               if [[ -n "$custom" ]]; then
+                   set_dns "$custom" "自定义"
+                   pause
+               fi ;;
+            6) if [ -f "$DNS_BACKUP" ]; then
+                   cp "$DNS_BACKUP" /etc/resolv.conf
+                   echo -e "  ${GREEN}已恢复备份。${PLAIN}"
+                   show_dns
+               else
+                   echo -e "  ${YELLOW}无备份。${PLAIN}"
+               fi
+               pause ;;
             0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
@@ -1751,7 +1863,7 @@ is_ssh_port() {
 
 menu_firewall() {
     if ! command -v ufw &>/dev/null; then
-        echo -e "${YELLOW}未安装 ufw，正在尝试安装...${PLAIN}"
+        echo -e "  ${YELLOW}未安装 ufw，正在尝试安装...${PLAIN}"
         case "$OS_FAMILY" in
             debian) apt-get update -qq && apt-get install -y -qq ufw ;;
             redhat) yum install -y -q firewalld 2>/dev/null ;;
@@ -1760,64 +1872,79 @@ menu_firewall() {
         esac
     fi
     if ! command -v ufw &>/dev/null; then
-        echo -e "${YELLOW}当前系统没有 ufw。${PLAIN}"
+        echo -e "  ${YELLOW}当前系统没有 ufw。${PLAIN}"
         echo -e "  Alpine : apk add ufw iptables && rc-update add ufw default && rc-service ufw start"
         echo -e "  其它   : 手动安装 ufw，或直接用 iptables / nftables 放行端口"
-        echo -e "${YELLOW}注：Alpine 默认不启用任何防火墙（端口本来就全开），一般无需额外放行。${PLAIN}"
+        echo -e "  ${YELLOW}注：Alpine 默认不启用任何防火墙（端口本来就全开），一般无需额外放行。${PLAIN}"
+        pause
         return
     fi
+    local c
     while true; do
-        local detected_ssh
+        local detected_ssh ufw_out ufw_stat
         detected_ssh=$(detect_ssh_ports)
-        menu_header "防火墙设置" "ufw 端口与安全策略（SSH: ${detected_ssh}）"
-        ufw status verbose 2>/dev/null | head -20
+        ufw_out=$(LC_ALL=C ufw status 2>/dev/null)
+        if [[ "$ufw_out" == 'Status: active'* ]]; then
+            ufw_stat="${GREEN}已启用${PLAIN}（SSH: ${detected_ssh}）"
+        else
+            ufw_stat="${YELLOW}未启用${PLAIN}（SSH: ${detected_ssh}）"
+        fi
+        menu_header "防火墙管理 (ufw)" "端口放行与安全策略" "$ufw_stat"
+        ufw status verbose 2>/dev/null | head -18 | sed 's/^/  /'
         menu_section "规则操作"
         menu_option 1 "开放端口（TCP + UDP）"
         menu_option 2 "关闭 / 删除端口规则"
-        menu_option 3 "启用防火墙（自动保留 SSH 端口: ${detected_ssh}）"
+        menu_section "开关"
+        menu_option 3 "启用防火墙（自动保留 SSH: ${detected_ssh}）"
         menu_option 4 "关闭防火墙"
         menu_option 5 "重载防火墙"
         menu_back
-        read_menu_choice "请选择 [0-5]"; c="$REPLY"
+        read_menu_choice "请选择 [0-5]" || return 0
+        c="$REPLY"
         case "$c" in
+            "") continue ;;
             1) local p
-               read -rp "要开放的端口: " p
+               read -rp "  要开放的端口（回车取消）: " p || continue
+               [[ -z "$p" ]] && continue
                if [[ "$p" =~ ^[0-9]{1,5}$ ]] && validate_port "$((10#$p))"; then
                    p=$((10#$p))
-                   ufw allow "$p"/tcp && ufw allow "$p"/udp && echo -e "${GREEN}已开放 $p (tcp+udp)${PLAIN}"
-               else echo -e "${RED}端口无效！${PLAIN}"; fi ;;
+                   ufw allow "$p"/tcp && ufw allow "$p"/udp && echo -e "  ${GREEN}已开放 $p (tcp+udp)${PLAIN}"
+               else echo -e "  ${RED}端口无效！${PLAIN}"; fi
+               pause ;;
             2) local p yn
-               read -rp "要关闭的端口: " p
+               read -rp "  要关闭的端口（回车取消）: " p || continue
+               [[ -z "$p" ]] && continue
                if ! [[ "$p" =~ ^[0-9]{1,5}$ ]] || ! validate_port "$((10#$p))"; then
-                   echo -e "${RED}端口无效！${PLAIN}"
+                   echo -e "  ${RED}端口无效！${PLAIN}"
                else
                    p=$((10#$p))
                    if is_ssh_port "$p"; then
-                       printf '%b警告：关闭 %s 可能导致当前 SSH 无法登录，确定？[y/N]: %b' "$RED" "$p" "$PLAIN"
-                       read -r yn
-                       [[ ! "$yn" =~ ^[Yy]$ ]] && { echo "已取消。"; pause; continue; }
+                       printf '  %b警告：关闭 %s 可能导致当前 SSH 无法登录，确定？[y/N]: %b' "$RED" "$p" "$PLAIN"
+                       read -r yn || continue
+                       [[ ! "$yn" =~ ^[Yy]$ ]] && { echo "  已取消。"; pause; continue; }
                    fi
                    ufw delete allow "$p"/tcp 2>/dev/null; ufw delete allow "$p"/udp 2>/dev/null
-                   echo -e "${GREEN}已删除 $p 的开放规则${PLAIN}"
-               fi ;;
+                   echo -e "  ${GREEN}已删除 $p 的开放规则${PLAIN}"
+               fi
+               pause ;;
             3) local sp allow_ok=1
                for sp in $detected_ssh; do
                    if ! ufw allow "${sp}/tcp" &>/dev/null; then
-                       echo -e "${RED}放行 SSH 端口 ${sp}/tcp 失败，已取消启用防火墙。${PLAIN}"
+                       echo -e "  ${RED}放行 SSH 端口 ${sp}/tcp 失败，已取消启用防火墙。${PLAIN}"
                        allow_ok=0
                        break
                    fi
                done
                if [ "$allow_ok" -eq 1 ]; then
-                   echo -e "${YELLOW}已自动保留 SSH 端口：${detected_ssh} (tcp)，防止锁死。${PLAIN}"
-                   yes | ufw enable && echo -e "${GREEN}防火墙已启用${PLAIN}"
-               fi ;;
-            4) ufw disable && echo -e "${YELLOW}防火墙已关闭${PLAIN}" ;;
-            5) ufw reload && echo -e "${GREEN}已重载${PLAIN}" ;;
+                   echo -e "  ${YELLOW}已自动保留 SSH 端口：${detected_ssh} (tcp)，防止锁死。${PLAIN}"
+                   yes | ufw enable && echo -e "  ${GREEN}防火墙已启用${PLAIN}"
+               fi
+               pause ;;
+            4) ufw disable && echo -e "  ${YELLOW}防火墙已关闭${PLAIN}"; pause ;;
+            5) ufw reload && echo -e "  ${GREEN}已重载${PLAIN}"; pause ;;
             0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
@@ -1904,7 +2031,7 @@ bbr_status_short() {
 }
 
 bbr_show_status() {
-    echo -e "${BLUE}=== 拥塞控制状态 ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 拥塞控制状态${PLAIN}"
     bbr_status_short
     echo -e "\n  判定依据 : 内核 $(uname -r) / tcp_bbr 模块 version=$(command -v modinfo >/dev/null 2>&1 && modinfo -F version tcp_bbr 2>/dev/null || echo 未知)"
     echo -e "  持久化   : ${BBR_CONF}"
@@ -2018,11 +2145,11 @@ bbr_post_install_check() {
 
 bbr_list_kernels() {
     if command -v dpkg-query >/dev/null 2>&1; then
-        echo -e "${BLUE}=== 已安装内核（dpkg）===${PLAIN}"
+        echo -e "\n  ${CYAN}▌ 已安装内核（dpkg）${PLAIN}"
         dpkg-query -W -f='${db:Status-Abbrev}|${Package}|${Version}\n' 'linux-image*' 2>/dev/null \
             | awk -F'|' '$1 ~ /^ii/ && $2 !~ /-common$/ {printf "  %s  %s\n", $2, $3}'
     elif command -v rpm >/dev/null 2>&1; then
-        echo -e "${BLUE}=== 已安装内核（rpm）===${PLAIN}"
+        echo -e "\n  ${CYAN}▌ 已安装内核（rpm）${PLAIN}"
         rpm -qa 2>/dev/null | grep -E '^kernel' | sort -V | sed 's/^/  /'
     else
         echo -e "${RED}未找到 dpkg / rpm，无法列出内核。${PLAIN}"; return
@@ -2246,11 +2373,10 @@ menu_tcp_buf() {
         menu_header "TCP 缓冲区调优" "只抬 socket 缓冲上限，不动 fq_codel 队列"
         tcp_buf_status
         rec=$(tcp_buf_recommend_mb)
-        echo -e "\n  ${BLUE}推荐依据${PLAIN}：BDP = 带宽(bit/s) × RTT(s) ÷ 8。本机参考 ~200Mbps/150ms"
-        echo -e "  → BDP≈3.75MB，含 2× 余量 ≈ 8MB 足够；跨区大带宽可到 16MB。"
+        echo -e "\n  ${DIM}参考：BDP = 带宽 × RTT ÷ 8，200Mbps/150ms 约 8MB；跨区大带宽可到 16MB。${PLAIN}"
         menu_section "设置上限"
         menu_option 1 "推荐值（${rec} MB，按内存兜底）"
-        menu_option 2 "8 MB（均衡，~200Mbps/150ms）"
+        menu_option 2 "8 MB（均衡）"
         menu_option 3 "16 MB（高带宽 / 高延迟）"
         menu_option 4 "32 MB（大内存 + 长肥管道）"
         menu_option 5 "自定义 MB"
@@ -2258,67 +2384,85 @@ menu_tcp_buf() {
         menu_section "恢复"
         menu_option 7 "恢复内核默认（删除本面板覆盖）"
         menu_back
-        read_menu_choice "请选择 [0-7]"; c="$REPLY"
+        read_menu_choice "请选择 [0-7]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) tcp_buf_apply "$rec" ;;
-            2) tcp_buf_apply 8 ;;
-            3) tcp_buf_apply 16 ;;
-            4) tcp_buf_apply 32 ;;
-            5) read -rp "  输入缓冲区上限 (MB, 1-512): " mb; tcp_buf_apply "$mb" ;;
-            6) tcp_buf_estimate ;;
-            7) tcp_buf_restore ;;
-            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            "") continue ;;
+            1) tcp_buf_apply "$rec"; pause ;;
+            2) tcp_buf_apply 8; pause ;;
+            3) tcp_buf_apply 16; pause ;;
+            4) tcp_buf_apply 32; pause ;;
+            5) read -rp "  输入缓冲区上限 (MB, 1-512, 回车取消): " mb || continue
+               [[ -n "$mb" ]] && { tcp_buf_apply "$mb"; pause; } ;;
+            6) tcp_buf_estimate; pause ;;
+            7) tcp_buf_restore; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
 menu_bbr() {
+    local c cc_now qd_now
     while true; do
-        menu_header "网络加速" "BBR / BBRv3 拥塞控制 + 内核 + TCP 缓冲区"
+        cc_now=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        qd_now=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        menu_header "网络加速" "BBR / BBRv3 拥塞控制 · 内核 · TCP 缓冲区" "${YELLOW}${cc_now:-?} + ${qd_now:-?}${PLAIN}（$(bbr_kernel_desc)）"
         bbr_status_short
-        menu_section "切换（立即生效 + 写入持久化）"
-        menu_option 1 "BBR + fq_codel（推荐；内核是 bbr3 就是 BBRv3）"
-        menu_option 2 "BBR + fq（先实测内核支不支持 fq，不支持就拒绝）"
-        menu_option 3 "CUBIC + fq_codel（恢复系统默认）"
-        menu_section "内核"
+        menu_section "拥塞控制切换（立即生效 + 持久化）"
+        menu_option 1 "BBR + fq_codel（推荐；bbr3 内核即 BBRv3）"
+        menu_option 2 "BBR + fq（实测支持 fq 才切换）"
+        menu_option 3 "CUBIC + fq_codel（恢复默认）"
+        menu_section "内核与缓冲区"
         menu_option 4 "安装 BBRv3 内核（${BBR3_REPO}，仅 deb 系）"
         menu_option 5 "查看已安装内核"
-        menu_section "TCP 调优"
-        menu_option 6 "TCP 缓冲区调优（按 BDP 推荐 / 预设 / 自定义）"
-        menu_section "查看"
+        menu_option 6 "TCP 缓冲区调优"
         menu_option 7 "完整状态与判定依据"
         menu_back
-        read_menu_choice "请选择 [0-7]"; c="$REPLY"
+        read_menu_choice "请选择 [0-7]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) bbr_set_bbr ;; 2) bbr_set_bbr_fq ;; 3) bbr_apply cubic fq_codel "CUBIC + fq_codel" ;;
-            4) bbr_install_kernel ;; 5) bbr_list_kernels ;; 6) menu_tcp_buf ;; 7) bbr_show_status ;;
-            0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            "") continue ;;
+            1) bbr_set_bbr; pause ;;
+            2) bbr_set_bbr_fq; pause ;;
+            3) bbr_apply cubic fq_codel "CUBIC + fq_codel"; pause ;;
+            4) bbr_install_kernel; pause ;;
+            5) bbr_list_kernels; pause ;;
+            6) menu_tcp_buf ;;
+            7) bbr_show_status; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 
 menu_tools() {
+    local c
     while true; do
-        menu_header "实用工具" "网络检测、加速、DNS 与防火墙"
-        menu_section "网络检测"
+        menu_header "网络检测与系统运维" "解锁检测、回程路由、DNS 与 Swap"
+        menu_section "网络与路由检测"
         menu_option 1 "流媒体解锁检测（快速）"
-        menu_option 2 "流媒体解锁检测（完整社区脚本）"
-        menu_section "系统网络"
-        menu_option 3 "DNS 设置"
-        menu_option 4 "防火墙设置（ufw）"
-        menu_option 5 "网络加速（BBR / BBRv3 + fq）"
-        menu_option 6 "Swap 管理（添加 / 删除）"
-        menu_section "路由测试"
-        menu_option 7 "回程路由测试（BestTrace / 三网及教育网）"
+        menu_option 2 "IP 质量与流媒体体检（xykt/IPQuality）"
+        menu_option 3 "回程路由测试（BestTrace / 三网及教育网）"
+        menu_section "系统运维"
+        menu_option 4 "DNS 设置（/etc/resolv.conf）"
+        menu_option 5 "Swap 虚拟内存管理"
+        menu_option 6 "防火墙管理（ufw）"
+        menu_option 7 "网络加速（BBR / BBRv3 + TCP 缓冲区）"
         menu_back
-        read_menu_choice "请选择 [0-7]"; c="$REPLY"
+        read_menu_choice "请选择 [0-7]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) media_check_quick; pause ;; 2) media_check_full; pause ;;
-            3) menu_dns ;; 4) menu_firewall ;; 5) menu_bbr ;; 6) menu_swap ;;
-            7) besttrace_check; pause ;; 0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            "") continue ;;
+            1) media_check_quick; pause ;;
+            2) media_check_full; pause ;;
+            3) besttrace_check; pause ;;
+            4) menu_dns ;;
+            5) menu_swap ;;
+            6) menu_firewall ;;
+            7) menu_bbr ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
     done
 }
@@ -2380,15 +2524,27 @@ swap_write_fstab() {
 }
 
 swap_status() {
-    printf '\n当前系统 Swap（包含系统/其他工具创建的 Swap）：\n'
-    cat "$SB_SWAP_PROC"
-    printf '\n内存概况（kB）：\n'
-    awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ {print}' "$SB_SWAP_MEMINFO"
-    if swap_owned; then
-        printf '\n本面板管理：%s（%s MiB）\n' "$SB_SWAP_FILE" "$(( $(stat -c %s "$SB_SWAP_FILE") / 1048576 ))"
-        if swap_active; then printf '状态：已启用\n'; else printf '状态：未启用\n'; fi
+    local mem_tot mem_avail sw_tot sw_free
+    mem_tot=$(awk '/^MemTotal:/{printf "%.0f MiB", $2/1024}' "$SB_SWAP_MEMINFO" 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{printf "%.0f MiB", $2/1024}' "$SB_SWAP_MEMINFO" 2>/dev/null)
+    sw_tot=$(awk '/^SwapTotal:/{printf "%.0f MiB", $2/1024}' "$SB_SWAP_MEMINFO" 2>/dev/null)
+    sw_free=$(awk '/^SwapFree:/{printf "%.0f MiB", $2/1024}' "$SB_SWAP_MEMINFO" 2>/dev/null)
+    printf '  %b内存概况%b  总计 %s · 可用 %s\n' "$DIM" "$PLAIN" "${mem_tot:-?}" "${mem_avail:-?}"
+    printf '  %bSwap概况%b  总计 %s · 空闲 %s\n' "$DIM" "$PLAIN" "${sw_tot:-?}" "${sw_free:-?}"
+    local swaps
+    swaps=$(awk 'NR > 1 {printf "    %s (%s, %.0f MiB, 已用 %.0f MiB)\n", $1, $2, $3/1024, $4/1024}' "$SB_SWAP_PROC" 2>/dev/null)
+    if [ -n "$swaps" ]; then
+        printf '  %b已启用项%b\n%s\n' "$DIM" "$PLAIN" "$swaps"
     else
-        printf '\n本面板尚未创建 Swap；不管理系统已有 Swap。\n'
+        printf '  %b已启用项%b  无\n' "$DIM" "$PLAIN"
+    fi
+    if swap_owned; then
+        local sz st
+        sz="$(( $(stat -c %s "$SB_SWAP_FILE") / 1048576 ))"
+        if swap_active; then st="${GREEN}已启用${PLAIN}"; else st="${YELLOW}未启用${PLAIN}"; fi
+        printf '  %b面板管理%b  %s（%s MiB · %b）\n' "$DIM" "$PLAIN" "$SB_SWAP_FILE" "$sz" "$st"
+    else
+        printf '  %b面板管理%b  %b尚未创建（不动系统已有 Swap）%b\n' "$DIM" "$PLAIN" "$YELLOW" "$PLAIN"
     fi
 }
 
@@ -2501,35 +2657,52 @@ menu_swap() {
     while true; do
         menu_header "Swap 管理" "只管理本面板创建的 Swap 文件"
         swap_status
+        menu_section "操作"
         menu_option 1 "添加 Swap（自定义 MiB）"
         menu_option 2 "删除本面板 Swap"
         menu_back
-        read_menu_choice "请选择 [0-2]" || return
+        read_menu_choice "请选择 [0-2]" || return 0
         c="$REPLY"
         case "$c" in
-            1) swap_create; pause ;; 2) swap_delete; pause ;; 0) return ;;
-            *) printf '无效选项！\n' ;;
+            "") continue ;;
+            1) swap_create; pause ;;
+            2) swap_delete; pause ;;
+            0) return ;;
+            *) menu_invalid ;;
         esac
     done
 }
 
 # ==================== 主菜单 ====================
 show_menu() {
-    menu_header "Sing-box 管理面板" "Reality / 转发 / WARP 分流  ·  ${SCRIPT_VERSION}" "$(get_singbox_status)"
-    menu_section "核心管理"
-    menu_option 1 "系统管理（安装、服务、日志、卸载）"
-    menu_option 2 "节点管理（VLESS / AnyTLS-Reality / SS2022）"
-    menu_option 3 "端口转发（TCP / UDP）"
-    menu_option 4 "WARP 出口与分流"
-    menu_section "配置与工具"
-    menu_option 5 "配置诊断（查看、编辑、回滚）"
-    menu_option 6 "实用工具（解锁检测、DNS、防火墙）"
-    printf '    %b 0)%b 退出脚本\n\n' "$YELLOW" "$PLAIN"
-    read_menu_choice "请选择 [0-6]"; choice="$REPLY"
+    local choice
+    menu_header "Sing-box 管理面板" "Reality / SS2022 / 转发 / WARP  ·  ${SCRIPT_VERSION}" "$(home_status_line)"
+    menu_section "代理与分流"
+    menu_option 1 "节点管理（链接 / 备注 / 增删）"
+    menu_option 2 "端口转发（TCP / UDP）"
+    menu_option 3 "WARP 出口与分流"
+    menu_section "核心与配置"
+    menu_option 4 "服务与核心（启停 / 更新 / 日志 / 卸载）"
+    menu_option 5 "配置管理（查看 / 编辑 / 回滚）"
+    menu_section "网络与系统"
+    menu_option 6 "网络加速（BBR / BBRv3 / TCP 缓冲区）"
+    menu_option 7 "防火墙管理（ufw）"
+    menu_option 8 "网络检测与系统运维（解锁 / 路由 / DNS / Swap）"
+    menu_exit
+    read_menu_choice "请选择 [0-8]" || exit 0
+    choice="$REPLY"
     case "$choice" in
-        1) menu_system ;; 2) menu_nodes ;; 3) menu_forward ;; 4) menu_warp ;;
-        5) diagnose_config ;; 6) menu_tools ;;
-        0) exit 0 ;; *) echo -e "${RED}无效选项！${PLAIN}"; sleep 1 ;;
+        "") return ;;
+        1) menu_nodes ;;
+        2) menu_forward ;;
+        3) menu_warp ;;
+        4) menu_system ;;
+        5) diagnose_config ;;
+        6) menu_bbr ;;
+        7) menu_firewall ;;
+        8) menu_tools ;;
+        0) exit 0 ;;
+        *) menu_invalid ;;
     esac
 }
 
@@ -2620,7 +2793,7 @@ add_warp() (
     printf '%bWARP 出口添加成功。%b\n' "$GREEN" "$PLAIN"
     printf '  出口标签 : %bwarp%b（wireguard endpoint）\n' "$BLUE" "$PLAIN"
     printf '  隧道地址 : %b%s%b\n' "$BLUE" "$addresses" "$PLAIN"
-    printf '%b使用方式：菜单选 4-7 添加分流规则，或手动把路由规则的 outbound 指向 "warp"。%b\n' "$YELLOW" "$PLAIN"
+    printf '%b提示：返回菜单即可开启 AI / 流媒体分流，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
 )
 
 add_warp_node_route() {
@@ -2650,8 +2823,8 @@ add_warp_route() {
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
         echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
     fi
-    read -rp "输入要走 WARP 的域名后缀（逗号分隔，如 openai.com,claude.ai）: " doms
-    [[ -z "$doms" ]] && { echo -e "${RED}未输入域名。${PLAIN}"; return; }
+    read -rp "  输入要走 WARP 的域名后缀（逗号分隔，如 openai.com,claude.ai，回车取消）: " doms || return 0
+    [[ -z "$doms" ]] && { echo -e "  ${YELLOW}已取消。${PLAIN}"; return 0; }
     local arr
     arr=$(printf '%s' "$doms" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -cs .)
     if [[ "$arr" == "[]" || -z "$arr" ]]; then
@@ -2753,9 +2926,9 @@ view_warp_rules() {
     fi
     local n
     n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-    echo -e "${CYAN}=== 指向 WARP 的分流规则（共 ${n:-0} 条）===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ 指向 WARP 的分流规则（共 ${n:-0} 条）${PLAIN}"
     if [ "${n:-0}" -eq 0 ]; then
-        echo -e "${YELLOW}暂无规则。可用菜单 4/5/6/7 添加。${PLAIN}"; return
+        echo -e "  ${YELLOW}暂无规则，可在分流菜单中开启规则集或添加自定义规则。${PLAIN}"; return
     fi
     jq -r '
       [.route.rules[]? | select((.outbound? // "") == "warp")]
@@ -2781,10 +2954,10 @@ delete_warp_rule() {
         echo -e "${YELLOW}暂无指向 warp 的分流规则。${PLAIN}"; return
     fi
     view_warp_rules
-    echo -e "--------------------------------------------------"
+    declare -F ui_subrule >/dev/null && ui_subrule
     local idx
-    read -rp "输入要删除的规则序号 (0 取消): " idx
-    [[ "$idx" == "0" ]] && return
+    read -rp "  输入要删除的规则序号 (0 或回车取消): " idx || return 0
+    [[ -z "$idx" || "$idx" == "0" ]] && return 0
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ]; then
         echo -e "${RED}无效序号！${PLAIN}"; return
     fi
@@ -2828,7 +3001,7 @@ view_warp() {
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
         echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
     fi
-    echo -e "${CYAN}=== WARP 出口 (wireguard endpoint) ===${PLAIN}"
+    echo -e "\n  ${CYAN}▌ WARP 出口 (wireguard endpoint)${PLAIN}"
     jq '.endpoints[] | select(.tag == "warp")' "$CONFIG_FILE"
     local rc
     rc=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
@@ -2837,36 +3010,55 @@ view_warp() {
 }
 
 menu_warp() {
+    local c yn
     while true; do
-        local warp_status
-        warp_status=$([ "$(has_warp_endpoint)" -gt 0 ] && echo -e "${GREEN}已配置${PLAIN}" || echo -e "${YELLOW}未配置${PLAIN}")
-        menu_header "WARP 出口" "Cloudflare WARP · 出口与分流规则" "$warp_status"
-        menu_section "出口"
-        menu_option 1 "添加 / 重置 WARP（免费自动注册）"
-        menu_option 2 "查看 WARP 出口信息"
-        menu_option 3 "删除 WARP 出口及相关规则"
+        local warp_has warp_status ai_state media_state rule_count
+        warp_has=$(has_warp_endpoint)
+        warp_status=$(warp_summary_short)
+        menu_header "WARP 出口与分流" "Cloudflare WARP · WireGuard Endpoint" "$warp_status"
         menu_section "分流规则"
-        local ai_state media_state
         ai_state=$(has_warp_ruleset "$WARP_AI_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
         media_state=$(has_warp_ruleset "$WARP_MEDIA_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
-        menu_option 4 "AI 分流开关 [${ai_state}]"
-        menu_option 5 "流媒体分流开关 [${media_state}]"
-        menu_option 6 "自定义域名走 WARP"
-        menu_option 7 "指定节点全部走 WARP"
-        local rule_count
         rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-        menu_option 8 "查看已添加的规则（${rule_count:-0} 条）"
-        menu_option 9 "删除指定规则"
+        menu_option 1 "AI 分流开关 [${ai_state}]"
+        menu_option 2 "流媒体分流开关 [${media_state}]"
+        menu_option 3 "添加自定义域名分流"
+        menu_option 4 "指定节点全部走 WARP"
+        menu_option 5 "查看分流规则（${rule_count:-0} 条）"
+        menu_option 6 "删除指定规则"
+        menu_section "出口管理"
+        if [ "$warp_has" -gt 0 ]; then
+            menu_option 7 "重新注册 / 重置 WARP 出口"
+        else
+            menu_option 7 "添加 WARP 出口（免费自动注册）"
+        fi
+        menu_option 8 "查看 WARP 出口详情"
+        menu_option 9 "删除 WARP 出口及全部关联规则"
         menu_back
-        read_menu_choice "请选择 [0-9]"; c="$REPLY"
+        read_menu_choice "请选择 [0-9]" || return 0
+        c="$REPLY"
         case "$c" in
-            1) add_warp ;; 2) view_warp ;; 3) delete_warp ;;
-            4) add_warp_ai ;; 5) add_warp_media ;; 6) add_warp_route ;;
-            7) add_warp_node_route ;; 8) view_warp_rules ;; 9) delete_warp_rule ;;
+            "") continue ;;
+            1) add_warp_ai; pause ;;
+            2) add_warp_media; pause ;;
+            3) add_warp_route; pause ;;
+            4) add_warp_node_route; pause ;;
+            5) view_warp_rules; pause ;;
+            6) delete_warp_rule; pause ;;
+            7) add_warp; pause ;;
+            8) view_warp; pause ;;
+            9) if [ "$(has_warp_endpoint)" -eq 0 ]; then
+                   echo -e "  ${YELLOW}当前没有 WARP 出口。${PLAIN}"; pause
+               else
+                   read -rp "  确认删除 WARP 出口及全部关联分流规则？[y/N]: " yn || continue
+                   if [[ "$yn" =~ ^[Yy]$ ]]; then
+                       delete_warp
+                       pause
+                   fi
+               fi ;;
             0) return ;;
-            *) echo -e "${RED}无效选项！${PLAIN}" ;;
+            *) menu_invalid ;;
         esac
-        pause
     done
 }
 

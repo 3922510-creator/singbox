@@ -196,7 +196,7 @@ menu_option() { printf '%s %s\n' "$1" "$2"; }
 menu_section() { :; }
 menu_back() { :; }
 read_menu_choice() { read -r REPLY; }
-menu_tools <<< $'6\n0\n0\n' > "$ROOT/menu"
+menu_tools <<< $'5\n0\n0\n' > "$ROOT/menu"
 grep -q 'Swap 管理' "$ROOT/menu"
 grep -q '添加 Swap' "$ROOT/menu"
 [ ! -s "$CALLS" ]

@@ -243,8 +243,10 @@ JSON
 add_warp_node_route <<< '2'
 jq -e '.route.rules | any(.inbound == ["anytls-reality-8444"] and .outbound == "warp")' "$CONFIG_FILE" >/dev/null
 
-# 2) delete_node 删除 vless 节点时同步清理它的路由规则
-delete_node <<< $'1\n1\n'
+# 2) delete_node 一次选择节点并确认后删除，同步清理它的路由规则
+delete_node <<< $'1\nn\n'
+jq -e '[.inbounds[] | select(.tag == "vless-reality-443")] | length == 1' "$CONFIG_FILE" >/dev/null
+delete_node <<< $'1\ny\n'
 jq -e '[.route.rules[] | select((.inbound? // []) | index("vless-reality-443"))] | length == 0' "$CONFIG_FILE" >/dev/null
 jq -e '.route.rules | any(.inbound == ["anytls-reality-8444"])' "$CONFIG_FILE" >/dev/null
 ''',
@@ -317,12 +319,17 @@ grep -Fxq 'nameserver 8.8.8.8' "$TEST_RESOLV"
             ["media_check_full"],
             r'''
 MARKER="$ROOT/ran"
+URL_LOG="$ROOT/url"
 curl() {
-    local out=""
+    local out="" url=""
     while (( $# )); do
-        if [[ "$1" == -o ]]; then out="$2"; shift; fi
+        case "$1" in
+            -o) out="$2"; shift ;;
+            https://*) url="$1" ;;
+        esac
         shift
     done
+    printf '%s' "$url" > "$URL_LOG"
     printf '%s' "$PAYLOAD" > "$out"
     return "${DL_RC:-0}"
 }
@@ -331,13 +338,16 @@ media_check_full <<< n
 DL_RC=22
 if media_check_full <<< y; then exit 1; fi
 [[ ! -e "$MARKER" ]]
+[[ "$(cat "$URL_LOG")" == "https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh" ]]
 DL_RC=0; PAYLOAD='if then'
 if media_check_full <<< y; then exit 1; fi
 [[ ! -e "$MARKER" ]]
 exec 200>"$ROOT/lock"
-PAYLOAD='[[ ! -e /proc/$$/fd/200 ]] || exit 91; touch "'"$MARKER"'"'
+ARGS_LOG="$ROOT/args"
+PAYLOAD='[[ ! -e /proc/$$/fd/200 ]] || exit 91; printf "%s" "$*" > "'"$ARGS_LOG"'"; touch "'"$MARKER"'"'
 media_check_full <<< y
 [[ -e "$MARKER" && -e /proc/$$/fd/200 ]]
+[[ "$(cat "$ARGS_LOG")" == "-M" ]]
 ''',
         )
 

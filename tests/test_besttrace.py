@@ -111,7 +111,7 @@ pause() { :; }
 # 面板本身没有 errexit；第三方失败不应退出菜单。
 set +e
 menu_tools <<'INPUT'
-7
+3
 0
 INPUT
 [[ "$REPLY" == 0 ]]

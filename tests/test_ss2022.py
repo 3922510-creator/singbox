@@ -61,7 +61,7 @@ cmp "$CONFIG_FILE" "$D/previous"
 [[ "$attempt" == 2 && ! -e "$D/unexpected-firewall" && $(node_display_name ss2022-8389) == ss2022-8389 ]]
 svc_restart() { :; }
 rename_node <<<$'1\nnew'; [[ $(node_display_name ss2022-8388) == new ]]
-delete_node <<<'1'; [[ $(ss2022_count) == 0 ]]
+delete_node <<< $'1\ny\n'; [[ $(ss2022_count) == 0 ]]
 ''', core=core)
 
     def test_uninstall_cancel_stop_failure_and_both_modes(self):
