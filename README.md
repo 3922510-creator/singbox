@@ -46,15 +46,18 @@ sudo bash singbox.sh
 > mihomo（Clash Meta）明确不支持 AnyTLS+Reality（服务端与客户端都不支持），Xray 不支持 AnyTLS。
 > 想要全平台可用的节点用 VLESS-Reality，要抗 TLS-in-TLS 长度特征时用 AnyTLS-Reality。
 
-### Cloudflare WARP 分流
+### WARP / SOCKS5 出口与分流
+
+主菜单 → `3` → `10` 添加或更新一个 SOCKS5 出口（地址、端口，可选用户名和密码）。
+配置出口不会自动开启分流，也不会改默认出口；两个出口都配置时，可逐条规则手动选择，不自动回落。
+进入 `3` 页面直接实测并显示 `S5` / `WARP` 的 IPv4、IPv6；IPv6 检测不到则不显示。同次菜单会话复用检测结果，配置变更或重新进入页面会重新检测。临时核心使用系统分配的本地端口，不改生产配置或重启服务。
 
 - 基于 sing-box 1.11+ `endpoint` 架构配置 WARP
 - 免费 WARP 账号自动注册与配置（直连 Cloudflare 官方 API，无需 Zero Trust 或第三方注册工具），默认接入 `162.159.192.8:2408/UDP`，不会自动开启分流
 - AI 分流开关（`SagerNet/sing-geosite` `geosite-category-ai-chat-!cn.srs`，默认每 24 小时自动更新）
 - 流媒体分流开关（`SagerNet/sing-geosite` `geosite-category-entertainment@!cn.srs`，默认每 24 小时自动更新）
-- 自定义域名、域名后缀、关键词和 IP 网段分流
-- 指定入站节点全部走 WARP
-- 查看和删除已添加的 WARP 规则
+- AI、流媒体、域名后缀、指定入站节点均可选择 WARP 或 SOCKS5；AI、流媒体再次选择当前出口即关闭该规则
+- 查看、删除两种出口的分流规则；删除出口仅清理指向该出口的分流规则
 
 ### 网络加速（BBR / BBRv3）
 

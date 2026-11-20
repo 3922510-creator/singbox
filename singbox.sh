@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.0  |  快捷指令: SB / sb
+#  版本: v3.8.1  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.0"
+SCRIPT_VERSION="v3.8.1"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -1654,7 +1654,7 @@ media_check_quick() {
     if [[ -n "$ttc" ]]; then tt="${GREEN}可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}未获取到地区${PLAIN}"; fi
     printf '  %-10s: %b\n' "TikTok" "$tt"
     ui_subrule
-    echo -e "  ${YELLOW}提示：此结果为服务器本机直连出口。若想让某服务走 WARP，可在「WARP 出口与分流」开启对应规则。${PLAIN}"
+    echo -e "  ${YELLOW}提示：此结果为服务器本机直连出口。可在「WARP / SOCKS5 出口与分流」为节点流量设置规则。${PLAIN}"
 }
 
 media_check_full() {
@@ -2680,7 +2680,7 @@ show_menu() {
     menu_section "代理与分流"
     menu_option 1 "节点管理（链接 / 备注 / 增删）"
     menu_option 2 "端口转发（TCP / UDP）"
-    menu_option 3 "WARP 出口与分流"
+    menu_option 3 "WARP / SOCKS5 出口与分流"
     menu_section "核心与配置"
     menu_option 4 "服务与核心（启停 / 更新 / 日志 / 卸载）"
     menu_option 5 "配置管理（查看 / 编辑 / 回滚）"
@@ -2796,34 +2796,96 @@ add_warp() (
     printf '%b提示：返回菜单即可开启 AI / 流媒体分流，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
 )
 
+has_socks5_outbound() {
+    jq -e 'any(.outbounds[]?; .tag == "socks5" and .type == "socks" and .version == "5")' \
+        "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# stdout 只返回出口标签，菜单提示走 stderr。
+choose_split_outbound() {
+    local warp=0 socks=0 choice
+    [ "$(has_warp_endpoint)" -gt 0 ] && warp=1
+    has_socks5_outbound && socks=1
+    case "$warp$socks" in
+        10) printf 'warp\n' ;;
+        01) printf 'socks5\n' ;;
+        11) read -rp '  选择出口 [1. WARP / 2. SOCKS5，回车取消]: ' choice || return 1
+            case "$choice" in
+                1) printf 'warp\n' ;;
+                2) printf 'socks5\n' ;;
+                '') return 1 ;;
+                *) menu_invalid >&2; return 1 ;;
+            esac ;;
+        *) printf '%b请先添加 WARP 或 SOCKS5 出口。%b\n' "$YELLOW" "$PLAIN" >&2; return 1 ;;
+    esac
+}
+
+add_socks5_outbound() {
+    ensure_config
+    local host port username password='' temp_json
+    if ! has_socks5_outbound && jq -e 'any((.outbounds[]?, .endpoints[]?); .tag == "socks5")' "$CONFIG_FILE" >/dev/null; then
+        printf '%b标签 socks5 已被其他出口占用，未修改配置。%b\n' "$RED" "$PLAIN"
+        return 1
+    fi
+    if has_socks5_outbound; then
+        printf '  当前 SOCKS5：'
+        jq -r '.outbounds[] | select(.tag == "socks5") | "\(.server) 端口 \(.server_port)"' "$CONFIG_FILE"
+        printf '  重新设置会保留关联分流规则。\n'
+    fi
+    read -rp '  SOCKS5 地址（域名 / IP，回车取消）: ' host || return 0
+    [ -n "$host" ] || return 0
+    host=${host#\[}; host=${host%\]}
+    read -rp '  SOCKS5 端口: ' port || return 0
+    if ! [[ "$host" =~ ^[A-Za-z0-9_.:-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] ||
+        (( 10#$port < 1 || 10#$port > 65535 )); then
+        printf '%b地址或端口无效。%b\n' "$RED" "$PLAIN"
+        return 1
+    fi
+    read -rp '  用户名（无需认证则留空）: ' username || return 0
+    if [ -n "$username" ]; then
+        read -rsp '  密码（不回显）: ' password || { printf '\n'; return 0; }
+        printf '\n'
+        [ -n "$password" ] || { printf '%b密码不能为空。%b\n' "$RED" "$PLAIN"; return 1; }
+    fi
+    temp_json=$(jq --arg host "$host" --argjson port "$((10#$port))" \
+        --rawfile username /dev/fd/3 --rawfile password /dev/fd/4 '
+        ({type:"socks", tag:"socks5", version:"5", server:$host, server_port:$port} +
+          (if $username == "" then {} else {username:$username, password:$password} end)) as $proxy |
+        if any(.outbounds[]?; .tag == "socks5") then
+            .outbounds |= map(if .tag == "socks5" then $proxy else . end)
+        else .outbounds = ((.outbounds // []) + [$proxy]) end
+    ' "$CONFIG_FILE" 3< <(printf '%s' "$username") 4< <(printf '%s' "$password")) || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf '%bSOCKS5 已保存；未自动开启分流或修改默认出口。%b\n' "$GREEN" "$PLAIN"
+    fi
+}
+
 add_warp_node_route() {
     ensure_config
-    if [ "$(has_warp_endpoint)" -eq 0 ]; then
-        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
-    fi
-
-    local real_idx selected temp_json
-    real_idx=$(prompt_delete_index "要全部走 WARP 的节点" node)
+    local real_idx selected outbound temp_json
+    outbound=$(choose_split_outbound) || return 0
+    real_idx=$(prompt_delete_index "要全部走 ${outbound^^} 的节点" node)
     [ -z "$real_idx" ] && return
     selected=$(inbound_field "$real_idx" "tag")
     [ -n "$selected" ] || return 1
 
-    temp_json=$(jq --arg tag "$selected" '
-        .route = (.route // {})
-        | .route.rules = ([{"inbound":[$tag],"outbound":"warp"}] +
-            [(.route.rules // [])[] | select((.inbound? // []) | (if type == "array" then index($tag) == null else . != $tag end))])
+    temp_json=$(jq --arg tag "$selected" --arg to "$outbound" '
+        .route.rules |= (
+          [(. // [])[] | select((.outbound != "warp" and .outbound != "socks5") or
+            ((.inbound != [$tag] and .inbound != $tag) or ((keys - ["inbound","outbound","action"]) | length > 0)))] |
+          ((map(.outbound != null) | index(true)) // length) as $i |
+          .[:$i] + [{inbound:[$tag],outbound:$to}] + .[$i:])
     ' "$CONFIG_FILE") || return 1
     if apply_config_and_restart "$temp_json"; then
-        echo -e "${GREEN}节点 [$(node_display_name "$selected")] 已设置为全部走 WARP。${PLAIN}"
+        echo -e "${GREEN}节点 [$(node_display_name "$selected")] 已设置为全部走 ${outbound^^}。${PLAIN}"
     fi
 }
 
 add_warp_route() {
     ensure_config
-    if [ "$(has_warp_endpoint)" -eq 0 ]; then
-        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
-    fi
-    read -rp "  输入要走 WARP 的域名后缀（逗号分隔，如 openai.com,claude.ai，回车取消）: " doms || return 0
+    local outbound doms
+    outbound=$(choose_split_outbound) || return 0
+    read -rp "  输入要走 ${outbound^^} 的域名后缀（逗号分隔，如 openai.com,claude.ai，回车取消）: " doms || return 0
     [[ -z "$doms" ]] && { echo -e "  ${YELLOW}已取消。${PLAIN}"; return 0; }
     local arr
     arr=$(printf '%s' "$doms" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -cs .)
@@ -2831,21 +2893,27 @@ add_warp_route() {
         echo -e "${RED}域名解析为空。${PLAIN}"; return
     fi
     local temp_json
-    temp_json=$(jq --argjson doms "$arr" '
-        .route = (.route // {})
-        | .route.rules = (.route.rules // [])
-        | .route.rules += [{"domain_suffix": $doms, "outbound": "warp"}]' "$CONFIG_FILE") || return 1
+    temp_json=$(jq --argjson doms "$arr" --arg to "$outbound" '
+        def same_domains: (.outbound == "warp" or .outbound == "socks5") and
+          ((keys - ["domain_suffix","outbound","action"]) | length == 0) and
+          (([.domain_suffix? | if type == "array" then .[] else strings end] | unique) == ($doms | unique));
+        .route.rules |= ((. // []) |
+          if any(.[]; same_domains) then map(if same_domains then .outbound = $to else . end)
+          else . + [{domain_suffix:$doms,outbound:$to}] end)' "$CONFIG_FILE") || return 1
     if apply_config_and_restart "$temp_json"; then
-        echo -e "${GREEN}已添加分流规则：$doms -> warp${PLAIN}"
+        echo -e "${GREEN}已设置分流规则：$doms -> ${outbound^^}${PLAIN}"
     fi
 }
 
+split_ruleset_outbound() {
+    jq -r --arg t "$1" '
+      first(.route.rules[]? | select((.outbound == "warp" or .outbound == "socks5") and
+        (.rule_set == $t or ((.rule_set | type) == "array" and (.rule_set | index($t)) != null))) | .outbound)
+    ' "$CONFIG_FILE" 2>/dev/null
+}
+
 has_warp_ruleset() {
-    local r_tag="$1"
-    [ -f "$CONFIG_FILE" ] || return 1
-    jq -e --arg t "$r_tag" '
-      .route.rules[]? | select(.outbound == "warp" and (.rule_set == $t or ((.rule_set? // []) | index($t) != null)))
-    ' "$CONFIG_FILE" >/dev/null 2>&1
+    [ "$(split_ruleset_outbound "$1")" = warp ]
 }
 
 # 开关式管理 WARP 远程规则集（与 sbx 一致）；参数：tag 名称 .srs文件名 [旧tag...]
@@ -2856,18 +2924,24 @@ toggle_warp_ruleset() {
     if [ "$#" -gt 0 ]; then
         legacy_json=$(printf '%s\n' "$@" | jq -R . | jq -cs .)
     fi
-    if [ "$(has_warp_endpoint)" -eq 0 ]; then
-        printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN"; return 1
-    fi
-
-    local temp_json
-    if has_warp_ruleset "$r_tag"; then
+    local temp_json outbound current
+    outbound=$(choose_split_outbound) || return 0
+    current=$(split_ruleset_outbound "$r_tag")
+    if [ -n "$current" ] && [ "$current" != "$outbound" ]; then
+        temp_json=$(jq --arg t "$r_tag" --arg from "$current" --arg to "$outbound" '
+          .route.rules |= map(if .outbound == $from and
+            (.rule_set == $t or ((.rule_set | type) == "array" and (.rule_set | index($t)) != null))
+            then .outbound = $to else . end)' "$CONFIG_FILE") || return 1
+        if apply_config_and_restart "$temp_json"; then
+            printf '%b%s 已切换 -> %s。%b\n' "$GREEN" "$r_name" "${outbound^^}" "$PLAIN"
+        fi
+    elif [ -n "$current" ]; then
         temp_json=$(jq --arg t "$r_tag" --argjson legacy "$legacy_json" '
           ($legacy + [$t]) as $drop |
           .route = (.route // {}) |
           .route.rule_set = [.route.rule_set[]? | select(.tag as $x | ($drop | index($x)) == null)] |
           .route.rules = [.route.rules[]? | select(
-            .outbound != "warp" or (
+            (.outbound != "warp" and .outbound != "socks5") or (
               .rule_set as $rs |
               (($rs | type) != "string" or ($drop | index($rs)) == null) and
               (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
@@ -2878,7 +2952,7 @@ toggle_warp_ruleset() {
             printf '%b%s 已关闭。%b\n' "$GREEN" "$r_name" "$PLAIN"
         fi
     else
-        temp_json=$(jq --arg t "$r_tag" --arg url "${GEOSITE_BASE}/${r_file}" --argjson legacy "$legacy_json" '
+        temp_json=$(jq --arg t "$r_tag" --arg to "$outbound" --arg url "${GEOSITE_BASE}/${r_file}" --argjson legacy "$legacy_json" '
           ($legacy + [$t]) as $drop |
           # sing-box 1.14+: 以 http_clients + default_http_client 代替已弃用的 download_detour
           .http_clients = ((.http_clients // []) + [{"tag":"rs-http"}] | group_by(.tag) | map(.[0])) |
@@ -2890,17 +2964,17 @@ toggle_warp_ruleset() {
           ) |
           .route.rules = (
             [.route.rules[]? | select(
-              .outbound != "warp" or (
+              (.outbound != "warp" and .outbound != "socks5") or (
                 .rule_set as $rs |
                 (($rs | type) != "string" or ($drop | index($rs)) == null) and
                 (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
               )
             )] +
-            [{"action": "route", "rule_set": $t, "outbound": "warp"}]
+            [{"action": "route", "rule_set": $t, "outbound": $to}]
           )
         ' "$CONFIG_FILE") || return 1
         if apply_config_and_restart "$temp_json"; then
-            printf '%b%s 已开启 -> warp（%s）。%b\n' "$GREEN" "$r_name" "$r_file" "$PLAIN"
+            printf '%b%s 已开启 -> %s（%s）。%b\n' "$GREEN" "$r_name" "${outbound^^}" "$r_file" "$PLAIN"
             printf '%b首次启动会自动下载规则集，默认每 24 小时自动更新。%b\n' "$YELLOW" "$PLAIN"
         fi
     fi
@@ -2919,19 +2993,20 @@ add_warp_media() {
         geosite-primevideo geosite-tiktok geosite-spotify geosite-hulu
 }
 
+count_split_rules() {
+    jq '[.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5")] | length' "$CONFIG_FILE" 2>/dev/null
+}
+
 view_warp_rules() {
     ensure_config
-    if [ "$(has_warp_endpoint)" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
-    fi
     local n
-    n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-    echo -e "\n  ${CYAN}▌ 指向 WARP 的分流规则（共 ${n:-0} 条）${PLAIN}"
+    n=$(count_split_rules)
+    echo -e "\n  ${CYAN}▌ WARP / SOCKS5 分流规则（共 ${n:-0} 条）${PLAIN}"
     if [ "${n:-0}" -eq 0 ]; then
         echo -e "  ${YELLOW}暂无规则，可在分流菜单中开启规则集或添加自定义规则。${PLAIN}"; return
     fi
     jq -r '
-      [.route.rules[]? | select((.outbound? // "") == "warp")]
+      [.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5")]
       | to_entries[]
       | .value as $r
       | ([
@@ -2942,28 +3017,28 @@ view_warp_rules() {
           (if ($r.domain_keyword? // null) != null then "关键词: "   + (($r.domain_keyword | if type == "array" then join(",") else tostring end)) else empty end),
           (if ($r.ip_cidr?       // null) != null then "IP: "       + (($r.ip_cidr       | if type == "array" then join(",") else tostring end)) else empty end)
         ] | map(select(. != "")) | join("  |  ")) as $detail
-      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量 -> warp" else $detail end)
+      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量" else $detail end) + " -> \($r.outbound | ascii_upcase)"
     ' "$CONFIG_FILE"
 }
 
 delete_warp_rule() {
     ensure_config
     local n
-    n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+    n=$(count_split_rules)
     if [ "${n:-0}" -eq 0 ]; then
-        echo -e "${YELLOW}暂无指向 warp 的分流规则。${PLAIN}"; return
+        echo -e "${YELLOW}暂无 WARP / SOCKS5 分流规则。${PLAIN}"; return
     fi
     view_warp_rules
     declare -F ui_subrule >/dev/null && ui_subrule
     local idx
     read -rp "  输入要删除的规则序号 (0 或回车取消): " idx || return 0
     [[ -z "$idx" || "$idx" == "0" ]] && return 0
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ]; then
+    if ! [[ "$idx" =~ ^[0-9]{1,9}$ ]] || (( 10#$idx < 1 || 10#$idx > n )); then
         echo -e "${RED}无效序号！${PLAIN}"; return
     fi
     local abs
-    abs=$(jq --argjson k "$((idx-1))" '
-      [.route.rules | to_entries[] | select((.value.outbound? // "") == "warp") | .key][$k]' "$CONFIG_FILE")
+    abs=$(jq --argjson k "$((10#$idx-1))" '
+      [.route.rules | to_entries[] | select(.value.outbound == "warp" or .value.outbound == "socks5") | .key][$k]' "$CONFIG_FILE") || return 1
     local temp_json
     temp_json=$(jq --argjson i "$abs" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
       .route.rules |= (.[:$i] + .[$i+1:]) |
@@ -2974,7 +3049,7 @@ delete_warp_rule() {
         )]
       else . end' "$CONFIG_FILE") || return 1
     if apply_config_and_restart "$temp_json"; then
-        echo -e "${GREEN}已删除第 $idx 条 warp 分流规则。${PLAIN}"
+        echo -e "${GREEN}已删除第 $idx 条分流规则。${PLAIN}"
     fi
 }
 
@@ -2984,16 +3059,88 @@ delete_warp() {
         echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
     fi
     local temp_json
-    temp_json=$(jq --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
-        .endpoints |= ((. // []) | map(select(.tag != "warp")))
-        | if .route then
-            .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")])
-            | .route.rule_set = ([(.route.rule_set // [])[] | select(.tag != $ai and .tag != $media)])
-          else . end' "$CONFIG_FILE") || return 1
+    temp_json=$(config_without_split_outbound warp) || return 1
     if apply_config_and_restart "$temp_json"; then
         rm -f "$WARP_META"
         printf '%bWARP 出口已删除（含指向 warp 的路由规则与规则集）。%b\n' "$GREEN" "$PLAIN"
     fi
+}
+
+config_without_split_outbound() {
+    jq --arg to "$1" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
+        if $to == "warp" then .endpoints |= map(select(.tag != $to))
+        else .outbounds |= map(select(.tag != $to)) end |
+        if .route.rules then .route.rules |= map(select(.outbound != $to)) else . end |
+        if .route.rule_set then
+          ([.route.rules[]?.rule_set? | if type == "array" then .[] else . end] | map(strings)) as $used |
+          .route.rule_set |= map(select(.tag as $x | ($x != $ai and $x != $media) or (($used | index($x)) != null)))
+        else . end' "$CONFIG_FILE"
+}
+
+delete_socks5_outbound() {
+    local temp_json
+    has_socks5_outbound || { printf '  尚未设置 SOCKS5 出口。\n'; return 1; }
+    temp_json=$(config_without_split_outbound socks5) || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf '%bSOCKS5 出口及其分流规则已删除。%b\n' "$GREEN" "$PLAIN"
+    fi
+}
+
+# 用独立临时核心测试指定出口；端口由系统分配，不改生产配置/路由。
+probe_split_outbound() (
+    local tag="$1" label="$2" work pid='' port='' ip family host i result=''
+    work=$(mktemp -d) || return 1
+    chmod 700 "$work"
+    trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }; rm -f -- "$work/config.json" "$work/core.log"; rmdir "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    umask 077
+    jq --arg tag "$tag" '
+      {log:{level:"info", timestamp:false},
+       dns:{servers:[{type:"local",tag:"probe-local"}]},
+       inbounds:[{type:"mixed",tag:"probe",listen:"127.0.0.1",listen_port:0}],
+       outbounds:[.outbounds[]? | select(.tag == $tag) | .domain_resolver = "probe-local"],
+       endpoints:[.endpoints[]? | select(.tag == $tag)],
+       route:{final:$tag,default_domain_resolver:"probe-local"}}
+    ' "$CONFIG_FILE" > "$work/config.json" || return 1
+    if ! "$BIN_FILE" check -c "$work/config.json" > "$work/core.log" 2>&1; then
+        return 1
+    fi
+    "$BIN_FILE" run -c "$work/config.json" > "$work/core.log" 2>&1 &
+    pid=$!
+    for ((i=0; i<30; i++)); do
+        port=$(sed -n 's/.*inbound\/mixed\[probe\]: tcp server started at 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$work/core.log" | head -1)
+        [ -z "$port" ] || break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$port" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    for family in 4 6; do
+        host="api${family}.ipify.org"
+        ip=$(curl --silent --fail --connect-timeout 5 --max-time 10 --noproxy '' \
+            --proxy "socks5h://127.0.0.1:$port" "https://$host" 2>/dev/null) || ip=''
+        if [[ "$family" == 4 && "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+            [[ "$family" == 6 && "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+            if [ "$family" == 4 ]; then
+                result="${result} IP: $ip"
+            else
+                result="${result} IPV6: $ip"
+            fi
+        fi
+    done
+    if [ -n "$result" ]; then printf '  %s%s\n' "$label" "$result"; fi
+)
+
+view_split_exit_ips() {
+    if has_socks5_outbound; then
+        probe_split_outbound socks5 S5 || :
+    fi
+    if [ "$(has_warp_endpoint)" -gt 0 ]; then
+        probe_split_outbound warp WARP || :
+    fi
+    return 0
 }
 
 view_warp() {
@@ -3010,20 +3157,31 @@ view_warp() {
 }
 
 menu_warp() {
-    local c yn
+    local c yn exit_ip_cache='' exit_ip_config='' current_config
     while true; do
-        local warp_has warp_status ai_state media_state rule_count
+        local warp_has warp_status ai_state media_state rule_count socks_status
         warp_has=$(has_warp_endpoint)
         warp_status=$(warp_summary_short)
-        menu_header "WARP 出口与分流" "Cloudflare WARP · WireGuard Endpoint" "$warp_status"
-        menu_section "分流规则"
-        ai_state=$(has_warp_ruleset "$WARP_AI_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
-        media_state=$(has_warp_ruleset "$WARP_MEDIA_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
-        rule_count=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
+        socks_status=未配置
+        has_socks5_outbound && socks_status=已配置
+        current_config=$(sha256sum "$CONFIG_FILE")
+        if [ "$current_config" != "$exit_ip_config" ]; then
+            exit_ip_cache=$(view_split_exit_ips)
+            exit_ip_config=$current_config
+        fi
+        local header_status="$warp_status / SOCKS5 $socks_status"
+        [ -z "$exit_ip_cache" ] || header_status+=$'\n'"$exit_ip_cache"
+        menu_header "WARP / SOCKS5 出口与分流" "" "$header_status"
+        menu_section "分流规则（再次选择当前出口可关闭规则集）"
+        ai_state=$(split_ruleset_outbound "$WARP_AI_RULE_TAG")
+        media_state=$(split_ruleset_outbound "$WARP_MEDIA_RULE_TAG")
+        ai_state=${ai_state^^}; ai_state=${ai_state:-关}
+        media_state=${media_state^^}; media_state=${media_state:-关}
+        rule_count=$(count_split_rules)
         menu_option 1 "AI 分流开关 [${ai_state}]"
         menu_option 2 "流媒体分流开关 [${media_state}]"
         menu_option 3 "添加自定义域名分流"
-        menu_option 4 "指定节点全部走 WARP"
+        menu_option 4 "指定节点的全部流量出口"
         menu_option 5 "查看分流规则（${rule_count:-0} 条）"
         menu_option 6 "删除指定规则"
         menu_section "出口管理"
@@ -3034,8 +3192,10 @@ menu_warp() {
         fi
         menu_option 8 "查看 WARP 出口详情"
         menu_option 9 "删除 WARP 出口及全部关联规则"
+        menu_option 10 "添加 / 更新 SOCKS5 出口"
+        menu_option 11 "删除 SOCKS5 出口及全部关联规则"
         menu_back
-        read_menu_choice "请选择 [0-9]" || return 0
+        read_menu_choice "请选择 [0-11]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -3056,6 +3216,13 @@ menu_warp() {
                        pause
                    fi
                fi ;;
+            10) add_socks5_outbound; pause ;;
+            11) if ! has_socks5_outbound; then
+                    printf '  尚未设置 SOCKS5 出口。\n'; pause
+                else
+                    read -rp '  确认删除 SOCKS5 出口及全部关联分流规则？[y/N]: ' yn || continue
+                    if [[ "$yn" =~ ^[Yy]$ ]]; then delete_socks5_outbound; pause; fi
+                fi ;;
             0) return ;;
             *) menu_invalid ;;
         esac

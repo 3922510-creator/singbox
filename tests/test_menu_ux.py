@@ -109,7 +109,8 @@ printf 'OK pause=%s\n' "$PAUSE_COUNT"
                 "menu_back", "read_menu_choice", "menu_invalid",
                 "inbound_count", "inbound_field", "count_by_type", "ss2022_count",
                 "nodes_summary_line", "menu_nodes",
-                "has_warp_endpoint", "has_warp_ruleset", "warp_summary_short", "menu_warp",
+                "has_warp_endpoint", "has_socks5_outbound", "split_ruleset_outbound",
+                "count_split_rules", "warp_summary_short", "menu_warp",
             ],
             r'''
 PAUSE_COUNT=0
@@ -117,16 +118,29 @@ pause() { PAUSE_COUNT=$((PAUSE_COUNT + 1)); }
 # 节点管理顶栏含摘要，日常操作在添加节点前；空回车不触发 pause
 menu_nodes <<< $'\n0\n'
 [[ "$PAUSE_COUNT" -eq 0 ]]
-# WARP 删除无出口时提示并 pause 一次；空回车不 pause；EOF 正常退出
-menu_warp <<< $'\n0\n'
-[[ "$PAUSE_COUNT" -eq 0 ]]
+# 出口 IP 自动显示；同次菜单无配置变更不重复检测。
+PROBE_COUNT_FILE="$ROOT/probe-count"
+view_split_exit_ips() { echo probe >> "$PROBE_COUNT_FILE"; printf 'S5 IPv4：203.0.113.4\n'; }
+# SOCKS5 菜单选项能调用对应操作；无出口时删除只提示。
+add_socks5_outbound() { printf 'SOCKS5-menu-dispatched\n'; }
+menu_warp <<< $'\n10\n11\n0\n'
+[[ "$PAUSE_COUNT" -eq 2 ]]
+[[ $(wc -l < "$PROBE_COUNT_FILE") -eq 1 ]]
 menu_warp < /dev/null
+[[ $(wc -l < "$PROBE_COUNT_FILE") -eq 2 ]]
 ''',
         )
         self.assertIn("共 1 个（VLESS 1 · AnyTLS 0 · SS2022 0）", out)
         self.assertLess(out.index("日常操作"), out.index("添加节点"))
         self.assertLess(out.index("分流规则"), out.index("出口管理"))
         self.assertIn("添加 WARP 出口（免费自动注册）", out)
+        self.assertIn("添加 / 更新 SOCKS5 出口", out)
+        self.assertIn("SOCKS5-menu-dispatched", out)
+        self.assertIn("S5 IPv4：203.0.113.4", out)
+        self.assertLess(out.index("S5 IPv4：203.0.113.4"), out.index("分流规则"))
+        self.assertNotIn("正在检测", out)
+        self.assertNotIn("12)", out)
+        self.assertIn("尚未设置 SOCKS5 出口", out)
 
     def test_narrow_terminal_no_overwide_fixed_dashes(self):
         source = SCRIPT.read_text(encoding="utf-8")

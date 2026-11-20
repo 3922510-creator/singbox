@@ -122,6 +122,15 @@ test ! -e "$WARP_META"
         funcs = extract_funcs(source, [
             'has_warp_endpoint',
             'has_warp_ruleset',
+            'has_socks5_outbound',
+            'choose_split_outbound',
+            'add_socks5_outbound',
+            'delete_socks5_outbound',
+            'add_warp_route',
+            'add_warp_node_route',
+            'split_ruleset_outbound',
+            'count_split_rules',
+            'config_without_split_outbound',
             'save_and_check_config',
             'apply_config_and_restart',
             'toggle_warp_ruleset',
@@ -193,7 +202,50 @@ delete_warp_rule <<< '2'
 "$BIN_FILE" check -c "$CONFIG_FILE"
 jq -e '.route.rule_set | map(.tag) == ["custom-keep"]' "$CONFIG_FILE" >/dev/null
 
+delete_warp_rule <<< '1'
+[[ $(count_split_rules) == 0 ]]
+
+# Adding SOCKS5 preserves default/other routes and supports password auth.
+cp "$CONFIG_FILE" "$D/before.json"
+if add_socks5_outbound <<< $'proxy.example\n65536'; then exit 1; fi
+cmp "$CONFIG_FILE" "$D/before.json"
+add_socks5_outbound <<< $'proxy.example\n01080\ndemo-user\npass word'
+"$BIN_FILE" check -c "$CONFIG_FILE"
+[[ $(stat -c %a "$CONFIG_FILE") == 600 ]]
+jq -e --slurpfile before "$D/before.json" '
+  .route == $before[0].route and .outbounds[-1] ==
+  {tag:"socks5",type:"socks",version:"5",server:"proxy.example",server_port:1080,username:"demo-user",password:"pass word"}' "$CONFIG_FILE" >/dev/null
+
+add_warp_ai <<< '2'
+add_warp_ai <<< '1'
+[[ $(split_ruleset_outbound geosite-ai) == warp ]]
+add_warp_ai <<< '2'
+[[ $(split_ruleset_outbound geosite-ai) == socks5 ]]
+add_warp_media <<< '1'
+add_warp_route <<< $'1\nshift.example'
+add_warp_route <<< $'2\nshift.example'
+jq -e '[.route.rules[] | select(.domain_suffix == ["shift.example"]) | .outbound] == ["socks5"]' "$CONFIG_FILE" >/dev/null
+
+# Relinking a node keeps preprocessing and existing unrelated routes.
+prompt_delete_index() { echo 0; }
+inbound_field() { echo node-test; }
+node_display_name() { echo "$1"; }
+add_warp_node_route <<< '1'
+add_warp_node_route <<< '2'
+jq -e '[.route.rules[] | select(.inbound == ["node-test"]) | .outbound] == ["socks5"]' "$CONFIG_FILE" >/dev/null
+
+add_socks5_outbound <<< $'[2001:db8::1]\n1081\n'
+jq -e '[.outbounds[] | select(.tag == "socks5")] ==
+  [{tag:"socks5",type:"socks",version:"5",server:"2001:db8::1",server_port:1081}]' "$CONFIG_FILE" >/dev/null
 delete_warp
+"$BIN_FILE" check -c "$CONFIG_FILE"
+[[ $(choose_split_outbound) == socks5 ]]
+[[ $(split_ruleset_outbound geosite-ai) == socks5 ]]
+[[ -z $(split_ruleset_outbound geosite-stream) ]]
+[[ $(count_split_rules) == 3 ]]
+delete_warp_rule <<< '02'
+[[ -z $(split_ruleset_outbound geosite-ai) ]]
+delete_socks5_outbound
 "$BIN_FILE" check -c "$CONFIG_FILE"
 jq -e '.route.rule_set | map(.tag) == ["custom-keep"]' "$CONFIG_FILE" >/dev/null
 jq -e '.route.rules | length == 0' "$CONFIG_FILE" >/dev/null

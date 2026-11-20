@@ -213,7 +213,7 @@ grep -q '端口无效' "$ROOT/err"
                 "ss2022_count", "node_display_name", "prompt_delete_index",
                 "remove_reality_meta", "save_node_name", "save_and_check_config",
                 "apply_config_and_restart", "delete_node", "has_warp_endpoint",
-                "add_warp_node_route",
+                "has_socks5_outbound", "choose_split_outbound", "add_warp_node_route",
             ],
             r'''
 cat > "$BIN_FILE" <<'BIN'
