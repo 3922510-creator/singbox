@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.7.0  |  快捷指令: SB / sb
+#  版本: v3.7.2  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
-#    • VLESS-Reality / AnyTLS-Reality 节点管理（二维码 / 分享链接）
+#    • VLESS-Reality / AnyTLS-Reality / SS2022 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
-#    • 实用小工具（流媒体解锁检测 / DNS / 防火墙）
+#    • 实用小工具（流媒体解锁检测 / 回程路由 / DNS / 防火墙 / Swap）
 #    • 网络加速（BBR / BBRv3 拥塞控制切换 + BBRv3 内核安装）
 #    • 配置校验 + 自动回滚 + 并发锁
 #  备份策略: 仅当“校验通过”才刷新唯一备份(.bak)，失败备份不动
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.7.1"
+SCRIPT_VERSION="v3.7.2"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -189,7 +189,7 @@ svc_active_name() {
 }
 
 # ---------- 通用交互 ----------
-pause() { echo ""; read -rp "  ⏎ 按回车键继续..." _; }
+pause() { echo ""; read -rp "  按回车键继续..." _; }
 
 # ====================================================================
 #  UI 渲染层（v3.7 新皮肤）
@@ -355,17 +355,18 @@ save_and_check_config() {
     local test_file
     # 在同一目录准备候选配置，校验后用 rename 原子替换。
     test_file=$(mktemp "${CONFIG_FILE%/*}/.sb-config.XXXXXX") || return 1
+    chmod 600 "$test_file" 2>/dev/null || true
     if ! printf '%s\n' "$new_json" > "$test_file"; then
         rm -f "$test_file"
         return 1
     fi
 
-    echo -e "${BLUE}⏳ 正在校验配置...${PLAIN}"
+    echo -e "${BLUE}正在校验配置...${PLAIN}"
     if ! "$BIN_FILE" check -c "$test_file" &>/dev/null; then
-        echo -e "${RED}❌ 配置校验失败，以下为错误详情：${PLAIN}"
+        echo -e "${RED}配置校验失败，以下为错误详情：${PLAIN}"
         "$BIN_FILE" check -c "$test_file"
         rm -f "$test_file"
-        echo -e "${YELLOW}💡 已放弃更改：原配置与备份均保持不变。${PLAIN}"
+        echo -e "${YELLOW}已放弃更改：原配置与备份均保持不变。${PLAIN}"
         return 1
     fi
 
@@ -384,6 +385,35 @@ save_and_check_config() {
     return 0
 }
 
+apply_config_and_restart() {
+    local new_json="$1" was_active=0 restore_file
+    if svc_active; then was_active=1; fi
+    save_and_check_config "$new_json" || return 1
+    if svc_restart && sleep 1 && svc_active; then
+        return 0
+    fi
+    printf '%b服务重启未生效，正在恢复上一份配置。%b\n' "$RED" "$PLAIN" >&2
+    if [ -f "${CONFIG_FILE}.bak" ] && jq empty "${CONFIG_FILE}.bak" 2>/dev/null; then
+        restore_file=$(mktemp "${CONFIG_FILE%/*}/.sb-restore.XXXXXX") || return 1
+        if ! install -m 600 "${CONFIG_FILE}.bak" "$restore_file" || ! mv -f -- "$restore_file" "$CONFIG_FILE"; then
+            rm -f -- "$restore_file"
+            printf '自动恢复失败；备份仍在 %s.bak。\n' "$CONFIG_FILE" >&2
+            return 1
+        fi
+    else
+        printf '未找到有效备份，无法自动恢复配置。\n' >&2
+        return 1
+    fi
+    if (( was_active )); then
+        if ! { svc_restart && sleep 1 && svc_active; }; then
+            printf '配置已恢复，但服务未能恢复运行，请查看日志。\n' >&2
+        fi
+    elif svc_active; then
+        svc_stop || printf '配置已恢复，但未能恢复原来的停止状态。\n' >&2
+    fi
+    return 1
+}
+
 rollback_config() {
     if [ ! -f "${CONFIG_FILE}.bak" ]; then
         echo -e "${RED}未找到备份文件，无法回滚。${PLAIN}"
@@ -393,27 +423,72 @@ rollback_config() {
         echo -e "${RED}备份文件语法异常，拒绝回滚。${PLAIN}"
         return 1
     fi
-    install -m 600 "${CONFIG_FILE}.bak" "$CONFIG_FILE"
-    svc_restart
-    echo -e "${GREEN}✅ 已回滚到上一次有效配置并重启服务。${PLAIN}"
+    install -m 600 "${CONFIG_FILE}.bak" "$CONFIG_FILE" || return 1
+    if svc_restart && sleep 1 && svc_active; then
+        echo -e "${GREEN}已回滚到上一次有效配置并重启服务。${PLAIN}"
+    else
+        echo -e "${RED}已回滚配置，但服务重启失败，请查看日志：${PLAIN}"
+        svc_logs 20
+        return 1
+    fi
 }
 
 # ==================== 辅助工具函数 ====================
 validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 port_in_use() {
-    [ -f "$CONFIG_FILE" ] || return 1
-    local n
-    n=$(jq --argjson p "$1" '[.inbounds[] | select(.listen_port == $p)] | length' "$CONFIG_FILE" 2>/dev/null)
-    [ "${n:-0}" -gt 0 ]
+    local p="$1" n
+    if [ -f "$CONFIG_FILE" ]; then
+        n=$(jq --argjson p "$p" '[.inbounds[]? | select(.listen_port == $p)] | length' "$CONFIG_FILE" 2>/dev/null)
+        [ "${n:-0}" -gt 0 ] && return 0
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        ss -tuln 2>/dev/null | awk -v p="$p" 'NR > 1 && $5 ~ ("(^|:|\\])" p "$") {found=1; exit} END {exit !found}' && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln 2>/dev/null | awk -v p="$p" 'NR > 2 && $4 ~ ("(^|:|\\])" p "$") {found=1; exit} END {exit !found}' && return 0
+    fi
+    return 1
+}
+
+is_valid_ip() {
+    local ip="$1" o seg
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS=.
+        read -r -a o <<< "$ip"
+        for seg in "${o[@]}"; do
+            (( 10#$seg >= 0 && 10#$seg <= 255 )) || return 1
+        done
+        return 0
+    fi
+    if [[ "$ip" == *:*:* && "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" != *:::* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+format_url_host() {
+    local host="$1"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
+    fi
 }
 
 get_public_ip() {
-    local ip
-    ip=$(curl -s -4 --max-time 5 https://api.ipify.org \
-      || curl -s -4 --max-time 5 https://ipv4.icanhazip.com \
-      || curl -s -6 --max-time 5 https://api64.ipify.org)
-    echo "${ip:-127.0.0.1}"
+    local ip="" candidate url
+    for url in "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://api64.ipify.org"; do
+        if [[ "$url" == *api64* ]]; then
+            candidate=$(curl -fsS -6 --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        else
+            candidate=$(curl -fsS -4 --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        fi
+        if is_valid_ip "$candidate"; then
+            ip="$candidate"
+            break
+        fi
+    done
+    printf '%s\n' "${ip:-127.0.0.1}"
 }
 
 open_firewall_port() {
@@ -429,18 +504,18 @@ open_firewall_port() {
         # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
         iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
         iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT || return 1
-        echo -e "${YELLOW}💡 已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
+        echo -e "${YELLOW}已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
     fi
 }
 
 get_singbox_status() {
-    if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}🔴 未安装${PLAIN}"; return; fi
+    if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}未安装${PLAIN}"; return; fi
     local ver
     ver=$($BIN_FILE version 2>/dev/null | head -n1 | awk '{print $3}')
     if svc_active; then
-        echo -e "${GREEN}🟢 运行中 [v${ver}]${PLAIN}"
+        echo -e "${GREEN}运行中 [v${ver}]${PLAIN}"
     else
-        echo -e "${YELLOW}🟡 已停止 [v${ver}]${PLAIN}"
+        echo -e "${YELLOW}已停止 [v${ver}]${PLAIN}"
     fi
 }
 
@@ -448,13 +523,13 @@ get_singbox_status() {
 # 所以不能只看 rc-service 的返回码，必须回头确认真实运行状态。
 start_service() {
     if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}尚未安装 Sing-box！${PLAIN}"; return 1; fi
-    echo -e "${BLUE}⏳ 正在启动 sing-box...${PLAIN}"
+    echo -e "${BLUE}正在启动 sing-box...${PLAIN}"
     svc_start
     sleep 2
     if svc_active; then
-        echo -e "${GREEN}✅ 启动成功！当前状态: $(get_singbox_status)${PLAIN}"
+        echo -e "${GREEN}启动成功！当前状态: $(get_singbox_status)${PLAIN}"
     else
-        echo -e "${RED}❌ 启动失败：服务仍未运行，请按下面的日志定位（末尾 20 行）：${PLAIN}"
+        echo -e "${RED}启动失败：服务仍未运行，请按下面的日志定位（末尾 20 行）：${PLAIN}"
         svc_logs 20
         return 1
     fi
@@ -462,27 +537,33 @@ start_service() {
 
 restart_service() {
     if [ ! -f "$BIN_FILE" ]; then echo -e "${RED}尚未安装 Sing-box！${PLAIN}"; return 1; fi
-    echo -e "${BLUE}⏳ 正在重启 sing-box...${PLAIN}"
+    echo -e "${BLUE}正在重启 sing-box...${PLAIN}"
     svc_restart
     sleep 1
     if svc_active; then
-        echo -e "${GREEN}✅ 重启成功！当前状态: $(get_singbox_status)${PLAIN}"
+        echo -e "${GREEN}重启成功！当前状态: $(get_singbox_status)${PLAIN}"
     else
-        echo -e "${RED}❌ 重启失败！请查看日志排查：${PLAIN}"
+        echo -e "${RED}重启失败！请查看日志排查：${PLAIN}"
         svc_logs 20
+        return 1
     fi
 }
 
 read_valid_port() {
     local prompt="$1" default="$2" check_dup="${3:-1}" p
     while true; do
-        read -rp "$prompt" p
+        read -rp "$prompt" p || return 1
         p=${p:-$default}
-        if ! validate_port "$p"; then echo -e "${RED}端口无效！${PLAIN}"; continue; fi
-        if [ "$check_dup" == "1" ] && port_in_use "$p"; then
-            echo -e "${RED}端口 $p 已被占用！${PLAIN}"; continue
+        if ! [[ "$p" =~ ^[0-9]{1,5}$ ]] || ! validate_port "$((10#$p))"; then
+            echo -e "${RED}端口无效！${PLAIN}" >&2
+            continue
         fi
-        echo "$p"; return
+        p=$((10#$p))
+        if [ "$check_dup" == "1" ] && port_in_use "$p"; then
+            echo -e "${RED}端口 $p 已被占用！${PLAIN}" >&2
+            continue
+        fi
+        echo "$p"; return 0
     done
 }
 
@@ -559,7 +640,7 @@ rename_node() {
     printf '当前备注: %s\n内部标识: %s\n' "$(node_display_name "$tag")" "$tag"
     name=$(read_node_name) || return 1
     if save_node_name "$tag" "$name"; then
-        printf '✅ 备注已更新为：%s（无需重启；已导入客户端的旧名称不会自动更新）\n' "$(node_display_name "$tag")"
+        printf '备注已更新为：%s（无需重启；已导入客户端的旧名称不会自动更新）\n' "$(node_display_name "$tag")"
     else
         return 1
     fi
@@ -622,37 +703,83 @@ prompt_delete_index() {
 # ==================== 系统管理 ====================
 install_singbox() {
     echo -e "${BLUE}正在获取最新版 Sing-box...${PLAIN}"
-    local tag
-    tag=$(curl -s --max-time 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-    [[ -z "$tag" ]] && tag="v1.8.8"
+    local tag arch url tmp new_bin old_bin="" bin_dir stage_bin
+    tag=$(curl -fsSL --connect-timeout 10 --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        | jq -r '.tag_name // empty' 2>/dev/null)
+    if [[ -z "$tag" || ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        echo -e "${RED}获取最新版本失败（GitHub API 限流或网络异常），已取消安装/更新。${PLAIN}"
+        return 1
+    fi
 
-    local arch="amd64"
-    [[ "$(uname -m)" == "aarch64" ]] && arch="arm64"
-    local url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${tag#v}-linux-${arch}.tar.gz"
+    case "$(uname -m)" in
+        x86_64|amd64)   arch="amd64" ;;
+        aarch64|arm64)  arch="arm64" ;;
+        armv7l)         arch="armv7" ;;
+        *) echo -e "${RED}不支持的架构：$(uname -m)${PLAIN}"; return 1 ;;
+    esac
+
+    url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${tag#v}-linux-${arch}.tar.gz"
     echo -e "${BLUE}下载: ${url}${PLAIN}"
 
-    curl -L --max-time 300 -o /tmp/sing-box.tar.gz "$url" || { echo -e "${RED}❌ 下载失败${PLAIN}"; return 1; }
-    tar -xzf /tmp/sing-box.tar.gz -C /tmp/ || { echo -e "${RED}解压失败${PLAIN}"; return 1; }
+    tmp=$(mktemp -d /tmp/sb-install-XXXXXX) || return 1
+    if ! curl -fSL --connect-timeout 15 --max-time 300 -o "$tmp/sing-box.tar.gz" "$url"; then
+        rm -rf -- "$tmp"
+        echo -e "${RED}下载失败，原核心未改动。${PLAIN}"
+        return 1
+    fi
+    if ! tar -xzf "$tmp/sing-box.tar.gz" -C "$tmp"; then
+        rm -rf -- "$tmp"
+        echo -e "${RED}解压失败，原核心未改动。${PLAIN}"
+        return 1
+    fi
 
-    mkdir -p /etc/sing-box
-    mv "/tmp/sing-box-${tag#v}-linux-${arch}/sing-box" "$BIN_FILE"
-    chmod +x "$BIN_FILE"
-    rm -rf /tmp/sing-box*
+    new_bin="$tmp/sing-box-${tag#v}-linux-${arch}/sing-box"
+    if [ ! -f "$new_bin" ]; then
+        rm -rf -- "$tmp"
+        echo -e "${RED}压缩包内未找到 sing-box 二进制，原核心未改动。${PLAIN}"
+        return 1
+    fi
+    chmod +x "$new_bin"
 
     # 官方发布的 linux 二进制是 glibc 构建（interpreter /lib64/ld-linux-x86-64.so.2），
-    # Alpine 是 musl：不装兼容层直接跑会报 “not found”。这里实测一下，不行就补 gcompat。
-    if ! "$BIN_FILE" version >/dev/null 2>&1; then
+    # Alpine 是 musl：不装兼容层直接跑会报 “not found”。这里先在临时目录实测，不行就补 gcompat。
+    if ! "$new_bin" version >/dev/null 2>&1; then
         if [ "$OS_FAMILY" = "alpine" ]; then
-            echo -e "${YELLOW}⚠ 官方二进制是 glibc 构建，Alpine（musl）需要 gcompat 兼容层，正在安装...${PLAIN}"
+            echo -e "${YELLOW}官方二进制是 glibc 构建，Alpine（musl）需要 gcompat 兼容层，正在安装...${PLAIN}"
             apk add --no-cache gcompat libc6-compat
         fi
     fi
-    if ! "$BIN_FILE" version >/dev/null 2>&1; then
-        echo -e "${RED}❌ 二进制无法在当前系统上运行：${BIN_FILE}${PLAIN}"
-        "$BIN_FILE" version 2>&1 | head -3
+    if ! "$new_bin" version >/dev/null 2>&1; then
+        echo -e "${RED}新二进制无法在当前系统上运行，原核心未改动。${PLAIN}"
+        "$new_bin" version 2>&1 | head -3
         if [ "$OS_FAMILY" = "alpine" ]; then
-            echo -e "${YELLOW}   Alpine 两条路：① apk add gcompat libc6-compat；② 用发行版自带包 apk add sing-box（musl 原生，版本略旧）${PLAIN}"
+            echo -e "${YELLOW}   Alpine 两条路：1) apk add gcompat libc6-compat；2) 用发行版自带包 apk add sing-box（musl 原生，版本略旧）${PLAIN}"
         fi
+        rm -rf -- "$tmp"
+        return 1
+    fi
+
+    # 若已有配置，先用新二进制校验兼容性，避免升级后配置直接不兼容挂掉
+    if [ -f "$CONFIG_FILE" ] && jq empty "$CONFIG_FILE" 2>/dev/null; then
+        if ! "$new_bin" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo -e "${RED}当前配置与新版本 ${tag} 不兼容，已取消更新（原核心未改动）：${PLAIN}"
+            "$new_bin" check -c "$CONFIG_FILE"
+            rm -rf -- "$tmp"
+            return 1
+        fi
+    fi
+
+    mkdir -p /etc/sing-box
+    bin_dir="${BIN_FILE%/*}"
+    if [ -f "$BIN_FILE" ]; then
+        old_bin="$tmp/sing-box.old"
+        cp -p -- "$BIN_FILE" "$old_bin" || { rm -rf -- "$tmp"; return 1; }
+    fi
+    stage_bin=$(mktemp "${bin_dir}/.sing-box.new.XXXXXX") || { rm -rf -- "$tmp"; return 1; }
+    if ! install -m 755 "$new_bin" "$stage_bin" || ! mv -f -- "$stage_bin" "$BIN_FILE"; then
+        rm -f -- "$stage_bin"
+        rm -rf -- "$tmp"
+        echo -e "${RED}安装二进制失败。${PLAIN}"
         return 1
     fi
 
@@ -660,8 +787,26 @@ install_singbox() {
         install_service_file
     fi
     ensure_config
-    svc_restart
-    echo -e "${GREEN}✅ 安装/更新成功！版本: ${tag}${PLAIN}"
+    if svc_restart && sleep 1 && svc_active; then
+        rm -rf -- "$tmp"
+        echo -e "${GREEN}安装/更新成功！版本: ${tag}${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}新版本 ${tag} 启动失败！${PLAIN}"
+    if [ -n "$old_bin" ] && [ -f "$old_bin" ]; then
+        echo -e "${YELLOW}正在回滚到上一版核心...${PLAIN}"
+        if install -m 755 "$old_bin" "$BIN_FILE" && svc_restart && sleep 1 && svc_active; then
+            echo -e "${YELLOW}已回滚到上一版核心并恢复运行。${PLAIN}"
+        else
+            echo -e "${RED}回滚后服务仍未运行，请查看日志排查：${PLAIN}"
+            svc_logs 20
+        fi
+    else
+        svc_logs 20
+    fi
+    rm -rf -- "$tmp"
+    return 1
 }
 
 # 按 init 系统写服务定义：systemd → unit 文件；OpenRC → /etc/init.d + rc-update；
@@ -724,7 +869,7 @@ EOF
             echo -e "${GREEN}已生成 OpenRC 服务：${OPENRC_FILE}（开机自启已加入 default runlevel；崩溃自动拉起）${PLAIN}"
             ;;
         *)
-            echo -e "${YELLOW}⚠ 未检测到 systemd / OpenRC：sing-box 将由 nohup 直接托管（重启后需手动拉起）。${PLAIN}"
+            echo -e "${YELLOW}未检测到 systemd / OpenRC：sing-box 将由 nohup 直接托管（重启后需手动拉起）。${PLAIN}"
             echo -e "   手动启动：nohup $BIN_FILE run -C /etc/sing-box >> $SINGBOX_LOG 2>&1 &"
             ;;
     esac
@@ -740,7 +885,7 @@ ensure_service_def_fresh() {
     local bak; bak="${OPENRC_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
     cp -a "$OPENRC_FILE" "$bak" 2>/dev/null
     install_service_file >/dev/null 2>&1
-    echo -e "${YELLOW}ℹ 已更新 OpenRC 服务定义（旧版缺陷：进程崩溃后不自愈、启动可能假成功）${PLAIN}"
+    echo -e "${YELLOW}已更新 OpenRC 服务定义（旧版缺陷：进程崩溃后不自愈、启动可能假成功）${PLAIN}"
     echo -e "  备份：${bak}；重启一次服务后新定义生效（面板「重启服务」或 rc-service sing-box restart）"
 }
 
@@ -793,23 +938,27 @@ view_logs() {
 
 # ==================== 节点操作 ====================
 add_reality_node() {
-    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
+    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
     ensure_config
 
     echo -e "${CYAN}=== 添加 VLESS-Reality 节点 ===${PLAIN}"
     local port
-    port=$(read_valid_port "监听端口 [默认 443]: " 443 1)
+    port=$(read_valid_port "监听端口 [默认 443]: " 443 1) || return 1
 
-    read -rp "伪装域名 SNI [默认 yahoo.com]: " sni
+    read -rp "伪装域名 SNI [默认 yahoo.com]: " sni || return 1
     sni=${sni:-yahoo.com}
 
-    echo -e "${BLUE}⏳ 生成密钥对...${PLAIN}"
+    echo -e "${BLUE}正在生成密钥对...${PLAIN}"
     local key_output private_key public_key uuid short_id
-    key_output=$("$BIN_FILE" generate reality-keypair)
+    key_output=$("$BIN_FILE" generate reality-keypair 2>/dev/null) || { echo -e "${RED}生成 Reality 密钥对失败！${PLAIN}" >&2; return 1; }
     private_key=$(echo "$key_output" | grep "PrivateKey" | awk '{print $2}' | tr -d '"')
     public_key=$(echo  "$key_output" | grep "PublicKey"  | awk '{print $2}' | tr -d '"')
-    uuid=$("$BIN_FILE" generate uuid)
-    short_id=$("$BIN_FILE" generate rand 8 --hex)
+    uuid=$("$BIN_FILE" generate uuid 2>/dev/null)
+    short_id=$("$BIN_FILE" generate rand 8 --hex 2>/dev/null)
+    if [[ -z "$private_key" || -z "$public_key" || -z "$uuid" || -z "$short_id" ]]; then
+        echo -e "${RED}生成节点密钥或参数失败！${PLAIN}" >&2
+        return 1
+    fi
 
     local tag="vless-reality-$port" name
     name=$(read_node_name) || return 1
@@ -826,18 +975,19 @@ add_reality_node() {
                                "handshake": {"server": $sni, "server_port": 443}
                            }
                        }
-                   }]' "$CONFIG_FILE")
+                   }]' "$CONFIG_FILE") || return 1
 
-    if save_and_check_config "$temp_json"; then
+    if apply_config_and_restart "$temp_json"; then
         save_reality_meta "$tag" "$public_key"
-        open_firewall_port "$port"
-        svc_restart
-        local ip; ip=$(get_public_ip)
         save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
-        local link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(node_link_fragment "$tag")"
+        open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+        local ip host
+        ip=$(get_public_ip)
+        host=$(format_url_host "$ip")
+        local link="vless://$uuid@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
         echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
+        echo -e "${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "服务器 IP  : ${BLUE}$ip${PLAIN}"
         echo -e "端口       : ${BLUE}$port${PLAIN}"
@@ -855,33 +1005,39 @@ add_reality_node() {
                 qrencode -t ANSIUTF8 "$link"
             fi
         fi
+    else
+        return 1
     fi
 }
 
 add_anytls_node() {
-    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
+    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
     ensure_config
     if ! singbox_version_ge 1.12.0; then
-        echo -e "${RED}❌ 当前核心不支持 AnyTLS（需要 sing-box ≥ 1.12.0）。${PLAIN}"
-        echo -e "${YELLOW}请先到「系统管理 → 安装 / 更新 Sing-box 核心」升级再来。${PLAIN}"
-        return
+        echo -e "${RED}当前核心不支持 AnyTLS（需要 sing-box >= 1.12.0）。${PLAIN}"
+        echo -e "${YELLOW}请先到「系统管理 -> 安装 / 更新 Sing-box 核心」升级再来。${PLAIN}"
+        return 1
     fi
 
     echo -e "${CYAN}=== 添加 AnyTLS-Reality 节点 ===${PLAIN}"
     local port
-    port=$(read_valid_port "监听端口 [默认 8444]: " 8444 1)
+    port=$(read_valid_port "监听端口 [默认 8444]: " 8444 1) || return 1
 
-    read -rp "伪装域名 SNI [默认 yahoo.com]: " sni
+    read -rp "伪装域名 SNI [默认 yahoo.com]: " sni || return 1
     sni=${sni:-yahoo.com}
 
-    echo -e "${BLUE}⏳ 生成密钥对与密码...${PLAIN}"
+    echo -e "${BLUE}正在生成密钥对与密码...${PLAIN}"
     local key_output private_key public_key password short_id
-    key_output=$("$BIN_FILE" generate reality-keypair)
+    key_output=$("$BIN_FILE" generate reality-keypair 2>/dev/null) || { echo -e "${RED}生成 Reality 密钥对失败！${PLAIN}" >&2; return 1; }
     private_key=$(echo "$key_output" | grep "PrivateKey" | awk '{print $2}' | tr -d '"')
     public_key=$(echo  "$key_output" | grep "PublicKey"  | awk '{print $2}' | tr -d '"')
     # 32 位十六进制：不含需要 URL 转义的字符，可直接拼进 anytls:// 分享链接
-    password=$("$BIN_FILE" generate rand 16 --hex)
-    short_id=$("$BIN_FILE" generate rand 8 --hex)
+    password=$("$BIN_FILE" generate rand 16 --hex 2>/dev/null)
+    short_id=$("$BIN_FILE" generate rand 8 --hex 2>/dev/null)
+    if [[ -z "$private_key" || -z "$public_key" || -z "$password" || -z "$short_id" ]]; then
+        echo -e "${RED}生成节点密钥或密码失败！${PLAIN}" >&2
+        return 1
+    fi
 
     local tag="anytls-reality-$port" name
     name=$(read_node_name) || return 1
@@ -898,18 +1054,19 @@ add_anytls_node() {
                                "handshake": {"server": $sni, "server_port": 443}
                            }
                        }
-                   }]' "$CONFIG_FILE")
+                   }]' "$CONFIG_FILE") || return 1
 
-    if save_and_check_config "$temp_json"; then
+    if apply_config_and_restart "$temp_json"; then
         save_reality_meta "$tag" "$public_key"
-        open_firewall_port "$port"
-        svc_restart
-        local ip; ip=$(get_public_ip)
         save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
-        local link="anytls://$password@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#$(node_link_fragment "$tag")"
+        open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+        local ip host
+        ip=$(get_public_ip)
+        host=$(format_url_host "$ip")
+        local link="anytls://$password@$host:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
         echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${GREEN}🎉 节点添加成功！（已放行防火墙）${PLAIN}"
+        echo -e "${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
         echo -e "服务器 IP  : ${BLUE}$ip${PLAIN}"
         echo -e "端口       : ${BLUE}$port${PLAIN}"
@@ -919,7 +1076,7 @@ add_anytls_node() {
         echo -e "SNI        : ${BLUE}$sni${PLAIN}"
         echo -e "分享链接   : ${YELLOW}$link${PLAIN}"
         echo -e "${GREEN}====================================================${PLAIN}"
-        echo -e "${YELLOW}💡 客户端要求：AnyTLS + Reality 需 sing-box 内核客户端（官方 sing-box /${PLAIN}"
+        echo -e "${YELLOW}客户端要求：AnyTLS + Reality 需 sing-box 内核客户端（官方 sing-box /${PLAIN}"
         echo -e "${YELLOW}   Karing / Hiddify / v2rayN），或小火箭 Shadowrocket 2.2.65+（类型选 AnyTLS，${PLAIN}"
         echo -e "${YELLOW}   TLS 开启后填 SNI / 公钥 / 短 ID）；mihomo 不支持该组合。${PLAIN}"
 
@@ -930,6 +1087,8 @@ add_anytls_node() {
                 qrencode -t ANSIUTF8 "$link"
             fi
         fi
+    else
+        return 1
     fi
 }
 
@@ -937,7 +1096,7 @@ add_anytls_node() {
 ss2022_link() {
     local method="$1" password="$2" host="$3" port="$4" tag="$5" encoded
     encoded=$(jq -rn --arg p "$password" '$p | @uri') || return 1
-    [[ "$host" == *:* && "$host" != \[*\] ]] && host="[$host]"
+    host=$(format_url_host "$host")
     printf 'ss://%s:%s@%s:%s#%s\n' "$method" "$encoded" "$host" "$port" "$(node_link_fragment "$tag")"
 }
 
@@ -951,19 +1110,8 @@ add_ss2022_node() {
         return 1
     fi
     ensure_config
-    local port name tag password method=2022-blake3-aes-256-gcm temp_json ip link show_qr was_active=0 restore_file
-    while true; do
-        read -rp '监听端口 [默认 8388]: ' port || return 0
-        port=${port:-8388}
-        if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || ! validate_port "$port"; then
-            printf '端口无效。\n' >&2; continue
-        fi
-        port=$((10#$port))
-        if port_in_use "$port"; then
-            printf '端口已被现有入站使用。\n' >&2; continue
-        fi
-        break
-    done
+    local port name tag password method=2022-blake3-aes-256-gcm temp_json ip link show_qr
+    port=$(read_valid_port '监听端口 [默认 8388]: ' 8388 1) || return 0
     name=$(read_node_name) || return 1
     tag="ss2022-$port"
     password=$("$BIN_FILE" generate rand 32 --base64) || return 1
@@ -973,25 +1121,7 @@ add_ss2022_node() {
     fi
     temp_json=$(jq --argjson port "$port" --arg tag "$tag" --arg method "$method" \
         --arg pw "$password" '.inbounds += [{type:"shadowsocks",tag:$tag,listen:"::",listen_port:$port,method:$method,password:$pw}]' "$CONFIG_FILE") || return 1
-    if svc_active; then was_active=1; fi
-    save_and_check_config "$temp_json" || return 1
-    if ! { svc_restart && sleep 1 && svc_active; }; then
-        printf '新节点未能启动，正在恢复上一份配置。\n' >&2
-        restore_file=$(mktemp "${CONFIG_FILE%/*}/.sb-restore.XXXXXX") || return 1
-        if ! cp -- "${CONFIG_FILE}.bak" "$restore_file" || ! mv -f -- "$restore_file" "$CONFIG_FILE"; then
-            rm -f -- "$restore_file"
-            printf '自动恢复失败；备份仍在 %s.bak。\n' "$CONFIG_FILE" >&2
-            return 1
-        fi
-        if (( was_active )); then
-            if ! { svc_restart && sleep 1 && svc_active; }; then
-                printf '配置已恢复，但服务未能恢复运行，请查看日志。\n' >&2
-            fi
-        elif svc_active; then
-            svc_stop || printf '配置已恢复，但未能恢复原来的停止状态。\n' >&2
-        fi
-        return 1
-    fi
+    apply_config_and_restart "$temp_json" || return 1
     save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
     open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
     ip=$(get_public_ip)
@@ -1010,96 +1140,81 @@ add_ss2022_node() {
 
 view_node_links() {
     ensure_config
-    local ip; ip=$(get_public_ip)
+    local ip host
+    ip=$(get_public_ip)
+    host=$(format_url_host "$ip")
     echo -e "${CYAN}=== 节点分享链接 ===${PLAIN}"
     echo -e "${BLUE}服务器 IP: $ip${PLAIN}"
     echo -e "--------------------------------------------------"
 
-    local vless_total anytls_total ss_total
-    vless_total=$(count_by_type "vless")
-    anytls_total=$(count_by_type "anytls")
-    ss_total=$(ss2022_count) || return 1
-    if (( vless_total + anytls_total + ss_total == 0 )); then
+    local records
+    records=$(jq -r '
+      def rows(kind):
+        .inbounds[]? | select(
+          if kind == "ss2022" then (.type == "shadowsocks" and ((.tag // "") | startswith("ss2022-")))
+          else .type == kind end
+        ) | [
+          kind,
+          (.tag // ""),
+          ((.listen_port // "") | tostring),
+          (if kind == "vless" then (.users[0].uuid // "")
+           elif kind == "anytls" then (.users[0].password // "")
+           else (.method // "") end),
+          (if kind == "ss2022" then (.password // "")
+           else (.tls.server_name // "") end),
+          (if kind == "ss2022" then ""
+           else (.tls.reality.short_id[0] // "") end)
+        ] | join("\u001f");
+      (rows("vless"), rows("anytls"), rows("ss2022"))
+    ' "$CONFIG_FILE" 2>/dev/null) || return 1
+
+    if [ -z "$records" ]; then
         echo -e "${YELLOW}当前没有可分享的节点。${PLAIN}"
         return
     fi
 
-    local total="$vless_total"
-    local links=() tags=() i=0 idx=0 total_all
-    total_all=$(inbound_count)
-    while [ $i -lt "$total_all" ]; do
-        local type
-        type=$(inbound_field "$i" "type")
-        if [ "$type" == "vless" ]; then
-            idx=$((idx+1))
-            local uuid sni sid tag port pbk link
-            uuid=$(inbound_field "$i" "users[0].uuid")
-            sni=$(inbound_field  "$i" "tls.server_name")
-            sid=$(inbound_field  "$i" "tls.reality.short_id[0]")
-            tag=$(inbound_field  "$i" "tag")
-            port=$(inbound_field "$i" "listen_port")
-            pbk=$(get_reality_pubkey "$tag")
-            link="vless://$uuid@$ip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid&type=tcp#$(node_link_fragment "$tag")"
-
-            links+=("$link")
-            tags+=("$(node_display_name "$tag")")
-
-            printf '  [%s] VLESS-Reality | %s | 端口: %s\n' "$idx" "$(node_display_name "$tag")" "$port"
-            echo -e "      SNI : $sni  |  ShortId: $sid"
-            echo -e "      公钥: ${pbk:-未记录}"
-            echo -e "      链接: ${YELLOW}$link${PLAIN}"
-            echo -e "--------------------------------------------------"
-        fi
-        i=$((i+1))
-    done
-
-    if [ "$anytls_total" -gt 0 ]; then
-        i=0
-        while [ $i -lt "$total_all" ]; do
-            local atype
-            atype=$(inbound_field "$i" "type")
-            if [ "$atype" == "anytls" ]; then
+    local links=() tags=() idx=0
+    local kind tag port f4 f5 f6 display pbk link
+    while IFS=$'\x1f' read -r kind tag port f4 f5 f6; do
+        [ -n "$kind" ] || continue
+        display=$(node_display_name "$tag")
+        case "$kind" in
+            vless)
                 idx=$((idx+1))
-                local pw sni sid tag port pbk link
-                pw=$(inbound_field   "$i" "users[0].password")
-                sni=$(inbound_field  "$i" "tls.server_name")
-                sid=$(inbound_field  "$i" "tls.reality.short_id[0]")
-                tag=$(inbound_field  "$i" "tag")
-                port=$(inbound_field "$i" "listen_port")
                 pbk=$(get_reality_pubkey "$tag")
-                link="anytls://$pw@$ip:$port/?security=reality&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid#$(node_link_fragment "$tag")"
-
+                link="vless://$f4@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$f5&fp=chrome&pbk=$pbk&sid=$f6&type=tcp#$(node_link_fragment "$tag")"
                 links+=("$link")
-                tags+=("$(node_display_name "$tag")")
-
-                printf '  [%s] AnyTLS-Reality | %s | 端口: %s\n' "$idx" "$(node_display_name "$tag")" "$port"
-                echo -e "      SNI : $sni  |  ShortId: $sid"
+                tags+=("$display")
+                printf '  [%s] VLESS-Reality | %s | 端口: %s\n' "$idx" "$display" "$port"
+                echo -e "      SNI : $f5  |  ShortId: $f6"
                 echo -e "      公钥: ${pbk:-未记录}"
-                echo -e "      密码: $pw"
                 echo -e "      链接: ${YELLOW}$link${PLAIN}"
                 echo -e "--------------------------------------------------"
-            fi
-            i=$((i+1))
-        done
-    fi
+                ;;
+            anytls)
+                idx=$((idx+1))
+                pbk=$(get_reality_pubkey "$tag")
+                link="anytls://$f4@$host:$port/?security=reality&sni=$f5&fp=chrome&pbk=$pbk&sid=$f6#$(node_link_fragment "$tag")"
+                links+=("$link")
+                tags+=("$display")
+                printf '  [%s] AnyTLS-Reality | %s | 端口: %s\n' "$idx" "$display" "$port"
+                echo -e "      SNI : $f5  |  ShortId: $f6"
+                echo -e "      公钥: ${pbk:-未记录}"
+                echo -e "      密码: $f4"
+                echo -e "      链接: ${YELLOW}$link${PLAIN}"
+                echo -e "--------------------------------------------------"
+                ;;
+            ss2022)
+                link=$(ss2022_link "$f4" "$f5" "$ip" "$port" "$tag") || continue
+                links+=("$link")
+                tags+=("$display")
+                idx=$((idx+1))
+                printf '  [%s] SS2022 | %s | 端口: %s\n      链接: %s\n' "$idx" "$display" "$port" "$link"
+                ;;
+        esac
+    done <<< "$records"
 
-    if [ "$ss_total" -gt 0 ]; then
-        for ((i=0; i<total_all; i++)); do
-            [[ $(inbound_node_type "$i") == ss2022 ]] || continue
-            local method password
-            method=$(inbound_field "$i" method)
-            password=$(inbound_field "$i" password)
-            tag=$(inbound_field "$i" tag)
-            port=$(inbound_field "$i" listen_port)
-            link=$(ss2022_link "$method" "$password" "$ip" "$port" "$tag") || continue
-            links+=("$link")
-            tags+=("$(node_display_name "$tag")")
-            idx=$((idx+1))
-            printf '  [%s] SS2022 | %s | 端口: %s\n      链接: %s\n' "$idx" "$(node_display_name "$tag")" "$port" "$link"
-        done
-    fi
-
-    if command -v qrencode &>/dev/null; then
+    if command -v qrencode &>/dev/null && [ "${#links[@]}" -gt 0 ]; then
         read -rp "输入要显示二维码的序号 (0 跳过): " qr_idx
         if [[ "$qr_idx" =~ ^[0-9]+$ ]] && [ "$qr_idx" -ge 1 ] && [ "$qr_idx" -le "${#links[@]}" ]; then
             local ridx=$((qr_idx - 1))
@@ -1142,29 +1257,33 @@ delete_node() {
     del_tag=$(inbound_field "$real_idx" "tag")
 
     local temp_json
-    temp_json=$(jq --argjson i "$real_idx" '.inbounds |= (.[:$i] + .[$i+1:])' "$CONFIG_FILE")
+    temp_json=$(jq --argjson i "$real_idx" --arg tag "$del_tag" '
+        .inbounds |= (.[:$i] + .[$i+1:]) |
+        if .route.rules then
+            .route.rules |= [.[] | select((.inbound? // []) | (if type == "array" then index($tag) == null else . != $tag end))]
+        else . end
+    ' "$CONFIG_FILE") || return 1
 
-    if save_and_check_config "$temp_json"; then
+    if apply_config_and_restart "$temp_json"; then
         remove_reality_meta "$del_tag"
         if [ -e "$NODE_NAMES_META" ]; then
             save_node_name "$del_tag" "" || printf '节点已删除，但旧备注清理失败。\n' >&2
         fi
-        svc_restart
-        echo -e "${GREEN}✅ 节点 [${del_tag}] 已删除。${PLAIN}"
+        echo -e "${GREEN}节点 [${del_tag}] 已删除。${PLAIN}"
     fi
 }
 
 # ==================== 端口转发 ====================
 add_port_forward() {
-    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return
+    [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
     ensure_config
 
     echo -e "${CYAN}=== 添加 TCP/UDP 端口转发 ===${PLAIN}"
     local local_port remote_ip remote_port
-    local_port=$(read_valid_port "本机监听端口: " "" 1)
-    read -rp "目标远程 IP: " remote_ip
-    [[ -z "$remote_ip" ]] && echo -e "${RED}IP 不能为空！${PLAIN}" && return
-    remote_port=$(read_valid_port "目标远程端口: " "" 0)
+    local_port=$(read_valid_port "本机监听端口: " "" 1) || return 1
+    read -rp "目标远程 IP: " remote_ip || return 1
+    [[ -z "$remote_ip" ]] && echo -e "${RED}IP 不能为空！${PLAIN}" && return 1
+    remote_port=$(read_valid_port "目标远程端口: " "" 0) || return 1
 
     local tag="forward-$local_port-to-$remote_port"
 
@@ -1176,13 +1295,13 @@ add_port_forward() {
                        "listen_port": $lport,
                        "override_address": $rip, "override_port": $rport
                    }] |
-                    .route.rules += [{"inbound": [$tag], "outbound": "direct"}]' \
-                   "$CONFIG_FILE")
+                    .route = (.route // {}) |
+                    .route.rules = ((.route.rules // []) + [{"inbound": [$tag], "outbound": "direct"}])' \
+                   "$CONFIG_FILE") || return 1
 
-    if save_and_check_config "$temp_json"; then
-        open_firewall_port "$local_port"
-        svc_restart
-        echo -e "${GREEN}✅ 转发成功：本机 [${local_port}] → ${remote_ip}:${remote_port}${PLAIN}"
+    if apply_config_and_restart "$temp_json"; then
+        open_firewall_port "$local_port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$local_port" >&2
+        echo -e "${GREEN}转发成功：本机 [${local_port}] -> ${remote_ip}:${remote_port}${PLAIN}"
     fi
 }
 
@@ -1210,7 +1329,7 @@ view_port_forwards() {
             lp=$(inbound_field  "$i" "listen_port")
             rip=$(inbound_field "$i" "override_address")
             rp=$(inbound_field  "$i" "override_port")
-            echo -e "  [${GREEN}$idx${PLAIN}] 监听 [${BLUE}$lp${PLAIN}] → ${rip}:${rp}   ${CYAN}($tag)${PLAIN}"
+            echo -e "  [${GREEN}$idx${PLAIN}] 监听 [${BLUE}$lp${PLAIN}] -> ${rip}:${rp}   ${CYAN}($tag)${PLAIN}"
         fi
         i=$((i+1))
     done
@@ -1234,14 +1353,15 @@ delete_port_forward() {
     del_tag=$(inbound_field "$real_idx" "tag")
 
     local temp_json
-    temp_json=$(jq --argjson i "$real_idx" --arg tag "$del_tag" \
-                   '.inbounds |= (.[:$i] + .[$i+1:]) |
-                    .route.rules |= [.[] | select((.inbound? // []) | index($tag) | not)]' \
-                   "$CONFIG_FILE")
+    temp_json=$(jq --argjson i "$real_idx" --arg tag "$del_tag" '
+                   .inbounds |= (.[:$i] + .[$i+1:]) |
+                   if .route.rules then
+                       .route.rules |= [.[] | select((.inbound? // []) | (if type == "array" then index($tag) == null else . != $tag end))]
+                   else . end' \
+                   "$CONFIG_FILE") || return 1
 
-    if save_and_check_config "$temp_json"; then
-        svc_restart
-        echo -e "${GREEN}✅ 转发 [${del_tag}] 已删除。${PLAIN}"
+    if apply_config_and_restart "$temp_json"; then
+        echo -e "${GREEN}转发 [${del_tag}] 已删除。${PLAIN}"
     fi
 }
 
@@ -1255,39 +1375,58 @@ diagnose_config() {
             size=$(wc -c < "$CONFIG_FILE" 2>/dev/null)
             echo -e " 文件大小: ${BLUE}${size}${PLAIN} bytes"
             if jq empty "$CONFIG_FILE" 2>/dev/null; then
-                echo -e " JSON状态: ${GREEN}✅ 语法正确${PLAIN}"
-                echo -e " 入站总数: ${BLUE}$(inbound_count)${PLAIN}  (VLESS: $(count_by_type vless), AnyTLS: $(count_by_type anytls), 转发: $(count_by_type direct))"
+                echo -e " JSON状态: ${GREEN}语法正确${PLAIN}"
+                echo -e " 入站总数: ${BLUE}$(inbound_count)${PLAIN}  (VLESS: $(count_by_type vless), AnyTLS: $(count_by_type anytls), SS2022: $(ss2022_count 2>/dev/null || echo 0), 转发: $(count_by_type direct))"
             else
-                echo -e " JSON状态: ${RED}❌ 语法错误${PLAIN}"
+                echo -e " JSON状态: ${RED}语法错误${PLAIN}"
             fi
         else
             echo -e " 状态: ${RED}配置文件不存在${PLAIN}"
         fi
-        echo -e " 备份文件: $([ -f "${CONFIG_FILE}.bak" ] && echo -e "${GREEN}✅ 存在（上一版有效配置）${PLAIN}" || echo -e "${YELLOW}⚠️ 不存在${PLAIN}")"
+        echo -e " 备份文件: $([ -f "${CONFIG_FILE}.bak" ] && echo -e "${GREEN}存在（上一版有效配置）${PLAIN}" || echo -e "${YELLOW}不存在${PLAIN}")"
         menu_section "配置操作"
         menu_option 1 "查看原始 JSON"
         menu_option 2 "查看 Reality 元数据"
         menu_option 3 "手动编辑并校验配置"
         menu_option 4 "重置为空配置（自动备份）"
-        menu_option 5 "回滚到上次有效备份 ${RED}⚠️${PLAIN}"
+        menu_option 5 "回滚到上次有效备份（高风险）"
         menu_back
         read_menu_choice "请选择 [0-5]"; c="$REPLY"
         case "$c" in
             1) echo -e "${CYAN}--- 原始 JSON ---${PLAIN}"; cat "$CONFIG_FILE" 2>/dev/null ;;
             2) echo -e "${CYAN}--- Reality 元数据 ---${PLAIN}"; [ -f "$REALITY_META" ] && cat "$REALITY_META" || echo -e "${YELLOW}无${PLAIN}" ;;
-            3) local editor="vi"; command -v nano &>/dev/null && editor="nano"; $editor "$CONFIG_FILE"
-               if jq empty "$CONFIG_FILE" 2>/dev/null; then
-                   svc_restart
-                   echo -e "${GREEN}✅ 配置有效，已重启服务${PLAIN}"
+            3) if [ ! -x "$BIN_FILE" ]; then
+                   echo -e "${RED}请先安装 Sing-box 核心！${PLAIN}"
                else
-                   echo -e "${RED}❌ 配置仍无效！${PLAIN}"
+                   local editor="vi" edit_tmp edited_json
+                   command -v nano &>/dev/null && editor="nano"
+                   ensure_config
+                   if edit_tmp=$(mktemp "${CONFIG_FILE%/*}/.sb-edit.XXXXXX") && install -m 600 "$CONFIG_FILE" "$edit_tmp"; then
+                       "$editor" "$edit_tmp"
+                       if cmp -s "$CONFIG_FILE" "$edit_tmp"; then
+                           rm -f -- "$edit_tmp"
+                           echo -e "${YELLOW}配置未改动。${PLAIN}"
+                       elif ! jq empty "$edit_tmp" 2>/dev/null; then
+                           rm -f -- "$edit_tmp"
+                           echo -e "${RED}JSON 语法错误，已放弃更改，原配置未改动。${PLAIN}"
+                       else
+                           edited_json=$(cat "$edit_tmp")
+                           rm -f -- "$edit_tmp"
+                           if apply_config_and_restart "$edited_json"; then
+                               echo -e "${GREEN}配置校验通过，已保存并重启服务。${PLAIN}"
+                           fi
+                       fi
+                   else
+                       rm -f -- "${edit_tmp:-}"
+                       echo -e "${RED}准备临时编辑文件失败。${PLAIN}"
+                   fi
                fi ;;
             4) read -rp "是否备份并重置为空配置？[y/N]: " cc
                if [[ "$cc" =~ ^[Yy]$ ]]; then
                    cp "$CONFIG_FILE" "${CONFIG_FILE}.broken.$(date +%s)" 2>/dev/null
                    rm -f "$CONFIG_FILE"
                    ensure_config
-                   echo -e "${GREEN}✅ 已重置（旧文件已备份）${PLAIN}"
+                   echo -e "${GREEN}已重置（旧文件已备份）${PLAIN}"
                fi ;;
             5) read -rp "确定要回滚到上次有效备份吗？[y/N]: " cc
                [[ "$cc" =~ ^[Yy]$ ]] && rollback_config ;;
@@ -1318,7 +1457,7 @@ menu_system() {
         read_menu_choice "请选择 [0-9]"; c="$REPLY"
         case "$c" in
             1) install_singbox ;; 2) start_service ;;
-            3) svc_stop && echo -e "${YELLOW}🛑 已停止${PLAIN}" ;; 4) restart_service ;;
+            3) svc_stop && echo -e "${YELLOW}已停止${PLAIN}" ;; 4) restart_service ;;
             5) uninstall_singbox ;; 6) show_service_status ;; 7) show_full_config ;; 8) view_logs ;;
             9) uninstall_singbox full ;;
             0) return ;; *) echo -e "${RED}无效选项！${PLAIN}" ;;
@@ -1368,7 +1507,7 @@ _UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like G
 # ---------- 流媒体解锁检测（本机出口）----------
 media_check_quick() {
     echo -e "${CYAN}=== 流媒体解锁检测（基于本机直连出口）===${PLAIN}"
-    echo -e "${BLUE}⏳ 检测中，请稍候...${PLAIN}"
+    echo -e "${BLUE}检测中，请稍候...${PLAIN}"
 
     # 出口 IP / 地区
     local geo ip country org
@@ -1386,51 +1525,74 @@ media_check_quick() {
     loc=$(curl -s --max-time 10 "https://chat.openai.com/cdn-cgi/trace" 2>/dev/null | sed -n 's/^loc=\([A-Za-z]*\).*/\1/p' | head -1)
     comp=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "https://api.openai.com/compliance/cookie_requirements" -H "authorization: Bearer x" 2>/dev/null)
     if [[ -n "$loc" && "$comp" == "200" ]]; then
-        gpt="${GREEN}✅ 可用${PLAIN} (地区: $loc)"
+        gpt="${GREEN}可用${PLAIN} (地区: $loc)"
     elif [[ -n "$loc" ]]; then
-        gpt="${YELLOW}⚠ 网页可访问但 App/API 受限${PLAIN} (地区: $loc)"
+        gpt="${YELLOW}网页可访问但 App/API 受限${PLAIN} (地区: $loc)"
     else
-        gpt="${RED}❌ 不可用/超时${PLAIN}"
+        gpt="${RED}不可用/超时${PLAIN}"
     fi
     printf ' %-12s: %b\n' "ChatGPT" "$gpt"
 
     # YouTube Premium 地区
     local yt ytc
     ytc=$(curl -s --max-time 12 -A "$_UA" -H "Accept-Language: en-US" "https://www.youtube.com/premium" 2>/dev/null | sed -n 's/.*"GL":"\([A-Z][A-Z]\)".*/\1/p' | head -1)
-    if [[ -n "$ytc" ]]; then yt="${GREEN}✅ 可用${PLAIN} (地区: $ytc)"; else yt="${RED}❌ 不可用/超时${PLAIN}"; fi
+    if [[ -n "$ytc" ]]; then yt="${GREEN}可用${PLAIN} (地区: $ytc)"; else yt="${RED}不可用/超时${PLAIN}"; fi
     printf ' %-12s: %b\n' "YouTube" "$yt"
 
     # Netflix：非自制剧 81280792  200=完整解锁 / 404=仅自制剧 / 其它=不可用
     local nf nfc
     nfc=$(curl -sL --max-time 12 -A "$_UA" -o /dev/null -w "%{http_code}" "https://www.netflix.com/title/81280792" 2>/dev/null)
     case "$nfc" in
-        200) nf="${GREEN}✅ 完整解锁${PLAIN}" ;;
-        404) nf="${YELLOW}⚠ 仅自制剧${PLAIN}" ;;
-        *)   nf="${RED}❌ 不可用 (http=$nfc)${PLAIN}" ;;
+        200) nf="${GREEN}完整解锁${PLAIN}" ;;
+        404) nf="${YELLOW}仅自制剧${PLAIN}" ;;
+        *)   nf="${RED}不可用 (http=$nfc)${PLAIN}" ;;
     esac
     printf ' %-12s: %b\n' "Netflix" "$nf"
 
     # Disney+
     local dp dpc
     dpc=$(curl -s --max-time 12 -A "$_UA" -o /dev/null -w "%{http_code}" "https://www.disneyplus.com/" 2>/dev/null)
-    if [[ "$dpc" == "200" ]]; then dp="${GREEN}✅ 可访问${PLAIN}"; else dp="${RED}❌ 不可用 (http=$dpc)${PLAIN}"; fi
+    if [[ "$dpc" == "200" ]]; then dp="${GREEN}可访问${PLAIN}"; else dp="${RED}不可用 (http=$dpc)${PLAIN}"; fi
     printf ' %-12s: %b\n' "Disney+" "$dp"
 
     # TikTok 地区
     local tt ttc
     ttc=$(curl -s --max-time 12 -A "$_UA" "https://www.tiktok.com/" 2>/dev/null | sed -n 's/.*"region":"\([A-Z][A-Z]\)".*/\1/p' | head -1)
-    if [[ -n "$ttc" ]]; then tt="${GREEN}✅ 可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}⚠ 未获取到地区${PLAIN}"; fi
+    if [[ -n "$ttc" ]]; then tt="${GREEN}可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}未获取到地区${PLAIN}"; fi
     printf ' %-12s: %b\n' "TikTok" "$tt"
     echo -e "--------------------------------------------------"
     echo -e "${YELLOW}提示：此结果为服务器本机直连出口。若想让某服务走 WARP，可在「WARP 出口」菜单添加分流。${PLAIN}"
 }
 
 media_check_full() {
+    local c rc tmp
     echo -e "${CYAN}=== 完整流媒体解锁检测（社区脚本 RegionRestrictionCheck）===${PLAIN}"
-    echo -e "${YELLOW}将下载并运行外部脚本，需能访问 GitHub。${PLAIN}"
-    read -rp "继续？[y/N]: " c
-    [[ ! "$c" =~ ^[Yy]$ ]] && return
-    bash <(curl -L -s https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh)
+    echo -e "${YELLOW}将以 root 权限下载并运行外部脚本，需能访问 GitHub。${PLAIN}"
+    read -rp "继续？[y/N]: " c || return 0
+    [[ "$c" =~ ^[Yy]$ ]] || return 0
+    (
+        exec 200>&-
+        tmp=$(mktemp -d) || exit 1
+        trap 'rm -rf -- "$tmp"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        if ! curl --proto '=https' --proto-redir '=https' -fSL \
+            --connect-timeout 15 --max-time 120 --retry 2 \
+            https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh -o "$tmp/check.sh"; then
+            echo -e "${RED}检测脚本下载失败，未执行。${PLAIN}" >&2
+            exit 1
+        fi
+        if [[ ! -s "$tmp/check.sh" ]] || ! bash -n "$tmp/check.sh"; then
+            echo -e "${RED}检测脚本内容为空或语法检查失败，未执行。${PLAIN}" >&2
+            exit 1
+        fi
+        bash "$tmp/check.sh"
+    )
+    rc=$?
+    if (( rc != 0 )); then
+        echo -e "${YELLOW}流媒体检测脚本未正常完成（退出码 ${rc}），已返回面板。${PLAIN}"
+    fi
+    return "$rc"
 }
 
 # BestTrace 保持独立子进程，避免上游的变量、exit 和 trap 影响面板。
@@ -1475,19 +1637,41 @@ show_dns() {
     echo -e "${CYAN}=== 当前 DNS (/etc/resolv.conf) ===${PLAIN}"
     grep -E '^nameserver' /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}未配置 nameserver${PLAIN}"
     if [ "$INIT_SYS" = "systemd" ] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        echo -e "${YELLOW}⚠ 检测到 systemd-resolved 正在运行，直改 resolv.conf 可能被覆盖。${PLAIN}"
+        echo -e "${YELLOW}检测到 systemd-resolved 正在运行，直改 resolv.conf 可能被覆盖。${PLAIN}"
     fi
 }
 
 set_dns() {
-    local servers="$1" label="$2"
-    mkdir -p "$META_DIR"
-    [ -f /etc/resolv.conf ] && cp /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
+    local servers="$1" label="$2" s tmp
+    local -a list=()
+    read -r -a list <<< "$servers"
+    if [ "${#list[@]}" -eq 0 ]; then
+        echo -e "${RED}未提供有效 DNS 地址。${PLAIN}" >&2
+        return 1
+    fi
+    for s in "${list[@]}"; do
+        if ! is_valid_ip "$s"; then
+            echo -e "${RED}无效的 DNS IP 地址：${s}（原配置未改动）${PLAIN}" >&2
+            return 1
+        fi
+    done
+    mkdir -p "$META_DIR" || return 1
+    # 仅在首次切换前备份原始 resolv.conf，避免多次切换冲掉初始备份
+    if [ ! -f "$DNS_BACKUP" ] && [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$DNS_BACKUP" 2>/dev/null
+    fi
+    tmp=$(mktemp) || return 1
     {
         echo "# generated by sb $(date '+%F %T')"
-        for s in $servers; do echo "nameserver $s"; done
-    } > /etc/resolv.conf
-    echo -e "${GREEN}✅ 已切换 DNS 为：$label${PLAIN}"
+        for s in "${list[@]}"; do printf 'nameserver %s\n' "$s"; done
+    } > "$tmp"
+    if ! cat "$tmp" > /etc/resolv.conf; then
+        rm -f -- "$tmp"
+        echo -e "${RED}写入 /etc/resolv.conf 失败。${PLAIN}" >&2
+        return 1
+    fi
+    rm -f -- "$tmp"
+    echo -e "${GREEN}已切换 DNS 为：$label${PLAIN}"
     show_dns
 }
 
@@ -1511,7 +1695,7 @@ menu_dns() {
             4) set_dns "223.5.5.5 223.6.6.6" "AliDNS" ;;
             5) read -rp "输入 DNS（空格分隔）: " custom
                [[ -n "$custom" ]] && set_dns "$custom" "自定义" || echo -e "${RED}未输入。${PLAIN}" ;;
-            6) if [ -f "$DNS_BACKUP" ]; then cp "$DNS_BACKUP" /etc/resolv.conf; echo -e "${GREEN}✅ 已恢复备份。${PLAIN}"; show_dns; else echo -e "${YELLOW}无备份。${PLAIN}"; fi ;;
+            6) if [ -f "$DNS_BACKUP" ]; then cp "$DNS_BACKUP" /etc/resolv.conf; echo -e "${GREEN}已恢复备份。${PLAIN}"; show_dns; else echo -e "${YELLOW}无备份。${PLAIN}"; fi ;;
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
@@ -1520,6 +1704,51 @@ menu_dns() {
 }
 
 # ---------- 防火墙 (ufw) 设置 ----------
+detect_ssh_ports() {
+    local ports=() p conn_port sshd_bin="" cfg_found=0
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        conn_port=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+        if [[ "$conn_port" =~ ^[0-9]{1,5}$ ]] && validate_port "$((10#$conn_port))"; then
+            ports+=("$((10#$conn_port))")
+        fi
+    fi
+    sshd_bin=$(command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; })
+    if [ -n "$sshd_bin" ]; then
+        while read -r p; do
+            if [[ "$p" =~ ^[0-9]{1,5}$ ]] && validate_port "$((10#$p))"; then
+                ports+=("$((10#$p))")
+                cfg_found=1
+            fi
+        done < <("$sshd_bin" -T 2>/dev/null | awk '$1 == "port" && $2 ~ /^[0-9]+$/ {print $2}')
+    fi
+    if [ "$cfg_found" -eq 0 ]; then
+        local cfg_files=() f
+        for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+            [ -r "$f" ] && cfg_files+=("$f")
+        done
+        if [ "${#cfg_files[@]}" -gt 0 ]; then
+            while read -r p; do
+                if [[ "$p" =~ ^[0-9]{1,5}$ ]] && validate_port "$((10#$p))"; then
+                    ports+=("$((10#$p))")
+                fi
+            done < <(awk 'tolower($1) == "port" && $2 ~ /^[0-9]+$/ {print $2}' "${cfg_files[@]}" 2>/dev/null)
+        fi
+    fi
+    if [ "${#ports[@]}" -eq 0 ]; then
+        ports=(22)
+    fi
+    printf '%s\n' "${ports[@]}" | sort -un | awk '{out = (out ? out " " : "") $0} END {print out}'
+}
+
+is_ssh_port() {
+    local target="$1" ssh_ports
+    ssh_ports=$(detect_ssh_ports)
+    case " $ssh_ports " in
+        *" $target "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 menu_firewall() {
     if ! command -v ufw &>/dev/null; then
         echo -e "${YELLOW}未安装 ufw，正在尝试安装...${PLAIN}"
@@ -1538,12 +1767,14 @@ menu_firewall() {
         return
     fi
     while true; do
-        menu_header "防火墙设置" "ufw 端口与安全策略"
+        local detected_ssh
+        detected_ssh=$(detect_ssh_ports)
+        menu_header "防火墙设置" "ufw 端口与安全策略（SSH: ${detected_ssh}）"
         ufw status verbose 2>/dev/null | head -20
         menu_section "规则操作"
         menu_option 1 "开放端口（TCP + UDP）"
         menu_option 2 "关闭 / 删除端口规则"
-        menu_option 3 "启用防火墙（自动保留 SSH 22）"
+        menu_option 3 "启用防火墙（自动保留 SSH 端口: ${detected_ssh}）"
         menu_option 4 "关闭防火墙"
         menu_option 5 "重载防火墙"
         menu_back
@@ -1551,24 +1782,38 @@ menu_firewall() {
         case "$c" in
             1) local p
                read -rp "要开放的端口: " p
-               if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
-                   ufw allow "$p"/tcp && ufw allow "$p"/udp && echo -e "${GREEN}✅ 已开放 $p (tcp+udp)${PLAIN}"
+               if [[ "$p" =~ ^[0-9]{1,5}$ ]] && validate_port "$((10#$p))"; then
+                   p=$((10#$p))
+                   ufw allow "$p"/tcp && ufw allow "$p"/udp && echo -e "${GREEN}已开放 $p (tcp+udp)${PLAIN}"
                else echo -e "${RED}端口无效！${PLAIN}"; fi ;;
-            2) local p
+            2) local p yn
                read -rp "要关闭的端口: " p
-               if [[ "$p" == "22" ]]; then
-                   read -rp "${RED}⚠ 关闭 22 可能导致 SSH 无法登录，确定？[y/N]: ${PLAIN}" yn
-                   [[ ! "$yn" =~ ^[Yy]$ ]] && { echo "已取消。"; pause; continue; }
-               fi
-               if [[ "$p" =~ ^[0-9]+$ ]]; then
+               if ! [[ "$p" =~ ^[0-9]{1,5}$ ]] || ! validate_port "$((10#$p))"; then
+                   echo -e "${RED}端口无效！${PLAIN}"
+               else
+                   p=$((10#$p))
+                   if is_ssh_port "$p"; then
+                       printf '%b警告：关闭 %s 可能导致当前 SSH 无法登录，确定？[y/N]: %b' "$RED" "$p" "$PLAIN"
+                       read -r yn
+                       [[ ! "$yn" =~ ^[Yy]$ ]] && { echo "已取消。"; pause; continue; }
+                   fi
                    ufw delete allow "$p"/tcp 2>/dev/null; ufw delete allow "$p"/udp 2>/dev/null
-                   echo -e "${GREEN}✅ 已删除 $p 的开放规则${PLAIN}"
-               else echo -e "${RED}端口无效！${PLAIN}"; fi ;;
-            3) ufw allow 22/tcp &>/dev/null
-               echo -e "${YELLOW}已自动保留 22/tcp，防止锁死。${PLAIN}"
-               yes | ufw enable && echo -e "${GREEN}✅ 防火墙已启用${PLAIN}" ;;
-            4) ufw disable && echo -e "${YELLOW}🛡 防火墙已关闭${PLAIN}" ;;
-            5) ufw reload && echo -e "${GREEN}✅ 已重载${PLAIN}" ;;
+                   echo -e "${GREEN}已删除 $p 的开放规则${PLAIN}"
+               fi ;;
+            3) local sp allow_ok=1
+               for sp in $detected_ssh; do
+                   if ! ufw allow "${sp}/tcp" &>/dev/null; then
+                       echo -e "${RED}放行 SSH 端口 ${sp}/tcp 失败，已取消启用防火墙。${PLAIN}"
+                       allow_ok=0
+                       break
+                   fi
+               done
+               if [ "$allow_ok" -eq 1 ]; then
+                   echo -e "${YELLOW}已自动保留 SSH 端口：${detected_ssh} (tcp)，防止锁死。${PLAIN}"
+                   yes | ufw enable && echo -e "${GREEN}防火墙已启用${PLAIN}"
+               fi ;;
+            4) ufw disable && echo -e "${YELLOW}防火墙已关闭${PLAIN}" ;;
+            5) ufw reload && echo -e "${GREEN}已重载${PLAIN}" ;;
             0) return ;;
             *) echo -e "${RED}无效选项！${PLAIN}" ;;
         esac
@@ -1640,7 +1885,7 @@ bbr_os_family() {
 bbr_require_tc() {
     command -v tc >/dev/null 2>&1 && return 0
     if [ "$OS_FAMILY" = "alpine" ]; then
-        echo -e "${BLUE}⏳ 安装 iproute2（提供 tc）...${PLAIN}"
+        echo -e "${BLUE}正在安装 iproute2（提供 tc）...${PLAIN}"
         apk add --no-cache iproute2 >/dev/null 2>&1
     fi
     command -v tc >/dev/null 2>&1
@@ -1673,9 +1918,12 @@ bbr_show_status() {
 bbr_apply() {
     local cc="$1" qdisc="$2" label="$3" avail iface cur_cc cur_qd cur_qd_live bak="" have_tc=0
     bbr_require_tc && have_tc=1
+    if [ "$cc" = "bbr" ]; then
+        modprobe tcp_bbr >/dev/null 2>&1 || true
+    fi
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
     if ! printf '%s\n' $avail | grep -x -- "$cc" >/dev/null; then
-        echo -e "${RED}❌ 当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
+        echo -e "${RED}当前内核不支持 ${cc}（可用: ${avail}）${PLAIN}"
         return 1
     fi
 
@@ -1685,14 +1933,14 @@ bbr_apply() {
         if [ "$cur_qd_live" != "$qdisc" ]; then
             # 默认队列只影响新建的网卡队列，已在跑的网卡必须手动替换；顺便用它验证内核是否支持
             if ! tc qdisc replace dev "$iface" root "$qdisc" >/dev/null 2>&1; then
-                echo -e "${RED}❌ 当前内核没有 ${qdisc} 这个队列算法（tc 替换失败），配置未做任何改动。${PLAIN}"
+                echo -e "${RED}当前内核没有 ${qdisc} 这个队列算法（tc 替换失败），配置未做任何改动。${PLAIN}"
                 echo -e "${YELLOW}   ${iface} 现用 ${cur_qd_live}；要 ${qdisc} 只能换一个带该算法（CONFIG_NET_SCH_FQ）的内核。${PLAIN}"
                 return 1
             fi
         fi
     fi
 
-    [ "$have_tc" = "0" ] && echo -e "${YELLOW}⚠ 没有 tc（iproute2 未装）→ 跳过队列实测/替换，只写 sysctl 持久化。${PLAIN}"
+    [ "$have_tc" = "0" ] && echo -e "${YELLOW}没有 tc（iproute2 未装）-> 跳过队列实测/替换，只写 sysctl 持久化。${PLAIN}"
 
     mkdir -p /etc/sysctl.d
     [ -f "$BBR_CONF" ] && { bak=$(mktemp); cp -p "$BBR_CONF" "$bak"; }
@@ -1703,22 +1951,22 @@ bbr_apply() {
     } > "$BBR_CONF"
     chmod 644 "$BBR_CONF"
 
-    modprobe tcp_bbr >/dev/null 2>&1 || true
     sysctl -q -w "net.core.default_qdisc=${qdisc}" "net.ipv4.tcp_congestion_control=${cc}" >/dev/null 2>&1
 
     cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     if [ "$cur_cc" = "$cc" ] && [ "$cur_qd" = "$qdisc" ]; then
+        rm -f "$bak"
         local live="n/a"
         [ "$have_tc" = "1" ] && live=$(tc qdisc show dev "${iface:-eth0}" 2>/dev/null | awk 'NR==1{print $2}')
-        echo -e "${GREEN}✅ 已切换到 ${label}${PLAIN}"
+        echo -e "${GREEN}已切换到 ${label}${PLAIN}"
         echo -e "   算法=${cur_cc}  默认队列=${cur_qd}  ${iface:-?} 实际队列=${live}"
         echo -e "   持久化=${BBR_CONF}（重启后自动生效）"
         echo -e "${YELLOW}   注意：已建立的 TCP 连接沿用旧算法，新连接才生效。${PLAIN}"
     else
         if [ -n "$bak" ]; then cp -p "$bak" "$BBR_CONF"; else rm -f "$BBR_CONF"; fi
         rm -f "$bak"
-        echo -e "${RED}❌ 回读校验不一致：算法=${cur_cc} 队列=${cur_qd}（期望 ${cc} / ${qdisc}）${PLAIN}"
+        echo -e "${RED}回读校验不一致：算法=${cur_cc} 队列=${cur_qd}（期望 ${cc} / ${qdisc}）${PLAIN}"
         echo -e "${YELLOW}   已把 ${BBR_CONF} 恢复原样。${PLAIN}"
         return 1
     fi
@@ -1785,25 +2033,25 @@ bbr_list_kernels() {
 # 从 BBR3_REPO 安装 BBRv3 内核（deb 系；不自动重启）
 # 注：这些包是 defconfig 构建，没有 CONFIG_NET_SCH_FQ → 装完用 fq_codel。
 bbr_install_kernel() {
-    local arch fam resp tags sel tag ver url_img url_hdr tmp i
+    local arch fam resp tags sel tag url_img url_hdr tmp i hdr_file
     arch=$(uname -m)
-    [ "$arch" = "x86_64" ] || { echo -e "${RED}❌ ${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核。${PLAIN}"; return 1; }
+    [ "$arch" = "x86_64" ] || { echo -e "${RED}${BBR3_REPO} 只提供 amd64 的 deb（当前 ${arch}）。ARM 请用发行版自带内核。${PLAIN}"; return 1; }
     fam=$(bbr_os_family)
     [ "$fam" = "debian" ] || {
-        echo -e "${RED}❌ BBRv3 内核安装只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"
+        echo -e "${RED}BBRv3 内核安装只处理 deb 系（Debian / Ubuntu），当前系统判定为 ${fam}。${PLAIN}"
         [ "$fam" = "alpine" ] && echo -e "${YELLOW}   Alpine 请用官方内核：apk add linux-lts（或 linux-virt / linux-edge），重启后在菜单里选一次「BBR + fq_codel」。${PLAIN}"
         return 1
     }
 
-    echo -e "${BLUE}⏳ 正在从 ${BBR3_REPO} 获取可用版本...${PLAIN}"
+    echo -e "${BLUE}正在从 ${BBR3_REPO} 获取可用版本...${PLAIN}"
     resp=$(curl -sL --max-time 25 "https://api.github.com/repos/${BBR3_REPO}/releases?per_page=100" 2>/dev/null)
     tags=$(jq -r '.[].tag_name' <<<"$resp" 2>/dev/null | grep -E -- '-bbr3-amd64$' | head -6)
     if [ -z "$tags" ]; then
-        echo -e "${RED}❌ 取不到版本列表（GitHub API 限流 / 无外网）。退路：VPSBox 的 BBR 菜单，或手动 dpkg 安装 deb。${PLAIN}"
+        echo -e "${RED}取不到版本列表（GitHub API 限流 / 无外网）。退路：VPSBox 的 BBR 菜单，或手动 dpkg 安装 deb。${PLAIN}"
         return 1
     fi
 
-    echo -e "${BLUE}可用 BBRv3 内核（新 → 旧）：${PLAIN}"
+    echo -e "${BLUE}可用 BBRv3 内核（新 -> 旧）：${PLAIN}"
     i=0
     while read -r tag; do
         [ -z "$tag" ] && continue
@@ -1818,31 +2066,45 @@ bbr_install_kernel() {
 
     url_img=$(jq -r --arg t "$tag" '.[] | select(.tag_name==$t) | .assets[].browser_download_url' <<<"$resp" 2>/dev/null | grep -E '/linux-image-[^/]*amd64\.deb$' | head -1)
     url_hdr=$(jq -r --arg t "$tag" '.[] | select(.tag_name==$t) | .assets[].browser_download_url' <<<"$resp" 2>/dev/null | grep -E '/linux-headers-[^/]*amd64\.deb$' | head -1)
-    [ -n "$url_img" ] || { echo -e "${RED}❌ 该版本没有 amd64 image 资产。${PLAIN}"; return 1; }
+    [ -n "$url_img" ] || { echo -e "${RED}该版本没有 amd64 image 资产。${PLAIN}"; return 1; }
 
-    tmp=$(mktemp -d /tmp/bbr3-XXXXXX)
-    echo -e "${BLUE}⏳ 下载 $(basename "$url_img") ...${PLAIN}"
-    curl -fL --max-time 600 -o "$tmp/$(basename "$url_img")" "$url_img" || { echo -e "${RED}❌ image 下载失败（文件留在 ${tmp}）。${PLAIN}"; return 1; }
+    tmp=$(mktemp -d /tmp/bbr3-XXXXXX) || return 1
+    echo -e "${BLUE}正在下载 $(basename "$url_img") ...${PLAIN}"
+    if ! curl -fL --max-time 600 -o "$tmp/$(basename "$url_img")" "$url_img"; then
+        rm -rf -- "$tmp"
+        echo -e "${RED}image 下载失败，已清理临时目录。${PLAIN}"
+        return 1
+    fi
     if [ -n "$url_hdr" ]; then
-        echo -e "${BLUE}⏳ 下载 $(basename "$url_hdr") ...${PLAIN}"
-        curl -fL --max-time 600 -o "$tmp/$(basename "$url_hdr")" "$url_hdr" || echo -e "${YELLOW}  ⚠️ headers 下载失败，只装 image。${PLAIN}"
+        hdr_file="$tmp/$(basename "$url_hdr")"
+        echo -e "${BLUE}正在下载 $(basename "$url_hdr") ...${PLAIN}"
+        if ! curl -fL --max-time 600 -o "$hdr_file" "$url_hdr"; then
+            rm -f -- "$hdr_file"
+            echo -e "${YELLOW}  headers 下载失败（已移除残余文件），只装 image。${PLAIN}"
+        fi
     fi
 
     echo -e "\n${YELLOW}即将 dpkg 安装 ${tag} 并更新 GRUB 默认项。${PLAIN}"
     echo -e "${RED}注意：需要重启才生效；新内核起不来时用 VPS 控制台（VNC）选旧内核回退。${PLAIN}"
-    echo -e "${YELLOW}  注：${BBR3_REPO} 的内核是 defconfig 构建 → 没有 fq（只有 fq_codel）。${PLAIN}"
+    echo -e "${YELLOW}  注：${BBR3_REPO} 的内核是 defconfig 构建 -> 没有 fq（只有 fq_codel）。${PLAIN}"
     read -rp "确认安装？输入 yes 继续: " conf
-    [ "$conf" = "yes" ] || { echo -e "${YELLOW}已取消（deb 文件留在 ${tmp}）。${PLAIN}"; return; }
+    [ "$conf" = "yes" ] || { rm -rf -- "$tmp"; echo -e "${YELLOW}已取消并清理临时文件。${PLAIN}"; return; }
 
     if dpkg -i "$tmp"/*.deb; then
+        rm -rf -- "$tmp"
         command -v update-grub >/dev/null 2>&1 && update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null
-        echo -e "${GREEN}✅ 安装完成，重启后生效： ${YELLOW}reboot${PLAIN}"
+        echo -e "${GREEN}安装完成，重启后生效： ${YELLOW}reboot${PLAIN}"
         bbr_post_install_check
         echo -e "   重启回来后在「网络加速」里选一次「BBR + fq_codel」确认即可。"
     else
-        echo -e "${RED}❌ dpkg 安装失败，尝试补齐依赖...${PLAIN}"
-        apt-get -f install -y && update-grub 2>/dev/null
-        echo -e "${YELLOW}若仍失败，deb 文件保留在 ${tmp} 可手动处理。${PLAIN}"
+        echo -e "${RED}dpkg 安装失败，尝试补齐依赖...${PLAIN}"
+        if apt-get -f install -y && update-grub 2>/dev/null; then
+            rm -rf -- "$tmp"
+            echo -e "${GREEN}依赖已补齐并完成安装。${PLAIN}"
+        else
+            echo -e "${YELLOW}若仍失败，deb 文件保留在 ${tmp} 可手动处理。${PLAIN}"
+            return 1
+        fi
     fi
 }
 
@@ -1897,14 +2159,14 @@ tcp_buf_save_baseline() {
 # $1 = 目标上限 MB；只抬 max，保留 min/default = 当前内核自动调优值
 tcp_buf_apply() {
     local mb="$1" ram max cur_rm cur_wm def_r def_w bak=""
-    case "$mb" in ''|*[!0-9]*) echo -e "${RED}❌ 请输入纯数字 MB。${PLAIN}"; return 1 ;; esac
+    case "$mb" in ''|*[!0-9]*) echo -e "${RED}请输入纯数字 MB。${PLAIN}"; return 1 ;; esac
     if [ "$mb" -lt 1 ] || [ "$mb" -gt 512 ]; then
-        echo -e "${RED}❌ 请输入 1-512 之间的 MB。${PLAIN}"; return 1
+        echo -e "${RED}请输入 1-512 之间的 MB。${PLAIN}"; return 1
     fi
     ram=$(tcp_mem_total_mb); max=$(( mb * 1024 * 1024 ))
     # 内存护栏：单条上限 > 内存 1/8 时要人确认（连接多可能吃光内存）
     if [ "$max" -gt $(( ram * 1024 * 1024 / 8 )) ]; then
-        echo -e "${YELLOW}⚠ ${mb}MB 超过物理内存(${ram}MB)的 1/8，连接多时有 OOM 风险。${PLAIN}"
+        echo -e "${YELLOW}${mb}MB 超过物理内存(${ram}MB)的 1/8，连接多时有 OOM 风险。${PLAIN}"
         read -rp "  仍要继续？[y/N]: " y; case "$y" in y|Y) ;; *) echo -e "${YELLOW}已取消。${PLAIN}"; return 1 ;; esac
     fi
     def_r=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $1, $2}'); [ -n "$def_r" ] || def_r="4096 131072"
@@ -1929,28 +2191,28 @@ tcp_buf_apply() {
     cur_wm=$(sysctl -n net.core.wmem_max 2>/dev/null)
     if [ "$cur_rm" = "$max" ] && [ "$cur_wm" = "$max" ]; then
         rm -f "$bak"
-        echo -e "${GREEN}✅ TCP 缓冲区上限已设为 ${mb} MB（min/default 保持内核默认，队列不变）${PLAIN}"
+        echo -e "${GREEN}TCP 缓冲区上限已设为 ${mb} MB（min/default 保持内核默认，队列不变）${PLAIN}"
         echo -e "   持久化=${TCP_BUF_CONF}（重启后自动生效）"
         echo -e "${YELLOW}   注意：只影响新建连接；代理转发瓶颈通常在 CPU/队列，缓冲区够用即可。${PLAIN}"
     else
         if [ -n "$bak" ]; then cp -p "$bak" "$TCP_BUF_CONF"; else rm -f "$TCP_BUF_CONF"; fi
         rm -f "$bak"
-        echo -e "${RED}❌ 回读不一致：rmem_max=${cur_rm} wmem_max=${cur_wm}（期望 ${max}）→ 已回滚配置。${PLAIN}"
+        echo -e "${RED}回读不一致：rmem_max=${cur_rm} wmem_max=${cur_wm}（期望 ${max}）-> 已回滚配置。${PLAIN}"
         return 1
     fi
 }
 
-# 带宽(Mbps) × RTT(ms) 估算 BDP → 推荐 MB
+# 带宽(Mbps) × RTT(ms) 估算 BDP -> 推荐 MB
 tcp_buf_estimate() {
     local bw rtt bdp mb
     read -rp "  估算带宽 (Mbps, 回车默认 200): " bw; bw=${bw:-200}
     read -rp "  往返延迟 RTT (ms, 回车默认 150): " rtt; rtt=${rtt:-150}
-    case "${bw}${rtt}" in *[!0-9]*) echo -e "${RED}❌ 带宽/RTT 需为纯数字。${PLAIN}"; return 1 ;; esac
-    { [ "$bw" -gt 0 ] && [ "$rtt" -gt 0 ]; } || { echo -e "${RED}❌ 带宽/RTT 需大于 0。${PLAIN}"; return 1; }
+    case "${bw}${rtt}" in *[!0-9]*) echo -e "${RED}带宽/RTT 需为纯数字。${PLAIN}"; return 1 ;; esac
+    { [ "$bw" -gt 0 ] && [ "$rtt" -gt 0 ]; } || { echo -e "${RED}带宽/RTT 需大于 0。${PLAIN}"; return 1; }
     # BDP(字节) = 带宽(bit/s) × RTT(s) ÷ 8；取 2× 余量后向上取整到整数 MB
     bdp=$(( bw * 1000000 / 8 * rtt / 1000 ))
     mb=$(( (bdp * 2 + 1048575) / 1048576 )); [ "$mb" -lt 1 ] && mb=1
-    echo -e "  BDP ≈ $(tcp_bytes_to_mb "$bdp") MB → 含 2× 余量推荐 ${GREEN}${mb} MB${PLAIN}"
+    echo -e "  BDP ≈ $(tcp_bytes_to_mb "$bdp") MB -> 含 2× 余量推荐 ${GREEN}${mb} MB${PLAIN}"
     read -rp "  按此值应用？[Y/n]: " y; case "$y" in n|N) echo -e "${YELLOW}已取消。${PLAIN}"; return ;; esac
     tcp_buf_apply "$mb"
 }
@@ -1968,7 +2230,7 @@ tcp_buf_restore() {
         [ -n "$b_tr" ] && sysctl -q -w "net.ipv4.tcp_rmem=${b_tr}" >/dev/null 2>&1
         [ -n "$b_tw" ] && sysctl -q -w "net.ipv4.tcp_wmem=${b_tw}" >/dev/null 2>&1
         rm -f "$TCP_BUF_BASELINE"
-        echo -e "${GREEN}✅ 已恢复到首次调优前的内核原值，并删除面板覆盖。${PLAIN}"
+        echo -e "${GREEN}已恢复到首次调优前的内核原值，并删除面板覆盖。${PLAIN}"
     elif [ -f "$TCP_BUF_CONF" ]; then
         rm -f "$TCP_BUF_CONF"
         echo -e "${YELLOW}已删除面板覆盖 ${TCP_BUF_CONF}（无基线记录）。${PLAIN}"
@@ -2043,12 +2305,13 @@ menu_tools() {
         menu_section "网络检测"
         menu_option 1 "流媒体解锁检测（快速）"
         menu_option 2 "流媒体解锁检测（完整社区脚本）"
-        menu_option 7 "回程路由测试（BestTrace / 三网及教育网）"
         menu_section "系统网络"
         menu_option 3 "DNS 设置"
         menu_option 4 "防火墙设置（ufw）"
         menu_option 5 "网络加速（BBR / BBRv3 + fq）"
         menu_option 6 "Swap 管理（添加 / 删除）"
+        menu_section "路由测试"
+        menu_option 7 "回程路由测试（BestTrace / 三网及教育网）"
         menu_back
         read_menu_choice "请选择 [0-7]"; c="$REPLY"
         case "$c" in
@@ -2191,7 +2454,7 @@ swap_create() {
         fi
         return 1
     fi
-    printf '✅ 已创建并启用 %s MiB Swap，开机自动启用。\n' "$mb"
+    printf '已创建并启用 %s MiB Swap，开机自动启用。\n' "$mb"
 }
 
 swap_delete() {
@@ -2230,7 +2493,7 @@ swap_delete() {
     fi
     rm -f "$SB_SWAP_MARKER"
     rmdir "$SB_SWAP_DIR" || printf '目录中还有其他文件，已保留目录。\n' >&2
-    printf '✅ 已删除本面板创建的 Swap。\n'
+    printf '已删除本面板创建的 Swap。\n'
 }
 
 menu_swap() {
@@ -2351,12 +2614,8 @@ add_warp() (
     candidate=$(jq --slurpfile ep /dev/fd/3 '
         .endpoints = ([.endpoints[]? | select(.tag != "warp")] + $ep) |
         .outbounds = [.outbounds[]? | select(.tag != "warp")]' 3<<< "$endpoint" "$CONFIG_FILE") || exit 1
-    save_and_check_config "$candidate" || exit 1
+    apply_config_and_restart "$candidate" || exit 1
     rm -f "$WARP_META"
-    if ! svc_restart; then
-        printf '配置已保存，但服务重启失败；上一版配置在 %s.bak。\n' "$CONFIG_FILE" >&2
-        exit 1
-    fi
     addresses=$(jq -r '.address | join(" / ")' <<< "$endpoint")
     printf '%bWARP 出口添加成功。%b\n' "$GREEN" "$PLAIN"
     printf '  出口标签 : %bwarp%b（wireguard endpoint）\n' "$BLUE" "$PLAIN"
@@ -2370,39 +2629,19 @@ add_warp_node_route() {
         echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
     fi
 
-    local tags=() i=0 n=0 tag choice selected
-    while [ $i -lt "$(inbound_count)" ]; do
-        tag=$(inbound_field "$i" "tag")
-        if [ "$(inbound_field "$i" "type")" == "vless" ] && [ -n "$tag" ]; then
-            tags+=("$tag")
-            n=$((n+1))
-            echo "  $n. $tag"
-        fi
-        i=$((i+1))
-    done
-    if [ "$n" -eq 0 ]; then
-        echo -e "${YELLOW}当前没有 VLESS 节点。${PLAIN}"; return
-    fi
+    local real_idx selected temp_json
+    real_idx=$(prompt_delete_index "要全部走 WARP 的节点" node)
+    [ -z "$real_idx" ] && return
+    selected=$(inbound_field "$real_idx" "tag")
+    [ -n "$selected" ] || return 1
 
-    read -rp "选择要全部走 WARP 的节点 [1-$n]: " choice
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
-        echo -e "${RED}无效序号。${PLAIN}"; return
-    fi
-    selected="${tags[$((choice-1))]}"
-
-    local temp_json
     temp_json=$(jq --arg tag "$selected" '
         .route = (.route // {})
         | .route.rules = ([{"inbound":[$tag],"outbound":"warp"}] +
-            [(.route.rules // [])[] | select((.inbound? // []) | index($tag) | not)])
-    ' "$CONFIG_FILE")
-    if save_and_check_config "$temp_json"; then
-        svc_restart
-        if svc_active; then
-            echo -e "${GREEN}✅ 节点 [$selected] 已设置为全部走 WARP。${PLAIN}"
-        else
-            echo -e "${RED}❌ 配置已写入，但 sing-box 重启失败，请查看日志。${PLAIN}"
-        fi
+            [(.route.rules // [])[] | select((.inbound? // []) | (if type == "array" then index($tag) == null else . != $tag end))])
+    ' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
+        echo -e "${GREEN}节点 [$(node_display_name "$selected")] 已设置为全部走 WARP。${PLAIN}"
     fi
 }
 
@@ -2422,10 +2661,9 @@ add_warp_route() {
     temp_json=$(jq --argjson doms "$arr" '
         .route = (.route // {})
         | .route.rules = (.route.rules // [])
-        | .route.rules += [{"domain_suffix": $doms, "outbound": "warp"}]' "$CONFIG_FILE")
-    if save_and_check_config "$temp_json"; then
-        svc_restart
-        echo -e "${GREEN}✅ 已添加分流规则：$doms → warp${PLAIN}"
+        | .route.rules += [{"domain_suffix": $doms, "outbound": "warp"}]' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
+        echo -e "${GREEN}已添加分流规则：$doms -> warp${PLAIN}"
     fi
 }
 
@@ -2457,13 +2695,13 @@ toggle_warp_ruleset() {
           .route.rule_set = [.route.rule_set[]? | select(.tag as $x | ($drop | index($x)) == null)] |
           .route.rules = [.route.rules[]? | select(
             .outbound != "warp" or (
-              (.rule_set != $t) and
-              ((.rule_set | type) != "array" or (all(.rule_set[]; . as $x | ($drop | index($x)) == null)))
+              .rule_set as $rs |
+              (($rs | type) != "string" or ($drop | index($rs)) == null) and
+              (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
             )
           )]
         ' "$CONFIG_FILE") || return 1
-        if save_and_check_config "$temp_json"; then
-            svc_restart
+        if apply_config_and_restart "$temp_json"; then
             printf '%b%s 已关闭。%b\n' "$GREEN" "$r_name" "$PLAIN"
         fi
     else
@@ -2480,15 +2718,15 @@ toggle_warp_ruleset() {
           .route.rules = (
             [.route.rules[]? | select(
               .outbound != "warp" or (
-                (.rule_set != $t) and
-                ((.rule_set | type) != "array" or (all(.rule_set[]; . as $x | ($drop | index($x)) == null)))
+                .rule_set as $rs |
+                (($rs | type) != "string" or ($drop | index($rs)) == null) and
+                (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
               )
             )] +
             [{"action": "route", "rule_set": $t, "outbound": "warp"}]
           )
         ' "$CONFIG_FILE") || return 1
-        if save_and_check_config "$temp_json"; then
-            svc_restart
+        if apply_config_and_restart "$temp_json"; then
             printf '%b%s 已开启 -> warp（%s）。%b\n' "$GREEN" "$r_name" "$r_file" "$PLAIN"
             printf '%b首次启动会自动下载规则集，默认每 24 小时自动更新。%b\n' "$YELLOW" "$PLAIN"
         fi
@@ -2517,7 +2755,7 @@ view_warp_rules() {
     n=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
     echo -e "${CYAN}=== 指向 WARP 的分流规则（共 ${n:-0} 条）===${PLAIN}"
     if [ "${n:-0}" -eq 0 ]; then
-        echo -e "${YELLOW}暂无规则。可用菜单 3/4/5 添加。${PLAIN}"; return
+        echo -e "${YELLOW}暂无规则。可用菜单 4/5/6/7 添加。${PLAIN}"; return
     fi
     jq -r '
       [.route.rules[]? | select((.outbound? // "") == "warp")]
@@ -2531,7 +2769,7 @@ view_warp_rules() {
           (if ($r.domain_keyword? // null) != null then "关键词: "   + (($r.domain_keyword | if type == "array" then join(",") else tostring end)) else empty end),
           (if ($r.ip_cidr?       // null) != null then "IP: "       + (($r.ip_cidr       | if type == "array" then join(",") else tostring end)) else empty end)
         ] | map(select(. != "")) | join("  |  ")) as $detail
-      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量 → warp" else $detail end)
+      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量 -> warp" else $detail end)
     ' "$CONFIG_FILE"
 }
 
@@ -2554,10 +2792,16 @@ delete_warp_rule() {
     abs=$(jq --argjson k "$((idx-1))" '
       [.route.rules | to_entries[] | select((.value.outbound? // "") == "warp") | .key][$k]' "$CONFIG_FILE")
     local temp_json
-    temp_json=$(jq --argjson i "$abs" '.route.rules |= (.[:$i] + .[$i+1:])' "$CONFIG_FILE")
-    if save_and_check_config "$temp_json"; then
-        svc_restart
-        echo -e "${GREEN}✅ 已删除第 $idx 条 warp 分流规则。${PLAIN}"
+    temp_json=$(jq --argjson i "$abs" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
+      .route.rules |= (.[:$i] + .[$i+1:]) |
+      if .route.rule_set then
+        ([.route.rules[]?.rule_set? | if type == "array" then .[] else . end] | map(strings)) as $used |
+        .route.rule_set |= [.[] | select(
+          .tag as $x | ($x != $ai and $x != $media) or (($used | index($x)) != null)
+        )]
+      else . end' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
+        echo -e "${GREEN}已删除第 $idx 条 warp 分流规则。${PLAIN}"
     fi
 }
 
@@ -2567,15 +2811,14 @@ delete_warp() {
         echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
     fi
     local temp_json
-    temp_json=$(jq '
+    temp_json=$(jq --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
         .endpoints |= ((. // []) | map(select(.tag != "warp")))
         | if .route then
             .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")])
-            | .route.rule_set = ([(.route.rule_set // [])[] | select(.tag != "geosite-ai" and .tag != "geosite-stream")])
-          else . end' "$CONFIG_FILE")
-    if save_and_check_config "$temp_json"; then
+            | .route.rule_set = ([(.route.rule_set // [])[] | select(.tag != $ai and .tag != $media)])
+          else . end' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
         rm -f "$WARP_META"
-        svc_restart
         printf '%bWARP 出口已删除（含指向 warp 的路由规则与规则集）。%b\n' "$GREEN" "$PLAIN"
     fi
 }

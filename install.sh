@@ -21,8 +21,8 @@ INSTALL_PATH="/usr/local/bin/sb"
 ALIAS_PATH="/usr/local/bin/SB"
 
 msg() { printf '%b[*]%b %b\n' "$BLUE" "$PLAIN" "$1"; }
-ok()  { printf '%b[✓]%b %b\n' "$GREEN" "$PLAIN" "$1"; }
-err() { printf '%b[✗]%b %b\n' "$RED" "$PLAIN" "$1" >&2; }
+ok()  { printf '%b[OK]%b %b\n' "$GREEN" "$PLAIN" "$1"; }
+err() { printf '%b[ERR]%b %b\n' "$RED" "$PLAIN" "$1" >&2; }
 
 [ "$(id -u)" -ne 0 ] && err "请使用 root 用户运行安装器！" && exit 1
 
@@ -88,14 +88,18 @@ install_deps() {
 # ---------- 下载主脚本 ----------
 download_script() {
     msg "下载管理脚本 -> ${INSTALL_PATH}"
-    tmp=$(mktemp)
-    if ! curl -sL --max-time 60 -o "$tmp" "$REPO_RAW"; then
+    tmp=$(mktemp) || return 1
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "$tmp" "$REPO_RAW"; then
         err "下载失败，请检查网络或稍后重试"
         rm -f "$tmp"; return 1
     fi
-    # 简单完整性校验：确认是 bash 脚本
-    if ! head -n1 "$tmp" | grep -q 'bash'; then
+    # 完整性与语法校验：防止拉到错误页或截断脚本覆盖现役面板
+    if [ ! -s "$tmp" ] || ! head -n1 "$tmp" | grep -q 'bash'; then
         err "下载内容异常（非脚本），已放弃安装"
+        rm -f "$tmp"; return 1
+    fi
+    if command -v bash >/dev/null 2>&1 && ! bash -n "$tmp" 2>/dev/null; then
+        err "下载脚本语法校验失败（可能截断或损坏），已放弃安装"
         rm -f "$tmp"; return 1
     fi
     install -m 755 "$tmp" "$INSTALL_PATH" || { cp "$tmp" "$INSTALL_PATH" && chmod 755 "$INSTALL_PATH"; }

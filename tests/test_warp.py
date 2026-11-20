@@ -66,6 +66,7 @@ printf '%s\n' "$ep"
             '_warp_registration_endpoint',
             'has_warp_endpoint',
             'save_and_check_config',
+            'apply_config_and_restart',
             'add_warp',
         ])
         with tempfile.TemporaryDirectory() as folder:
@@ -74,7 +75,7 @@ printf '%s\n' "$ep"
 set -euo pipefail
 D="$1"; BIN_FILE="$2"
 CONFIG_FILE="$D/etc/config.json"; WARP_META="$D/etc/.meta/warp.json"
-RED=""; GREEN=""; YELLOW=""; BLUE=""; PLAIN=""
+RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; PLAIN=""
 mkdir -p "$D/etc/.meta"
 touch "$WARP_META"
 cat > "$CONFIG_FILE" <<'JSON'
@@ -90,7 +91,9 @@ cat > "$CONFIG_FILE" <<'JSON'
 }
 JSON
 ensure_config() { test -f "$CONFIG_FILE"; }
+svc_active() { return 0; }
 svc_restart() { :; }
+sleep() { :; }
 curl() {
     [[ "$*" == *api.cloudflareclient.com/v0a2158/reg* ]] || return 1
     printf '{"config":{"client_id":"1fbA","interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700::2"}},"peers":[{"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="}]}}\n'
@@ -120,9 +123,12 @@ test ! -e "$WARP_META"
             'has_warp_endpoint',
             'has_warp_ruleset',
             'save_and_check_config',
+            'apply_config_and_restart',
             'toggle_warp_ruleset',
             'add_warp_ai',
             'add_warp_media',
+            'view_warp_rules',
+            'delete_warp_rule',
             'delete_warp',
         ])
         with tempfile.TemporaryDirectory() as folder:
@@ -131,7 +137,7 @@ test ! -e "$WARP_META"
 set -euo pipefail
 D="$1"; BIN_FILE="$2"
 CONFIG_FILE="$D/etc/config.json"; WARP_META="$D/etc/.meta/warp.json"
-RED=""; GREEN=""; YELLOW=""; BLUE=""; PLAIN=""
+RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; PLAIN=""
 mkdir -p "$D/etc/.meta"
 keys=$("$BIN_FILE" generate wg-keypair)
 priv=$(awk '/^PrivateKey:/{print $2}' <<< "$keys")
@@ -148,17 +154,21 @@ jq -n --arg priv "$priv" '{
   route: {
     rule_set: [
       {tag: "geosite-openai", type: "remote", format: "binary", url: "https://example.invalid/old.srs"},
+      {tag: "geosite-anthropic", type: "remote", format: "binary", url: "https://example.invalid/old2.srs"},
       {tag: "custom-keep", type: "remote", format: "binary", url: "https://example.invalid/keep.srs"}
     ],
     rules: [
       {rule_set: ["geosite-openai"], outbound: "warp"},
+      {rule_set: "geosite-anthropic", outbound: "warp"},
       {domain_suffix: ["keep.example"], outbound: "warp"}
     ],
     final: "direct"
   }
 }' > "$CONFIG_FILE"
 ensure_config() { test -f "$CONFIG_FILE"; }
+svc_active() { return 0; }
 svc_restart() { :; }
+sleep() { :; }
 ''' + consts + '\n' + funcs + r'''
 add_warp_ai
 "$BIN_FILE" check -c "$CONFIG_FILE"
@@ -166,7 +176,7 @@ has_warp_ruleset geosite-ai
 jq -e '.route.rule_set | map(.tag) == ["custom-keep", "geosite-ai"]' "$CONFIG_FILE" >/dev/null
 jq -e '.route.rule_set[] | select(.tag == "geosite-ai") | .url == "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ai-chat-!cn.srs" and (has("download_detour") | not)' "$CONFIG_FILE" >/dev/null
 jq -e '.route.default_http_client == "rs-http" and (.http_clients | map(.tag) == ["rs-http"])' "$CONFIG_FILE" >/dev/null
-jq -e '.route.rules | any(.rule_set == "geosite-ai" and .outbound == "warp") and any(.domain_suffix == ["keep.example"]) and (any(.rule_set == ["geosite-openai"]) | not)' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rules | any(.rule_set == "geosite-ai" and .outbound == "warp") and any(.domain_suffix == ["keep.example"]) and (any(.rule_set == ["geosite-openai"]) | not) and (any(.rule_set == "geosite-anthropic") | not)' "$CONFIG_FILE" >/dev/null
 
 add_warp_media
 "$BIN_FILE" check -c "$CONFIG_FILE"
@@ -177,6 +187,11 @@ add_warp_ai
 "$BIN_FILE" check -c "$CONFIG_FILE"
 ! has_warp_ruleset geosite-ai
 jq -e '.route.rule_set | map(.tag) == ["custom-keep", "geosite-stream"]' "$CONFIG_FILE" >/dev/null
+
+# 删除规则集对应的路由规则时，同步清理不再被引用的 geosite-stream 定义
+delete_warp_rule <<< '2'
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.route.rule_set | map(.tag) == ["custom-keep"]' "$CONFIG_FILE" >/dev/null
 
 delete_warp
 "$BIN_FILE" check -c "$CONFIG_FILE"

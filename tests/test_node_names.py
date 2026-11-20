@@ -14,7 +14,8 @@ class NodeNamesTests(unittest.TestCase):
         names = ["node_display_name", "read_node_name", "save_node_name",
                  "node_link_fragment", "rename_node", "prompt_delete_index",
                  "inbound_count", "inbound_field", "inbound_node_type", "count_by_type",
-                 "ss2022_count", "view_node_links",
+                 "ss2022_count", "format_url_host", "apply_config_and_restart",
+                 "view_node_links",
                  "add_reality_node", "add_anytls_node", "menu_nodes", "delete_node"]
         functions = []
         for name in names:
@@ -32,7 +33,9 @@ REALITY_META="$META_DIR/reality.txt"
 ensure_config() { :; }
 get_public_ip() { printf '192.0.2.1'; }
 get_reality_pubkey() { printf 'public-key'; }
+svc_active() { return 0; }
 svc_restart() { echo unexpected-restart >&2; return 99; }
+sleep() { :; }
 command() { if [ "$1" = -v ] && [ "$2" = qrencode ]; then return 1; else builtin command "$@"; fi; }
 cat > "$CONFIG_FILE" <<'JSON'
 {"inbounds":[{"type":"vless","tag":"vless-reality-443","listen_port":443,"users":[{"uuid":"test-uuid"}],"tls":{"server_name":"example.com","reality":{"short_id":["abc"]}}},{"type":"anytls","tag":"anytls-reality-8444","listen_port":8444,"users":[{"password":"test-password"}],"tls":{"server_name":"example.com","reality":{"short_id":["def"]}}}],"route":{"rules":[{"inbound":["vless-reality-443"],"outbound":"direct"}]}}

@@ -36,10 +36,13 @@ command() { if [[ "$1 $2" == '-v qrencode' ]]; then return 1; fi; builtin comman
         core = os.environ.get('SING_BOX_TEST_BIN') or shutil.which('sing-box')
         if not core:
             self.skipTest('set SING_BOX_TEST_BIN to check with a real sing-box core')
-        self.run_shell('add_ss2022_node ss2022_link ss2022_count port_in_use '
-                       'save_and_check_config read_node_name save_node_name node_display_name '
+        self.run_shell('add_ss2022_node ss2022_link ss2022_count port_in_use read_valid_port '
+                       'format_url_host save_and_check_config apply_config_and_restart '
+                       'read_node_name save_node_name node_display_name '
                        'node_link_fragment inbound_count inbound_field inbound_node_type count_by_type '
                        'view_node_links rename_node prompt_delete_index delete_node remove_reality_meta', r'''
+ss() { return 1; }
+netstat() { return 1; }
 svc_active() { return 0; }
 svc_restart() { :; }
 open_firewall_port() { [[ "$1" == 8388 ]]; }
