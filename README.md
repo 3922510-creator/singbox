@@ -49,7 +49,7 @@ sudo bash singbox.sh
 ### Cloudflare WARP 分流
 
 - 基于 sing-box 1.11+ `endpoint` 架构配置 WARP
-- 仅支持 Cloudflare Zero Trust 组织的邮箱验证码登录，请通过交互式 SSH 操作（需 `python3` 和 `openssl`）。默认接入 `162.159.193.1:2408/UDP`。已有普通 WARP 可从菜单重新登录替换，不会自动开启分流。
+- 免费 WARP 账号自动注册与配置（直连 Cloudflare 官方 API，无需 Zero Trust 或第三方注册工具），默认接入 `162.159.192.8:2408/UDP`，不会自动开启分流
 - AI 服务分流（ChatGPT、Claude、Gemini 等）
 - 流媒体分流（Netflix、Disney+、YouTube 等）
 - 自定义域名、域名后缀、关键词和 IP 网段分流
