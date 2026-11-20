@@ -50,8 +50,8 @@ sudo bash singbox.sh
 
 - 基于 sing-box 1.11+ `endpoint` 架构配置 WARP
 - 免费 WARP 账号自动注册与配置（直连 Cloudflare 官方 API，无需 Zero Trust 或第三方注册工具），默认接入 `162.159.192.8:2408/UDP`，不会自动开启分流
-- AI 服务分流（ChatGPT、Claude、Gemini 等）
-- 流媒体分流（Netflix、Disney+、YouTube 等）
+- AI 分流开关（`SagerNet/sing-geosite` `geosite-category-ai-chat-!cn.srs`，默认每 24 小时自动更新）
+- 流媒体分流开关（`SagerNet/sing-geosite` `geosite-category-entertainment@!cn.srs`，默认每 24 小时自动更新）
 - 自定义域名、域名后缀、关键词和 IP 网段分流
 - 指定入站节点全部走 WARP
 - 查看和删除已添加的 WARP 规则

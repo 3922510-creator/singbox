@@ -107,6 +107,86 @@ test ! -e "$WARP_META"
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
+    def test_warp_ai_and_media_toggle_matches_sbx_rulesets(self):
+        core = os.environ.get('SING_BOX_TEST_BIN') or shutil.which('sing-box')
+        if not core:
+            self.skipTest('sing-box binary is required')
+        source = SCRIPT.read_text(encoding='utf-8')
+        consts = '\n'.join(
+            line for line in source.splitlines()
+            if line.startswith(('GEOSITE_BASE=', 'WARP_AI_RULE_', 'WARP_MEDIA_RULE_'))
+        )
+        funcs = extract_funcs(source, [
+            'has_warp_endpoint',
+            'has_warp_ruleset',
+            'save_and_check_config',
+            'toggle_warp_ruleset',
+            'add_warp_ai',
+            'add_warp_media',
+            'delete_warp',
+        ])
+        with tempfile.TemporaryDirectory() as folder:
+            res = subprocess.run(
+                ['bash', '-c', '''
+set -euo pipefail
+D="$1"; BIN_FILE="$2"
+CONFIG_FILE="$D/etc/config.json"; WARP_META="$D/etc/.meta/warp.json"
+RED=""; GREEN=""; YELLOW=""; BLUE=""; PLAIN=""
+mkdir -p "$D/etc/.meta"
+keys=$("$BIN_FILE" generate wg-keypair)
+priv=$(awk '/^PrivateKey:/{print $2}' <<< "$keys")
+jq -n --arg priv "$priv" '{
+  endpoints: [{
+    type: "wireguard",
+    tag: "warp",
+    mtu: 1280,
+    address: ["172.16.0.2/32"],
+    private_key: $priv,
+    peers: [{address: "162.159.192.8", port: 2408, public_key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", allowed_ips: ["0.0.0.0/0", "::/0"]}]
+  }],
+  outbounds: [{type: "direct", tag: "direct"}],
+  route: {
+    rule_set: [
+      {tag: "geosite-openai", type: "remote", format: "binary", url: "https://example.invalid/old.srs"},
+      {tag: "custom-keep", type: "remote", format: "binary", url: "https://example.invalid/keep.srs"}
+    ],
+    rules: [
+      {rule_set: ["geosite-openai"], outbound: "warp"},
+      {domain_suffix: ["keep.example"], outbound: "warp"}
+    ],
+    final: "direct"
+  }
+}' > "$CONFIG_FILE"
+ensure_config() { test -f "$CONFIG_FILE"; }
+svc_restart() { :; }
+''' + consts + '\n' + funcs + r'''
+add_warp_ai
+"$BIN_FILE" check -c "$CONFIG_FILE"
+has_warp_ruleset geosite-ai
+jq -e '.route.rule_set | map(.tag) == ["custom-keep", "geosite-ai"]' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rule_set[] | select(.tag == "geosite-ai") | .url == "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ai-chat-!cn.srs" and (has("download_detour") | not)' "$CONFIG_FILE" >/dev/null
+jq -e '.route.default_http_client == "rs-http" and (.http_clients | map(.tag) == ["rs-http"])' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rules | any(.rule_set == "geosite-ai" and .outbound == "warp") and any(.domain_suffix == ["keep.example"]) and (any(.rule_set == ["geosite-openai"]) | not)' "$CONFIG_FILE" >/dev/null
+
+add_warp_media
+"$BIN_FILE" check -c "$CONFIG_FILE"
+has_warp_ruleset geosite-stream
+jq -e '.route.rule_set[] | select(.tag == "geosite-stream") | .url == "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-entertainment@!cn.srs"' "$CONFIG_FILE" >/dev/null
+
+add_warp_ai
+"$BIN_FILE" check -c "$CONFIG_FILE"
+! has_warp_ruleset geosite-ai
+jq -e '.route.rule_set | map(.tag) == ["custom-keep", "geosite-stream"]' "$CONFIG_FILE" >/dev/null
+
+delete_warp
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.route.rule_set | map(.tag) == ["custom-keep"]' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rules | length == 0' "$CONFIG_FILE" >/dev/null
+''', 'test_warp_rulesets', folder, core],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

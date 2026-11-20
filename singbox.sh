@@ -2302,12 +2302,12 @@ _warp_registration_endpoint() {
     ' 3<<< "$1" <<< "$payload"
 }
 
-# geosite 规则集（SagerNet/sing-geosite rule-set 分支，.srs 二进制）
+# geosite 规则集（SagerNet/sing-geosite rule-set 分支，.srs 二进制，与 sbx 保持一致）
 GEOSITE_BASE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
-# AI ：category-ai-!cn 已聚合 ChatGPT/Claude/Gemini 等，再显式补 openai/anthropic
-WARP_AI_SITES="category-ai-!cn openai anthropic"
-# 流媒体
-WARP_MEDIA_SITES="netflix disney hbo youtube primevideo tiktok spotify hulu"
+WARP_AI_RULE_TAG="geosite-ai"
+WARP_AI_RULE_FILE="geosite-category-ai-chat-!cn.srs"
+WARP_MEDIA_RULE_TAG="geosite-stream"
+WARP_MEDIA_RULE_FILE="geosite-category-entertainment@!cn.srs"
 
 has_warp_endpoint() {
     local c
@@ -2429,40 +2429,84 @@ add_warp_route() {
     fi
 }
 
-# 确保 rule_set 定义存在（按 tag 去重）并添加一条指向 warp 的规则；参数：规则组名 + geosite 列表
-add_ruleset_to_warp() {
-    local label="$1"; shift
-    local sites=("$@")
+has_warp_ruleset() {
+    local r_tag="$1"
+    [ -f "$CONFIG_FILE" ] || return 1
+    jq -e --arg t "$r_tag" '
+      .route.rules[]? | select(.outbound == "warp" and (.rule_set == $t or ((.rule_set? // []) | index($t) != null)))
+    ' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 开关式管理 WARP 远程规则集（与 sbx 一致）；参数：tag 名称 .srs文件名 [旧tag...]
+toggle_warp_ruleset() {
+    local r_tag="$1" r_name="$2" r_file="$3"
+    shift 3
+    local legacy_json='[]'
+    if [ "$#" -gt 0 ]; then
+        legacy_json=$(printf '%s\n' "$@" | jq -R . | jq -cs .)
+    fi
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
-        echo -e "${YELLOW}请先添加 WARP 出口。${PLAIN}"; return
+        printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN"; return 1
     fi
 
-    local tags_json defs_json
-    tags_json=$(printf '%s\n' "${sites[@]}" | sed 's/^/geosite-/' | jq -R . | jq -cs .)
-    defs_json=$(printf '%s\n' "${sites[@]}" | jq -R --arg base "$GEOSITE_BASE" \
-        '{tag:("geosite-"+.),type:"remote",format:"binary",url:($base+"/geosite-"+.+".srs")}' | jq -cs .)
-
     local temp_json
-    temp_json=$(jq --argjson tags "$tags_json" --argjson defs "$defs_json" '
-        # sing-box 1.14+: 以 http_clients + default_http_client 代替已弃用的 download_detour
-        .http_clients = ((.http_clients // []) + [{"tag":"rs-http"}] | group_by(.tag) | map(.[0]))
-        | .route = (.route // {})
-        | .route.default_http_client = "rs-http"
-        # 新增 rule_set 定义，并清掉旧的 download_detour 字段（按 tag 去重）
-        | .route.rule_set = (((.route.rule_set // []) + $defs) | map(del(.download_detour)) | group_by(.tag) | map(.[0]))
-        | .route.rules = (.route.rules // [])
-        | .route.rules += [{"rule_set": $tags, "outbound": "warp"}]' "$CONFIG_FILE")
-
-    if save_and_check_config "$temp_json"; then
-        svc_restart
-        echo -e "${GREEN}✅ 已添加「$label」分流规则 → warp${PLAIN}"
-        echo -e "  规则集: $(printf 'geosite-%s ' "${sites[@]}")"
-        echo -e "${YELLOW}💡 首次启动会自动下载规则集，若无法下载请确认服务器能访问 GitHub。${PLAIN}"
+    if has_warp_ruleset "$r_tag"; then
+        temp_json=$(jq --arg t "$r_tag" --argjson legacy "$legacy_json" '
+          ($legacy + [$t]) as $drop |
+          .route = (.route // {}) |
+          .route.rule_set = [.route.rule_set[]? | select(.tag as $x | ($drop | index($x)) == null)] |
+          .route.rules = [.route.rules[]? | select(
+            .outbound != "warp" or (
+              (.rule_set != $t) and
+              ((.rule_set | type) != "array" or (all(.rule_set[]; . as $x | ($drop | index($x)) == null)))
+            )
+          )]
+        ' "$CONFIG_FILE") || return 1
+        if save_and_check_config "$temp_json"; then
+            svc_restart
+            printf '%b%s 已关闭。%b\n' "$GREEN" "$r_name" "$PLAIN"
+        fi
+    else
+        temp_json=$(jq --arg t "$r_tag" --arg url "${GEOSITE_BASE}/${r_file}" --argjson legacy "$legacy_json" '
+          ($legacy + [$t]) as $drop |
+          # sing-box 1.14+: 以 http_clients + default_http_client 代替已弃用的 download_detour
+          .http_clients = ((.http_clients // []) + [{"tag":"rs-http"}] | group_by(.tag) | map(.[0])) |
+          .route = (.route // {}) |
+          .route.default_http_client = "rs-http" |
+          .route.rule_set = (
+            [.route.rule_set[]? | select(.tag as $x | ($drop | index($x)) == null) | del(.download_detour)] +
+            [{"tag": $t, "type": "remote", "format": "binary", "url": $url}]
+          ) |
+          .route.rules = (
+            [.route.rules[]? | select(
+              .outbound != "warp" or (
+                (.rule_set != $t) and
+                ((.rule_set | type) != "array" or (all(.rule_set[]; . as $x | ($drop | index($x)) == null)))
+              )
+            )] +
+            [{"action": "route", "rule_set": $t, "outbound": "warp"}]
+          )
+        ' "$CONFIG_FILE") || return 1
+        if save_and_check_config "$temp_json"; then
+            svc_restart
+            printf '%b%s 已开启 -> warp（%s）。%b\n' "$GREEN" "$r_name" "$r_file" "$PLAIN"
+            printf '%b首次启动会自动下载规则集，默认每 24 小时自动更新。%b\n' "$YELLOW" "$PLAIN"
+        fi
     fi
 }
 
-add_warp_ai()    { ensure_config; add_ruleset_to_warp "AI 服务" $WARP_AI_SITES; }
-add_warp_media() { ensure_config; add_ruleset_to_warp "流媒体"   $WARP_MEDIA_SITES; }
+add_warp_ai() {
+    ensure_config
+    toggle_warp_ruleset "$WARP_AI_RULE_TAG" "AI 分流" "$WARP_AI_RULE_FILE" \
+        geosite-category-ai-!cn geosite-openai geosite-anthropic
+}
+
+add_warp_media() {
+    ensure_config
+    toggle_warp_ruleset "$WARP_MEDIA_RULE_TAG" "流媒体分流" "$WARP_MEDIA_RULE_FILE" \
+        geosite-netflix geosite-disney geosite-hbo geosite-youtube \
+        geosite-primevideo geosite-tiktok geosite-spotify geosite-hulu
+}
 
 view_warp_rules() {
     ensure_config
@@ -2525,11 +2569,14 @@ delete_warp() {
     local temp_json
     temp_json=$(jq '
         .endpoints |= ((. // []) | map(select(.tag != "warp")))
-        | if .route then .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")]) else . end' "$CONFIG_FILE")
+        | if .route then
+            .route.rules = ([(.route.rules // [])[] | select((.outbound? // "") != "warp")])
+            | .route.rule_set = ([(.route.rule_set // [])[] | select(.tag != "geosite-ai" and .tag != "geosite-stream")])
+          else . end' "$CONFIG_FILE")
     if save_and_check_config "$temp_json"; then
         rm -f "$WARP_META"
         svc_restart
-        echo -e "${GREEN}✅ WARP 出口已删除（含指向 warp 的路由规则）。${PLAIN}"
+        printf '%bWARP 出口已删除（含指向 warp 的路由规则与规则集）。%b\n' "$GREEN" "$PLAIN"
     fi
 }
 
@@ -2556,8 +2603,11 @@ menu_warp() {
         menu_option 2 "查看 WARP 出口信息"
         menu_option 3 "删除 WARP 出口及相关规则"
         menu_section "分流规则"
-        menu_option 4 "AI 服务走 WARP"
-        menu_option 5 "流媒体走 WARP"
+        local ai_state media_state
+        ai_state=$(has_warp_ruleset "$WARP_AI_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
+        media_state=$(has_warp_ruleset "$WARP_MEDIA_RULE_TAG" && printf '%b开%b' "$GREEN" "$PLAIN" || printf '%b关%b' "$YELLOW" "$PLAIN")
+        menu_option 4 "AI 分流开关 [${ai_state}]"
+        menu_option 5 "流媒体分流开关 [${media_state}]"
         menu_option 6 "自定义域名走 WARP"
         menu_option 7 "指定节点全部走 WARP"
         local rule_count
