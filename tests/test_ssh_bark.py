@@ -94,6 +94,31 @@ class SSHBarkTest(unittest.TestCase):
             self.assertTrue(marker.exists(), 'worker did not reach journalctl')
             self.assertFalse(lock.exists(), 'worker must not open the panel lock')
 
+    def test_machine_label_changes_title_and_group_without_touching_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            credentials = b'{"key":"test_key_123","endpoint":"https://example.test/push"}'
+            path.write_bytes(credentials)
+            self.assertEqual(self.worker['host_label'](str(path), 'fallback'), 'fallback')
+            cmd = ['python3', '-c', WORKER, 'label', str(path)]
+            subprocess.run(cmd, input='西海岸线路机\n', text=True, check=True)
+            self.assertEqual(path.read_bytes(), credentials)
+            label = self.worker['host_label'](str(path), 'fallback')
+            opener = MagicMock()
+            self.worker['opener'] = opener
+            opener.open.return_value.__enter__.return_value.read.return_value = b'{"code":200}'
+            self.worker['notify'](json.loads(credentials), 'SSH 登录成功', '测试', label)
+            payload = json.loads(opener.open.call_args.args[0].data)
+            self.assertEqual(payload['title'], '[西海岸线路机] SSH 登录成功')
+            self.assertEqual(payload['group'], 'SSH · 西海岸线路机')
+            for invalid in ('x' * 41, 'bad\x1bname'):
+                attempt = subprocess.run(cmd, input=invalid + '\n', text=True, capture_output=True)
+                self.assertNotEqual(attempt.returncode, 0)
+                self.assertEqual(self.worker['host_label'](str(path), 'fallback'), label)
+            subprocess.run(cmd, input='\n', text=True, check=True)
+            self.assertEqual(self.worker['host_label'](str(path), 'fallback'), 'fallback')
+            self.assertEqual(path.read_bytes(), credentials)
+
     def test_config_privacy_and_invalid_input_does_not_replace(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.4  |  快捷指令: SB / sb
+#  版本: v3.8.5  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.4"
+SCRIPT_VERSION="v3.8.5"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -2481,8 +2481,11 @@ def webhook_config(value):
         cfg['basic_auth'] = [user, password]
     return cfg
 
-def notify(cfg, title, body):
-    data = json.dumps({"device_key": cfg['key'], "title": title, "body": body, "group": "SSH"}).encode()
+def notify(cfg, title, body, label=''):
+    if label:
+        title = f'[{label}] {title}'
+    group = f'SSH · {label}' if label else 'SSH'
+    data = json.dumps({"device_key": cfg['key'], "title": title, "body": body, "group": group}).encode()
     req = request.Request(cfg['endpoint'], data=data, headers={"Content-Type": "application/json"})
     if 'basic_auth' in cfg:
         token = base64.b64encode(':'.join(cfg['basic_auth']).encode()).decode('ascii')
@@ -2522,25 +2525,47 @@ def events(lines):
         if alert:
             yield 'SSH 疑似暴力破解', f'来源：{addr}\n5 分钟内至少失败 5 次\n时间：{stamp}'
 
+def valid_label(value):
+    return len(value) <= 40 and (not value or value.isprintable())
+
+def host_label(path, host):
+    try:
+        with open(path + '.label', encoding='utf-8') as f:
+            label = f.read(161).strip()
+        if label and valid_label(label):
+            return label
+    except (OSError, UnicodeError):
+        pass
+    return host
+
+def write_private(path, contents):
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(path), delete=False) as out:
+        name = out.name
+        try:
+            out.write(contents)
+            out.flush()
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
 def main(mode, path):
+    if mode == 'label':
+        label = sys.stdin.readline().strip()
+        if not valid_label(label):
+            raise ValueError()
+        write_private(path + '.label', label)
+        return
     if mode in ('configure', 'configure-webhook'):
         value = sys.stdin.readline().rstrip('\n')
         cfg = webhook_config(value) if mode == 'configure-webhook' else config(value, sys.stdin.readline().rstrip('\n'))
-        with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(path), delete=False) as out:
-            name = out.name
-            try:
-                json.dump(cfg, out)
-                out.flush()
-                os.replace(name, path)
-            finally:
-                if os.path.exists(name):
-                    os.unlink(name)
+        write_private(path, json.dumps(cfg))
         return
     with open(path) as f:
         cfg = json.load(f)
     host = socket.gethostname()
     if mode == 'test':
-        notify(cfg, 'SSH Bark 测试', host + ': 推送配置可用')
+        notify(cfg, 'SSH Bark 测试', f'主机：{host}\n推送配置可用', host_label(path, host))
         return
     if mode != 'follow':
         raise ValueError()
@@ -2549,7 +2574,7 @@ def main(mode, path):
                             stdout=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
     for title, body in events(proc.stdout):
         try:
-            notify(cfg, title, f'主机：{host}\n{body}')
+            notify(cfg, title, f'主机：{host}\n{body}', host_label(path, host))
         except (ValueError, OSError, AttributeError):
             print('SSH Bark 推送失败', file=sys.stderr, flush=True)
     proc.wait()
@@ -2567,7 +2592,7 @@ PY
 }
 
 menu_ssh_bark() {
-    local status server key webhook
+    local status server key webhook label
     if [ "$INIT_SYS" != systemd ] || ! command -v python3 >/dev/null || ! command -v journalctl >/dev/null; then
         echo 'SSH Bark 需要 systemd、journald 和 Python 3。'
         pause
@@ -2580,8 +2605,9 @@ menu_ssh_bark() {
         menu_option 1 '配置 Bark 并启用'
         menu_option 2 '发送测试通知'
         menu_option 3 '停用告警（保留配置）'
+        menu_option 4 '设置机器备注'
         menu_back
-        read_menu_choice '请选择 [0-3]' || return
+        read_menu_choice '请选择 [0-4]' || return
         case "$REPLY" in
             1)
                 if [ ! -f "$PANEL_FILE" ] || ! grep -q '^ssh_bark_worker() {' "$PANEL_FILE"; then
@@ -2638,6 +2664,10 @@ EOF
                 else
                     echo '尚未配置告警。'
                 fi
+                pause ;;
+            4)
+                read -r -p '机器备注（最多 40 个字符，留空使用主机名）：' label || return
+                printf '%s\n' "$label" | ssh_bark_worker label && echo '已保存，后续通知将使用此备注。'
                 pause ;;
             0) return ;;
             *) menu_invalid ;;
