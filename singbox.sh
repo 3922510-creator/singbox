@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.1  |  快捷指令: SB / sb
+#  版本: v3.8.2  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,9 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.1"
+SCRIPT_VERSION="v3.8.2"
+SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
+SSH_BARK_UNIT="sb-ssh-bark.service"
 
 # ---------- 颜色 ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -70,7 +72,7 @@ fi
 # 若通过管道/进程替换（如 bash <(curl ...)）运行，stdin 不是终端，
 # read 会立即读到 EOF 导致菜单空转或直接退出（表现为“执行完就断连”）。
 # 强制把 stdin 重定向到终端，保证交互菜单始终从 TTY 读取。
-if [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
+if [ "${1:-}" != --ssh-bark-worker ] && [ ! -t 0 ] && [ -e /dev/tty ]; then exec < /dev/tty; fi
 
 # ==================== 服务控制抽象（systemd / OpenRC / 无 init）====================
 # 全脚本统一用这几个函数管 sing-box 服务（日志同理），不再散落 systemctl/journalctl。
@@ -2436,6 +2438,184 @@ menu_bbr() {
     done
 }
 
+# ==================== SSH Bark 告警（systemd / journald） ====================
+ssh_bark_worker() {
+    python3 -c "$(cat <<'PY'
+import datetime, ipaddress, json, os, re, socket, subprocess, sys, tempfile
+from collections import OrderedDict
+from urllib import request
+from urllib.parse import urlsplit
+
+success = re.compile(r"^Accepted \S+ for (\S+) from (\S+) port \d+\b")
+failure = re.compile(r"^Failed \S+ for (?:invalid user )?(\S+) from (\S+) port \d+\b")
+
+class NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = request.build_opener(request.ProxyHandler({}), NoRedirect())
+
+def config(server, key):
+    if not re.fullmatch(r"https://[^\s\\]+", server):
+        raise ValueError()
+    url = urlsplit(server)
+    if not url.hostname or url.username is not None or url.port == 0 or any(c in server for c in '?#'):
+        raise ValueError()
+    if not re.fullmatch(r"[-A-Za-z0-9_]{8,128}", key):
+        raise ValueError()
+    return {"endpoint": server.rstrip('/') + '/push', "key": key}
+
+def notify(cfg, title, body):
+    data = json.dumps({"device_key": cfg['key'], "title": title, "body": body, "group": "SSH"}).encode()
+    req = request.Request(cfg['endpoint'], data=data, headers={"Content-Type": "application/json"})
+    with opener.open(req, timeout=5) as res:
+        if json.loads(res.read(8192)).get('code') != 200:
+            raise ValueError()
+
+def events(lines):
+    # Only count the final Failed line: Invalid user/PAM often report the same attempt again.
+    seen = OrderedDict()
+    for line in lines:
+        try:
+            event = json.loads(line)
+            msg = event['MESSAGE']
+            ok = success.match(msg)
+            match = ok or failure.match(msg)
+            if not match:
+                continue
+            user, addr = match.groups()
+            addr = str(ipaddress.ip_address(addr))
+            when = int(event['__REALTIME_TIMESTAMP']) / 1_000_000
+            tick = int(event['__MONOTONIC_TIMESTAMP']) / 1_000_000
+            stamp = datetime.datetime.fromtimestamp(when).astimezone().isoformat(timespec='seconds')
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if ok:
+            yield 'SSH 登录成功', f'账号：{user}\n来源：{addr}\n时间：{stamp}'
+            continue
+        attempts, last = seen.pop(addr, ([], float('-inf')))
+        attempts = ([t for t in attempts if tick - t <= 300] + [tick])[-5:]
+        alert = len(attempts) == 5 and tick - last >= 1800
+        seen[addr] = (attempts, tick if alert else last)
+        # Bound state during large distributed scans; old entries may be evicted.
+        if len(seen) > 4096:
+            seen.popitem(last=False)
+        if alert:
+            yield 'SSH 疑似暴力破解', f'来源：{addr}\n5 分钟内至少失败 5 次\n时间：{stamp}'
+
+def main(mode, path):
+    if mode == 'configure':
+        cfg = config(sys.stdin.readline().rstrip('\n'), sys.stdin.readline().rstrip('\n'))
+        with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(path), delete=False) as out:
+            name = out.name
+            try:
+                json.dump(cfg, out)
+                out.flush()
+                os.replace(name, path)
+            finally:
+                if os.path.exists(name):
+                    os.unlink(name)
+        return
+    with open(path) as f:
+        cfg = json.load(f)
+    host = socket.gethostname()
+    if mode == 'test':
+        notify(cfg, 'SSH Bark 测试', host + ': 推送配置可用')
+        return
+    if mode != 'follow':
+        raise ValueError()
+    proc = subprocess.Popen(['journalctl', '--follow', '--lines=0', '--output=json', '--no-pager',
+                             '-u', 'ssh.service', '-u', 'sshd.service', '-u', 'ssh@*.service', '-u', 'sshd@*.service'],
+                            stdout=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+    for title, body in events(proc.stdout):
+        try:
+            notify(cfg, title, f'主机：{host}\n{body}')
+        except (ValueError, OSError, AttributeError):
+            print('SSH Bark 推送失败', file=sys.stderr, flush=True)
+    proc.wait()
+    raise OSError()
+
+if __name__ == '__main__':
+    try:
+        main(*sys.argv[1:])
+    except Exception:
+        # URL、推送响应和凭据都不写入终端或 journal。
+        print('SSH Bark 操作失败，请检查配置、网络和服务状态。', file=sys.stderr)
+        sys.exit(1)
+PY
+)" "$1" "$SSH_BARK_CONFIG"
+}
+
+menu_ssh_bark() {
+    local status server key
+    if [ "$INIT_SYS" != systemd ] || ! command -v python3 >/dev/null || ! command -v journalctl >/dev/null; then
+        echo 'SSH Bark 需要 systemd、journald 和 Python 3。'
+        pause
+        return
+    fi
+    while true; do
+        status=未运行
+        systemctl is-active --quiet "$SSH_BARK_UNIT" && status=运行中
+        menu_header 'SSH Bark 告警' '仅通知，不封禁 IP' "$status"
+        menu_option 1 '配置 Bark 并启用'
+        menu_option 2 '发送测试通知'
+        menu_option 3 '停用告警（保留配置）'
+        menu_back
+        read_menu_choice '请选择 [0-3]' || return
+        case "$REPLY" in
+            1)
+                if [ ! -f "$PANEL_FILE" ] || ! grep -q '^ssh_bark_worker() {' "$PANEL_FILE"; then
+                    echo "请先将新版 sb 安装到 $PANEL_FILE。"; pause; continue
+                fi
+                read -r -p 'Bark 服务地址 [https://api.day.app]：' server || return
+                read -rs -p 'Bark Device Key（不回显）：' key || return
+                echo
+                if ! printf '%s\n%s\n' "${server:-https://api.day.app}" "$key" | ssh_bark_worker configure; then
+                    unset key; pause; continue
+                fi
+                unset key
+                if cat > "/etc/systemd/system/$SSH_BARK_UNIT" <<EOF
+[Unit]
+Description=SSH login and brute-force alerts via Bark
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/bin/bash $PANEL_FILE --ssh-bark-worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                then
+                    if systemctl daemon-reload && systemctl enable "$SSH_BARK_UNIT" && systemctl restart "$SSH_BARK_UNIT"; then
+                        echo '已启用，建议用菜单 2 测试推送。'
+                    else
+                        echo '启用失败，请检查服务状态。'
+                    fi
+                else
+                    echo '无法写入 SSH Bark 服务定义。'
+                fi
+                pause ;;
+            2) ssh_bark_worker test && echo '测试推送已提交。'; pause ;;
+            3)
+                if [ -f "/etc/systemd/system/$SSH_BARK_UNIT" ]; then
+                    systemctl disable --now "$SSH_BARK_UNIT" && echo '已停用。'
+                else
+                    echo '尚未配置告警。'
+                fi
+                pause ;;
+            0) return ;;
+            *) menu_invalid ;;
+        esac
+    done
+}
+
 menu_tools() {
     local c
     while true; do
@@ -2449,8 +2629,9 @@ menu_tools() {
         menu_option 5 "Swap 虚拟内存管理"
         menu_option 6 "防火墙管理（ufw）"
         menu_option 7 "网络加速（BBR / BBRv3 + TCP 缓冲区）"
+        menu_option 8 "SSH Bark 告警"
         menu_back
-        read_menu_choice "请选择 [0-7]" || return 0
+        read_menu_choice "请选择 [0-8]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -2461,6 +2642,7 @@ menu_tools() {
             5) menu_swap ;;
             6) menu_firewall ;;
             7) menu_bbr ;;
+            8) menu_ssh_bark ;;
             0) return ;;
             *) menu_invalid ;;
         esac
@@ -3230,6 +3412,10 @@ menu_warp() {
 }
 
 # ==================== 入口 ====================
+if [ "${1:-}" = --ssh-bark-worker ]; then
+    ssh_bark_worker follow
+    exit $?
+fi
 install_dependencies
 ensure_config
 ensure_service_def_fresh
