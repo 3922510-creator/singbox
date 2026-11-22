@@ -73,6 +73,27 @@ class SSHBarkTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse(bad)
 
+    @unittest.skipUnless(os.geteuid() == 0, 'the full sb entry point requires root')
+    def test_worker_entrypoint_skips_panel_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = root / 'panel.lock'
+            config = root / 'config.json'
+            marker = root / 'journal.started'
+            panel = root / 'sb'
+            panel.write_text(PANEL.read_text().replace('/var/run/sing-box-manager.lock', str(lock))
+                             .replace('/etc/sb-ssh-bark.json', str(config)))
+            config.write_text('{"endpoint":"https://example.test/push","key":"test_key_123"}')
+            for name, script in {'flock': 'exit 1\n', 'journalctl': f'touch "{marker}"\n'}.items():
+                stub = root / name
+                stub.write_text('#!/bin/sh\n' + script)
+                stub.chmod(0o755)
+            env = dict(os.environ, PATH=f'{root}:' + os.defpath)
+            subprocess.run(['bash', panel, '--ssh-bark-worker'], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=5)
+            self.assertTrue(marker.exists(), 'worker did not reach journalctl')
+            self.assertFalse(lock.exists(), 'worker must not open the panel lock')
+
     def test_config_privacy_and_invalid_input_does_not_replace(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'

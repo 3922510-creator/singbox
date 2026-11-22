@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.3  |  快捷指令: SB / sb
+#  版本: v3.8.4  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.3"
+SCRIPT_VERSION="v3.8.4"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -343,7 +343,6 @@ acquire_lock() {
         exit 1
     fi
 }
-acquire_lock
 
 # ==================== 依赖安装 ====================
 install_dependencies() {
@@ -3446,6 +3445,8 @@ if [ "${1:-}" = --ssh-bark-worker ]; then
     ssh_bark_worker follow
     exit $?
 fi
+# 只有交互面板会修改代理配置；只读告警进程不应争用面板锁。
+acquire_lock
 install_dependencies
 ensure_config
 ensure_service_def_fresh
