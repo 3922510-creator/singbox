@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,23 @@ class SSHBarkTest(unittest.TestCase):
         opener.open.return_value.__enter__.return_value.read.return_value = b'{"code":400}'
         with self.assertRaises(ValueError):
             self.worker['notify'](config, '登录', '测试')
+
+    def test_webhook_with_basic_auth(self):
+        parse = self.worker['webhook_config']
+        cfg = parse('https://demo:p%40ss%3Aword@example.com:8443/bark/test_key_123')
+        self.assertEqual(cfg['endpoint'], 'https://example.com:8443/bark/push')
+        opener = MagicMock()
+        self.worker['opener'] = opener
+        opener.open.return_value.__enter__.return_value.read.return_value = b'{"code":200}'
+        self.worker['notify'](cfg, '登录', '测试')
+        req = opener.open.call_args.args[0]
+        self.assertEqual(base64.b64decode(req.get_header('Authorization').split()[1]), b'demo:p@ss:word')
+        self.assertEqual(json.loads(req.data)['device_key'], 'test_key_123')
+        self.assertNotIn('basic_auth', parse('https://example.com/test_key_123'))
+        for bad in ('http://demo:pw@example.com/test_key_123', 'https://demo@example.com/test_key_123',
+                    'https://demo:p%0Ass@example.com/test_key_123', 'https://example.com/test_key_123?x=y'):
+            with self.assertRaises(ValueError):
+                parse(bad)
 
     def test_config_privacy_and_invalid_input_does_not_replace(self):
         with tempfile.TemporaryDirectory() as tmp:

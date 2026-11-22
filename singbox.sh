@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.2  |  快捷指令: SB / sb
+#  版本: v3.8.3  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.2"
+SCRIPT_VERSION="v3.8.3"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -2441,10 +2441,10 @@ menu_bbr() {
 # ==================== SSH Bark 告警（systemd / journald） ====================
 ssh_bark_worker() {
     python3 -c "$(cat <<'PY'
-import datetime, ipaddress, json, os, re, socket, subprocess, sys, tempfile
+import base64, datetime, ipaddress, json, os, re, socket, subprocess, sys, tempfile
 from collections import OrderedDict
 from urllib import request
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 success = re.compile(r"^Accepted \S+ for (\S+) from (\S+) port \d+\b")
 failure = re.compile(r"^Failed \S+ for (?:invalid user )?(\S+) from (\S+) port \d+\b")
@@ -2465,9 +2465,29 @@ def config(server, key):
         raise ValueError()
     return {"endpoint": server.rstrip('/') + '/push', "key": key}
 
+def webhook_config(value):
+    if not re.fullmatch(r"https://[^\s\\]+", value) or any(c in value for c in '?#'):
+        raise ValueError()
+    url = urlsplit(value)
+    if url.netloc.count('@') > 1:
+        raise ValueError()
+    prefix, _, key = url.path.rstrip('/').rpartition('/')
+    host = url.netloc.rsplit('@', 1)[-1]
+    cfg = config(f'https://{host}{prefix}', key)
+    if url.username is not None:
+        user = unquote(url.username, errors='strict')
+        password = unquote(url.password or '', errors='strict')
+        if not user or not password or ':' in user or any(ord(c) < 32 or ord(c) == 127 for c in user + password):
+            raise ValueError()
+        cfg['basic_auth'] = [user, password]
+    return cfg
+
 def notify(cfg, title, body):
     data = json.dumps({"device_key": cfg['key'], "title": title, "body": body, "group": "SSH"}).encode()
     req = request.Request(cfg['endpoint'], data=data, headers={"Content-Type": "application/json"})
+    if 'basic_auth' in cfg:
+        token = base64.b64encode(':'.join(cfg['basic_auth']).encode()).decode('ascii')
+        req.add_header('Authorization', 'Basic ' + token)
     with opener.open(req, timeout=5) as res:
         if json.loads(res.read(8192)).get('code') != 200:
             raise ValueError()
@@ -2504,8 +2524,9 @@ def events(lines):
             yield 'SSH 疑似暴力破解', f'来源：{addr}\n5 分钟内至少失败 5 次\n时间：{stamp}'
 
 def main(mode, path):
-    if mode == 'configure':
-        cfg = config(sys.stdin.readline().rstrip('\n'), sys.stdin.readline().rstrip('\n'))
+    if mode in ('configure', 'configure-webhook'):
+        value = sys.stdin.readline().rstrip('\n')
+        cfg = webhook_config(value) if mode == 'configure-webhook' else config(value, sys.stdin.readline().rstrip('\n'))
         with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(path), delete=False) as out:
             name = out.name
             try:
@@ -2547,7 +2568,7 @@ PY
 }
 
 menu_ssh_bark() {
-    local status server key
+    local status server key webhook
     if [ "$INIT_SYS" != systemd ] || ! command -v python3 >/dev/null || ! command -v journalctl >/dev/null; then
         echo 'SSH Bark 需要 systemd、journald 和 Python 3。'
         pause
@@ -2567,13 +2588,22 @@ menu_ssh_bark() {
                 if [ ! -f "$PANEL_FILE" ] || ! grep -q '^ssh_bark_worker() {' "$PANEL_FILE"; then
                     echo "请先将新版 sb 安装到 $PANEL_FILE。"; pause; continue
                 fi
-                read -r -p 'Bark 服务地址 [https://api.day.app]：' server || return
-                read -rs -p 'Bark Device Key（不回显）：' key || return
+                read -rs -p 'Bark Webhook URL（以 Device Key 结尾，不回显；留空则分开填写）：' webhook || return
                 echo
-                if ! printf '%s\n%s\n' "${server:-https://api.day.app}" "$key" | ssh_bark_worker configure; then
-                    unset key; pause; continue
+                if [ -n "$webhook" ]; then
+                    if ! printf '%s\n' "$webhook" | ssh_bark_worker configure-webhook; then
+                        unset webhook; pause; continue
+                    fi
+                    unset webhook
+                else
+                    read -r -p 'Bark 服务地址 [https://api.day.app]：' server || return
+                    read -rs -p 'Bark Device Key（不回显）：' key || return
+                    echo
+                    if ! printf '%s\n%s\n' "${server:-https://api.day.app}" "$key" | ssh_bark_worker configure; then
+                        unset key; pause; continue
+                    fi
+                    unset key
                 fi
-                unset key
                 if cat > "/etc/systemd/system/$SSH_BARK_UNIT" <<EOF
 [Unit]
 Description=SSH login and brute-force alerts via Bark

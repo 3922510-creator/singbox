@@ -77,7 +77,7 @@ sudo bash singbox.sh
 - 服务启停、状态查看和日志查看
 - 流媒体与 AI 快捷检测，以及 IP 质量体检（`网络检测与系统运维 → 2`，接入 [xykt/IPQuality](https://github.com/xykt/IPQuality)，涵盖风控评分、主流流媒体/AI 解锁、邮局与黑名单检测；确认后以 root 权限下载运行外部脚本）
 - 回程路由测试：网络检测与系统运维 → `3`，接入 [BestTrace.sh](https://besttrace.sh/)，支持电信 / 联通 / 移动 / 教育网及上游线路识别。
-- **SSH Bark 告警**：`sb → 8 网络检测与系统运维 → 8 SSH Bark 告警`。选 `1` 输入 HTTPS 服务地址（默认 `https://api.day.app`）和 Bark Device Key（隐藏输入），再选 `2` 测试。仅支持 systemd/journald，需要 Python 3。监听启用后的 SSH 日志：成功登录逐次通知，同一 IP 5 分钟内失败 5 次才通知，30 分钟内不重复爆破告警。只通知，不封禁、不改防火墙，Key 存在 root 可读的 `/etc/sb-ssh-bark.json`。选 `3` 可停用并保留配置。服务中断时的事件不补发，也不能检测宿主机绕过 SSH 的操作。
+- **SSH Bark 告警**：`sb → 8 网络检测与系统运维 → 8 SSH Bark 告警`。选 `1` 粘贴以 Device Key 结尾的 HTTPS Bark Webhook URL（支持 URL 中的 HTTP Basic Auth，不回显；不要附带示例消息或查询参数），或留空分开填写服务地址与 Device Key，再选 `2` 测试。仅支持 systemd/journald，需要 Python 3。监听启用后的 SSH 日志：成功登录逐次通知，同一 IP 5 分钟内失败 5 次才通知，30 分钟内不重复爆破告警。只通知，不封禁、不改防火墙，Key 存在 root 可读的 `/etc/sb-ssh-bark.json`。选 `3` 可停用并保留配置。服务中断时的事件不补发，也不能检测宿主机绕过 SSH 的操作。
   - 输入 `y` / `Y` 后才下载并以 root 权限运行上游脚本，`n` 或直接回车取消；首次运行可能安装 NextTrace，结果仅供参考。
   - HTTPS 下载、超时和语法检查，结束后清理面板下载的临时文件；失败会返回面板。不修改 sing-box 配置、不重启服务。
   - 此入口运行在线第三方代码（包括其后续安装器），不是内置离线检测；检测目标、线路判定、架构与发行版兼容性由上游维护。
