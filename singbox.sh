@@ -1690,103 +1690,146 @@ media_check_full() {
     return "$rc"
 }
 
-# IPv6 使用独立目标，不能套用 BestTrace 的 IPv4 线路识别规则。
-besttrace_ipv6() {
-    local choice target answer rc=0 failed=0 tmp i
-    local -a names=("电信" "联通" "移动" "教育网")
-    local -a targets=("240e:4c:4008::1" "2408:8899::8" "2409:8088::a" "2001:da8::666")
-    echo "IPv6 回程：1) 三网及教育网  2) 电信  3) 联通  4) 移动  5) 教育网  6) 自定义  0) 返回"
-    echo "预设目标为国内运营商 DNS；仅显示实际路由，不套用 IPv4 线路评级。"
-    echo "需要本机有可用 IPv6 出口；隧道出口测到的是隧道后的路径。"
-    read -rp "请选择 [0-6]: " choice || return 0
-    case "$choice" in
-        0|'') return 0 ;;
-        1) ;;
-        2|3|4|5) i=$((choice - 2)); names=("${names[i]}"); targets=("${targets[i]}") ;;
-        6)
-            read -rp "请输入目标 IPv6 地址（不带方括号）: " target || return 0
-            # 只收地址，不接受主机名、选项或带 shell 语法的输入。
-            if ! python3 -c 'import ipaddress,sys; ipaddress.IPv6Address(sys.argv[1])' "$target" 2>/dev/null; then
-                echo "IPv6 地址无效。"; return 1
-            fi
-            names=("自定义"); targets=("$target") ;;
-        *) echo "无效选项。"; return 1 ;;
-    esac
-    if ! command -v nexttrace >/dev/null 2>&1; then
-        echo "尚未安装 NextTrace，将以 root 权限下载并运行 https://nxtrace.org/nt 安装脚本。"
-        read -rp "确认安装 NextTrace？[y/N]: " answer || return 0
-        [[ "$answer" =~ ^[Yy]$ ]] || return 0
-        (
-            exec 200>&-
-            tmp=$(mktemp -d) || exit 1
-            trap 'rm -rf -- "$tmp"' EXIT
-            trap 'exit 130' INT
-            trap 'exit 143' TERM
-            curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 \
-                --max-time 120 --retry 2 https://nxtrace.org/nt -o "$tmp/install.sh" || exit 1
-            [[ -s "$tmp/install.sh" ]] && bash -n "$tmp/install.sh" || exit 1
-            bash "$tmp/install.sh"
-        )
-        rc=$?
-        if (( rc != 0 )) || ! command -v nexttrace >/dev/null 2>&1; then
-            echo "NextTrace 安装未完成，已返回面板。"; return 1
+# 基于 BestTrace.sh v5.0（https://besttrace.sh/，https://bwg.net）改造。
+# 保留逐项分析与最终汇总；双栈共享识别逻辑，不按目标运营商臆测线路。
+besttrace_analyze_route() {
+    local log_content="$1" family="$2" rc="$3" clean_content asns domestic
+    local result="未识别（ASN 信息不足）"
+    clean_content=$(printf '%s\n' "$log_content" | sed 's/\x1b\[[0-9;]*m//g')
+    # 只分析实际跳点，避免 API 提示、地图链接和目标名称造成误判。
+    clean_content=$(printf '%s\n' "$clean_content" | grep -E '^[[:space:]]*[0-9]+[[:space:]]' || :)
+    asns=$(printf '%s\n' "$clean_content" | grep -Eo 'AS[0-9]+' | sort -u | tr '\n' ' ')
+    domestic=$(printf '%s\n' "$clean_content" | grep -iE '中国|北京|上海|广州|成都|China|Beijing|Shanghai|Guangzhou|Chengdu' | grep -ivE 'Hong Kong|HongKong|香港|Taiwan|台湾|Macao|Macau|澳门' || :)
+    # 延续 BestTrace 的优先级，但 GIA/GT 不能仅凭 IPv6 ASN 区分。
+    if [[ "$asns" =~ (^|[[:space:]])AS4809([[:space:]]|$) ]]; then
+        if [[ "$family" == 6 ]]; then
+            result="电信 CN2（AS4809；GIA/GT 未判定）"
+        elif [[ "$domestic" =~ AS4809([^0-9]|$)|59\.43\. ]]; then
+            result="电信 CN2 GIA 特征（国内段 AS4809，仅供参考）"
+        else
+            result="电信 CN2（AS4809；GIA/GT 未判定）"
         fi
+    elif [[ "$asns" =~ (^|[[:space:]])AS(9929|10099)([[:space:]]|$) ]]; then
+        result="联通 9929 / A 网（AS9929/AS10099）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS58807([[:space:]]|$) ]]; then
+        result="移动 CMIN2（AS58807）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS4837([[:space:]]|$) ]]; then
+        result="联通 4837（169 骨干）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS58453([[:space:]]|$) ]]; then
+        result="移动 CMI（AS58453）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS9808([[:space:]]|$) ]]; then
+        result="移动骨干（AS9808；未见 CMI/CMIN2 特征）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS4134([[:space:]]|$) ]]; then
+        result="电信 163 骨干（AS4134）"
+    elif [[ "$asns" =~ (^|[[:space:]])AS(4538|23910)([[:space:]]|$) ]]; then
+        result="教育网 CERNET（AS4538/AS23910）"
     fi
-    for i in "${!targets[@]}"; do
-        printf '\nIPv6 回程：%s [%s]\n' "${names[i]}" "${targets[i]}"
-        # 单个目标失败不阻止其余运营商；中断则立即返回。
-        ( exec 200>&-; nexttrace -6 "${targets[i]}" -q 1 -M )
-        rc=$?
-        case "$rc" in
-            0) ;;
-            130|143) return "$rc" ;;
-            *) failed=1; echo "该目标测试失败（退出码 $rc），请检查 IPv6 出口或换自定义目标。" ;;
-        esac
-    done
-    return "$failed"
+    if (( rc != 0 )); then
+        result="探测失败（退出码 $rc）；已见：$result"
+    fi
+    printf '%s' "$result"
 }
 
-# BestTrace 保持独立子进程，避免上游的变量、exit 和 trap 影响面板。
-besttrace_check() {
-    local answer rc tmp family
-    echo "回程地址族：1) IPv4（BestTrace）  2) IPv6（NextTrace）  0) 返回"
-    read -rp "请选择 [1/2/0]: " family || return 0
-    case "$family" in
-        1) ;;
-        2) besttrace_ipv6; return $? ;;
-        0|'') return 0 ;;
-        *) echo "无效选项。"; return 1 ;;
-    esac
-    echo -e "\n  ${CYAN}▌ 回程路由测试（BestTrace.sh）${PLAIN}"
-    echo "支持电信 / 联通 / 移动 / 教育网，线路识别结果仅供参考。"
-    echo -e "${YELLOW}将以 root 权限下载并运行 https://besttrace.sh/ 的第三方脚本。${PLAIN}"
-    echo "首次运行可能由上游下载并安装 NextTrace；不会主动修改 sing-box 配置。"
-    read -rp "运行第三方脚本（可能安装 NextTrace）？[y/N]: " answer || return 0
-    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+besttrace_print_summary() {
+    local line
+    printf '\nBestTrace 双栈回程 — IPv%s 线路汇总\n' "$family"
+    printf '%s\n' '节点 / 目标 IP / 线路类型' '----------------------------'
+    for line in "${summary[@]}"; do printf '%s\n' "$line"; done
+    printf '%s\n' '----------------------------'
+    echo '线路判断仅供参考；未见某 ASN 不代表一定没走该网络。超时/隐藏跳点不作普通线路判定。'
+    echo 'IPv6 仅凭 AS4809 不区分 GIA/GT；若使用 WARP 等隧道，测到的是隧道出口之后的路径。'
+}
+
+besttrace_install() {
+    local answer tmp rc
+    command -v nexttrace >/dev/null 2>&1 && return 0
+    echo '将以 root 权限下载并运行 https://nxtrace.org/nt 安装 NextTrace。'
+    read -rp '确认安装 NextTrace？[y/N]: ' answer || return 2
+    [[ "$answer" =~ ^[Yy]$ ]] || return 2
     (
-        # 不让上游安装器启动的后台进程继承面板锁。
         exec 200>&-
         tmp=$(mktemp -d) || exit 1
         trap 'rm -rf -- "$tmp"' EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
-        if ! curl --proto '=https' --proto-redir '=https' -fSL \
-            --connect-timeout 15 --max-time 120 --retry 2 \
-            https://besttrace.sh/ -o "$tmp/besttrace.sh"; then
-            echo -e "${RED}BestTrace 下载失败，未执行。${PLAIN}" >&2
-            exit 1
-        fi
-        if [[ ! -s "$tmp/besttrace.sh" ]] || ! bash -n "$tmp/besttrace.sh"; then
-            echo -e "${RED}BestTrace 内容为空或语法检查失败，未执行。${PLAIN}" >&2
-            exit 1
-        fi
-        bash "$tmp/besttrace.sh"
+        curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 \
+            --max-time 120 --retry 2 https://nxtrace.org/nt -o "$tmp/install.sh" || exit 1
+        [[ -s "$tmp/install.sh" ]] && bash -n "$tmp/install.sh" || exit 1
+        bash "$tmp/install.sh"
     )
     rc=$?
-    if (( rc != 0 )); then
-        echo -e "${YELLOW}BestTrace 未正常完成（退出码 ${rc}），已返回面板。${PLAIN}"
+    if (( rc != 0 )) || ! command -v nexttrace >/dev/null 2>&1; then
+        echo 'NextTrace 安装未完成，已返回面板。'; return 1
     fi
-    return "$rc"
+}
+
+besttrace_check() {
+    local family choice target i rc failed=0 tmp result
+    local -a names targets codes summary=()
+    echo 'BestTrace 双栈回程：1) IPv4  2) IPv6  0) 返回'
+    read -rp '请选择 [1/2/0]: ' family || return 0
+    case "$family" in
+        1)
+            family=4
+            targets=(219.141.147.210 202.106.50.1 221.179.155.161 202.96.209.133 210.22.97.1 211.136.112.200 202.96.128.86 210.21.196.6 120.196.165.24 118.112.11.12 119.6.6.6 211.137.96.205 202.112.14.151)
+            names=(北京电信 北京联通 北京移动 上海电信 上海联通 上海移动 广州电信 广州联通 广州移动 成都电信 成都联通 成都移动 成都教育网)
+            codes=(CT CU CM CT CU CM CT CU CM CT CU CM EDU) ;;
+        2)
+            family=6
+            targets=(240e:4c:4008::1 2408:8899::8 2409:8088::a 2001:da8::666)
+            names=(电信 联通 移动 教育网)
+            codes=(CT CU CM EDU) ;;
+        0|'') return 0 ;;
+        *) echo '无效选项。'; return 1 ;;
+    esac
+    echo '1) 三网及教育网  2) 电信  3) 联通  4) 移动  5) 教育网  6) 自定义  0) 返回'
+    read -rp '请选择 [0-6]: ' choice || return 0
+    case "$choice" in
+        0|'') return 0 ;;
+        1|2|3|4|5) ;;
+        6)
+            read -rp "请输入目标 IPv${family} 地址: " target || return 0
+            if ! python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); sys.exit(a.version != int(sys.argv[2]))' "$target" "$family" 2>/dev/null; then
+                echo 'IP 地址无效或地址族不匹配。'; return 1
+            fi
+            names=(自定义); targets=("$target"); codes=(OTHER) ;;
+        *) echo '无效选项。'; return 1 ;;
+    esac
+    rc=0
+    besttrace_install || rc=$?
+    case "$rc" in 0) ;; 2) return 0 ;; *) return "$rc" ;; esac
+    # 子进程隔离 trap 和日志文件；不继承面板锁，不污染并行运行的测试。
+    (
+        exec 200>&-
+        tmp=$(mktemp -d) || exit 1
+        trap 'rm -rf -- "$tmp"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        for i in "${!targets[@]}"; do
+            case "$choice:${codes[i]}" in
+                1:*|6:*|2:CT|3:CU|4:CM|5:EDU) ;;
+                *) continue ;;
+            esac
+            printf '\n正在测试 IPv%s：%s [%s]\n' "$family" "${names[i]}" "${targets[i]}"
+            rc=0
+            if nexttrace "-$family" "${targets[i]}" -q 1 -M 2>&1 | tee "$tmp/trace.log"; then
+                rc=${PIPESTATUS[0]}
+            else
+                rc=${PIPESTATUS[0]}
+                (( rc != 0 )) || rc=1
+            fi
+            case "$rc" in
+                130|143) exit "$rc" ;;
+                0) ;;
+                *) failed=1 ;;
+            esac
+            result=$(besttrace_analyze_route "$(cat "$tmp/trace.log")" "$family" "$rc")
+            printf '>>> [智能分析] %s\n' "$result"
+            summary+=("${names[i]} / ${targets[i]} / $result")
+        done
+        besttrace_print_summary
+        exit "$failed"
+    )
 }
 
 # ---------- DNS 设置 ----------
@@ -2746,7 +2789,7 @@ menu_tools() {
         menu_section "网络与路由检测"
         menu_option 1 "流媒体解锁检测（快速）"
         menu_option 2 "IP 质量与流媒体体检（xykt/IPQuality）"
-        menu_option 3 "回程路由测试（BestTrace / 三网及教育网）"
+        menu_option 3 "回程路由测试（BestTrace / IPv4·IPv6）"
         menu_section "系统运维"
         menu_option 4 "DNS 设置（/etc/resolv.conf）"
         menu_option 5 "Swap 虚拟内存管理"
