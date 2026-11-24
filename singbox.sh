@@ -1690,9 +1690,73 @@ media_check_full() {
     return "$rc"
 }
 
+# IPv6 使用独立目标，不能套用 BestTrace 的 IPv4 线路识别规则。
+besttrace_ipv6() {
+    local choice target answer rc=0 failed=0 tmp i
+    local -a names=("电信" "联通" "移动" "教育网")
+    local -a targets=("240e:4c:4008::1" "2408:8899::8" "2409:8088::a" "2001:da8::666")
+    echo "IPv6 回程：1) 三网及教育网  2) 电信  3) 联通  4) 移动  5) 教育网  6) 自定义  0) 返回"
+    echo "预设目标为国内运营商 DNS；仅显示实际路由，不套用 IPv4 线路评级。"
+    echo "需要本机有可用 IPv6 出口；隧道出口测到的是隧道后的路径。"
+    read -rp "请选择 [0-6]: " choice || return 0
+    case "$choice" in
+        0|'') return 0 ;;
+        1) ;;
+        2|3|4|5) i=$((choice - 2)); names=("${names[i]}"); targets=("${targets[i]}") ;;
+        6)
+            read -rp "请输入目标 IPv6 地址（不带方括号）: " target || return 0
+            # 只收地址，不接受主机名、选项或带 shell 语法的输入。
+            if ! python3 -c 'import ipaddress,sys; ipaddress.IPv6Address(sys.argv[1])' "$target" 2>/dev/null; then
+                echo "IPv6 地址无效。"; return 1
+            fi
+            names=("自定义"); targets=("$target") ;;
+        *) echo "无效选项。"; return 1 ;;
+    esac
+    if ! command -v nexttrace >/dev/null 2>&1; then
+        echo "尚未安装 NextTrace，将以 root 权限下载并运行 https://nxtrace.org/nt 安装脚本。"
+        read -rp "确认安装 NextTrace？[y/N]: " answer || return 0
+        [[ "$answer" =~ ^[Yy]$ ]] || return 0
+        (
+            exec 200>&-
+            tmp=$(mktemp -d) || exit 1
+            trap 'rm -rf -- "$tmp"' EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 \
+                --max-time 120 --retry 2 https://nxtrace.org/nt -o "$tmp/install.sh" || exit 1
+            [[ -s "$tmp/install.sh" ]] && bash -n "$tmp/install.sh" || exit 1
+            bash "$tmp/install.sh"
+        )
+        rc=$?
+        if (( rc != 0 )) || ! command -v nexttrace >/dev/null 2>&1; then
+            echo "NextTrace 安装未完成，已返回面板。"; return 1
+        fi
+    fi
+    for i in "${!targets[@]}"; do
+        printf '\nIPv6 回程：%s [%s]\n' "${names[i]}" "${targets[i]}"
+        # 单个目标失败不阻止其余运营商；中断则立即返回。
+        ( exec 200>&-; nexttrace -6 "${targets[i]}" -q 1 -M )
+        rc=$?
+        case "$rc" in
+            0) ;;
+            130|143) return "$rc" ;;
+            *) failed=1; echo "该目标测试失败（退出码 $rc），请检查 IPv6 出口或换自定义目标。" ;;
+        esac
+    done
+    return "$failed"
+}
+
 # BestTrace 保持独立子进程，避免上游的变量、exit 和 trap 影响面板。
 besttrace_check() {
-    local answer rc tmp
+    local answer rc tmp family
+    echo "回程地址族：1) IPv4（BestTrace）  2) IPv6（NextTrace）  0) 返回"
+    read -rp "请选择 [1/2/0]: " family || return 0
+    case "$family" in
+        1) ;;
+        2) besttrace_ipv6; return $? ;;
+        0|'') return 0 ;;
+        *) echo "无效选项。"; return 1 ;;
+    esac
     echo -e "\n  ${CYAN}▌ 回程路由测试（BestTrace.sh）${PLAIN}"
     echo "支持电信 / 联通 / 移动 / 教育网，线路识别结果仅供参考。"
     echo -e "${YELLOW}将以 root 权限下载并运行 https://besttrace.sh/ 的第三方脚本。${PLAIN}"

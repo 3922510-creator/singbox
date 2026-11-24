@@ -13,7 +13,7 @@ class BestTraceTests(unittest.TestCase):
         source = SCRIPT.read_text()
         functions = "\n".join(
             re.search(r"^" + name + r"\(\) \{\n.*?^\}", source, re.M | re.S).group()
-            for name in ("besttrace_check", "menu_tools")
+            for name in ("besttrace_ipv6", "besttrace_check", "menu_tools")
         )
         with tempfile.TemporaryDirectory(prefix="sb-besttrace-test-") as directory:
             prelude = r'''
@@ -46,7 +46,7 @@ assert_clean() {
     def test_cancel_and_eof_do_not_download(self):
         self.run_shell(r'''
 for answer in n N 确认 yes ''; do
-    besttrace_check <<< "$answer"
+    besttrace_check <<< $'1\n'"$answer"
 done
 besttrace_check < /dev/null
 [[ ! -e "$ROOT/curl-args" && ! -e "$MARKER" ]]
@@ -59,7 +59,7 @@ exec 200>"$ROOT/lock"
 PAYLOAD='[[ ! -e /proc/$$/fd/200 ]] || exit 91
 printf "ran\n" > "$MARKER"
 exit 0'
-besttrace_check <<< Y
+besttrace_check <<< $'1\nY'
 [[ $(cat "$MARKER") == ran ]]
 [[ -e /proc/$$/fd/200 ]]
 grep -Fxq -- '--proto' "$ROOT/curl-args"
@@ -72,7 +72,7 @@ assert_clean
         self.run_shell(r'''
 DOWNLOAD_RC=22
 rc=0
-besttrace_check <<< y || rc=$?
+besttrace_check <<< $'1\ny' || rc=$?
 [[ "$rc" == 1 && ! -e "$MARKER" ]]
 assert_clean
 ''')
@@ -81,7 +81,7 @@ assert_clean
         self.run_shell(r'''
 for PAYLOAD in '' '<html>error</html>' 'if then'; do
     rc=0
-    besttrace_check <<< y || rc=$?
+    besttrace_check <<< $'1\ny' || rc=$?
     [[ "$rc" == 1 && ! -e "$MARKER" ]]
     assert_clean
 done
@@ -91,13 +91,44 @@ done
         output = self.run_shell(r'''
 PAYLOAD='exit 17'
 rc=0
-besttrace_check <<< y || rc=$?
+besttrace_check <<< $'1\ny' || rc=$?
 [[ "$rc" == 17 ]]
 assert_clean
 printf 'parent-alive\n'
 ''')
         self.assertIn("退出码 17", output)
         self.assertIn("parent-alive", output)
+
+    def test_ipv6_presets_and_custom(self):
+        self.run_shell(r'''
+nexttrace() { printf '%s\n' "$*" >> "$ROOT/traces"; }
+besttrace_check <<< $'2\n1'
+[[ $(wc -l < "$ROOT/traces") == 4 ]]
+grep -Fxq -- '-6 240e:4c:4008::1 -q 1 -M' "$ROOT/traces"
+grep -Fxq -- '-6 2408:8899::8 -q 1 -M' "$ROOT/traces"
+grep -Fxq -- '-6 2409:8088::a -q 1 -M' "$ROOT/traces"
+grep -Fxq -- '-6 2001:da8::666 -q 1 -M' "$ROOT/traces"
+for selection in 2 3 4 5; do
+    : > "$ROOT/traces"
+    besttrace_check <<< $'2\n'"$selection"
+    [[ $(wc -l < "$ROOT/traces") == 1 ]]
+done
+besttrace_check <<< $'2\n6\n2001:db8::1'
+grep -Fxq -- '-6 2001:db8::1 -q 1 -M' "$ROOT/traces"
+[[ ! -e "$ROOT/curl-args" ]]
+''')
+
+    def test_ipv6_invalid_cancel_and_failure(self):
+        self.run_shell(r'''
+nexttrace() { printf 'called\n' >> "$ROOT/traces"; return 9; }
+for input in 0 '' 9 $'2\n0' $'2\n6\n--help' $'2\n6\n1.1.1.1'; do
+    besttrace_check <<< "$input" || :
+done
+[[ ! -e "$ROOT/traces" && ! -e "$ROOT/curl-args" ]]
+rc=0
+besttrace_check <<< $'2\n1' || rc=$?
+[[ "$rc" == 1 && $(wc -l < "$ROOT/traces") == 4 ]]
+''')
 
     def test_menu_entry_returns_after_failure(self):
         self.run_shell(r'''
