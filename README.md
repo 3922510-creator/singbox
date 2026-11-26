@@ -1,6 +1,6 @@
 # Sing-box 管理面板
 
-面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality / AnyTLS-Reality / Shadowsocks 2022 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
+面向 Debian / Ubuntu / RHEL 系与 Alpine（OpenRC）服务器的 Sing-box 一键管理脚本。通过交互式菜单集中管理 VLESS-Reality / AnyTLS-Reality / Shadowsocks 2022 / Hysteria 2 节点、TCP/UDP 端口转发、Cloudflare WARP 分流、DNS 与防火墙，并内置 BBR / BBRv3 网络加速切换，提供配置校验、自动备份和失败回滚。
 
 ## 一键安装
 
@@ -133,7 +133,11 @@ bash <(curl -sL https://raw.githubusercontent.com/3922510-creator/singbox/main/i
 ## 节点备注
 
 - 添加 VLESS-Reality / AnyTLS-Reality / SS2022 / Hysteria 2 节点时可输入备注（最多 80 字），支持中文、空格及特殊符号；分享链接的名称会自动 URL 编码。
-- Hysteria 2 使用 QUIC，仅需入站 UDP。添加时使用解析到服务器的域名，以及匹配的可信 TLS 完整证书链和私钥（PEM 绝对路径，sing-box 服务须能读取）；面板不签发或续期证书。若云防火墙另有入站规则，也须放行所选 UDP 端口。
+- Hysteria 2 使用 QUIC；域名须直连服务器，Cloudflare 记录请设为「仅 DNS」。本机防火墙只由面板放行节点的 UDP 端口；如有云防火墙，也须放行该端口。
+- 证书可使用 sing-box 内置 ACME 向 Let’s Encrypt 自动申请和续期（要求 sing-box ≥ 1.14.0，带 `with_acme`）：
+  - **HTTP-01**：`80/TCP` 不能被其他服务占用，且公网须能直连。面板不自动开放该验证端口，申请和续期时都须可达。
+  - **Cloudflare DNS-01**：不占用 Web 端口，兼容已有 Caddy。使用仅限目标 Zone 的 `Zone:Read` 和 `DNS:Edit` API Token；Token 存入仅管理员可读的 sing-box 配置及其备份，请勿分享这些文件。
+  - 也可继续使用已有证书：填写完整证书链和私钥的 PEM 绝对路径，确保 sing-box 服务有读取权限。
 - 已有节点：`sb → 节点管理 → 2 修改节点备注`，留空恢复默认名称。
 - 列表、分享链接及二维码同步使用备注；已经导入客户端的名称不会自动变化，需重新导入或在客户端手动修改。
 - 备注保存在 `/etc/sing-box/.meta/node-names.json`（权限 600），不修改节点内部 tag、端口、认证或路由，修改备注无需重启服务；原有节点未设置备注时继续显示 tag。

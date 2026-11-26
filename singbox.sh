@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.5  |  快捷指令: SB / sb
+#  版本: v3.8.6  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.5"
+SCRIPT_VERSION="v3.8.6"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -1226,7 +1226,7 @@ add_hysteria2_node() {
         return 1
     fi
     ensure_config
-    local port domain cert key name tag password temp_json link show_qr
+    local port domain cert key mode email token acme dns_challenge=null tls name tag password temp_json link show_qr
     port=$(read_valid_port '监听端口（UDP）[默认 8444]: ' 8444 1) || return 0
     read -rp '证书域名（DNS 须解析到本机）: ' domain || return 1
     local domain_re='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
@@ -1234,23 +1234,65 @@ add_hysteria2_node() {
         printf '域名无效。\n' >&2
         return 1
     fi
-    read -rp '完整证书链 PEM 路径: ' cert || return 1
-    read -rp '私钥 PEM 路径: ' key || return 1
-    if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -r "$cert" || ! -f "$key" || ! -r "$key" ]]; then
-        printf '请输入可读证书和私钥文件的绝对路径。\n' >&2
-        return 1
-    fi
+    printf '  1) 自动申请 / 续期（HTTP-01，需公网 80/TCP）\n  2) 自动申请 / 续期（Cloudflare DNS-01，不占用 Web 端口）\n  3) 使用已有证书 / 私钥\n'
+    read -rp '证书方式 [1-3，默认 1]: ' mode || return 1
+    mode=${mode:-1}
+    case "$mode" in
+        1|2)
+            if ! singbox_version_ge 1.14.0 || ! "$BIN_FILE" version | grep -Eq '^Tags:.*[ ,]with_acme([ ,]|$)'; then
+                printf '自动申请需要 sing-box >= 1.14.0 且编译时启用 with_acme；也可使用已有证书。\n' >&2
+                return 1
+            fi
+            if [ "$mode" = 1 ]; then
+                if port_in_use 80; then
+                    printf '80 端口已被占用或配置使用；请选择 DNS-01 或已有证书。\n' >&2
+                    return 1
+                fi
+                printf '请确认公网可直连本机 80/TCP（包括防火墙和云安全组），续期时也需可达。\n'
+            fi
+            read -rp 'Let’s Encrypt 联系邮箱（可留空）: ' email || return 1
+            if [ "$mode" = 2 ]; then
+                read -rsp 'Cloudflare API Token（该域名 Zone:Read、DNS:Edit）: ' token || return 1
+                printf '\n'
+                if [[ -z "$token" ]]; then
+                    printf 'Cloudflare API Token 不能为空。\n' >&2
+                    return 1
+                fi
+                dns_challenge=$(printf '%s' "$token" | jq -Rs '{provider:"cloudflare", api_token:.}') || return 1
+                unset token
+            fi
+            acme=$(printf '%s\n' "$dns_challenge" | jq --arg domain "$domain" --arg dir "$META_DIR/acme" --arg email "$email" '
+                {type:"acme", provider:"letsencrypt", domain:[$domain], data_directory:$dir, disable_tls_alpn_challenge:true}
+                + (if $email == "" then {} else {email:$email} end)
+                + (if . == null then {} else {dns01_challenge:.} end)
+            ') || return 1
+            tls=$(printf '%s\n' "$acme" | jq --arg domain "$domain" '{enabled:true, server_name:$domain, certificate_provider:.}') || return 1
+            ;;
+        3)
+            read -rp '完整证书链 PEM 路径: ' cert || return 1
+            read -rp '私钥 PEM 路径: ' key || return 1
+            if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -r "$cert" || ! -f "$key" || ! -r "$key" ]]; then
+                printf '请输入可读证书和私钥文件的绝对路径。\n' >&2
+                return 1
+            fi
+            tls=$(jq -n --arg domain "$domain" --arg cert "$cert" --arg key "$key" \
+                '{enabled:true, server_name:$domain, certificate_path:$cert, key_path:$key}') || return 1
+            ;;
+        *) printf '无效的证书方式。\n' >&2; return 1 ;;
+    esac
     name=$(read_node_name) || return 1
     tag="hysteria2-$port"
     password=$("$BIN_FILE" generate uuid) || return 1
     [ -n "$password" ] || return 1
-    temp_json=$(jq --argjson port "$port" --arg tag "$tag" --arg pw "$password" \
-        --arg domain "$domain" --arg cert "$cert" --arg key "$key" '
-        .inbounds += [{type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
-                       users:[{password:$pw}], tls:{enabled:true, server_name:$domain,
-                       certificate_path:$cert, key_path:$key}}]
-    ' "$CONFIG_FILE") || return 1
+    # 证书配置经 stdin 交给 jq，避免 DNS API Token 进入命令行参数。
+    temp_json=$(printf '%s\n' "$tls" | jq -s --argjson port "$port" --arg tag "$tag" --arg pw "$password" '
+        .[1] as $tls | .[0] | .inbounds += [{type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
+                                            users:[{password:$pw}], tls:$tls}]
+    ' "$CONFIG_FILE" -) || return 1
     apply_config_and_restart "$temp_json" || return 1
+    if [ "$mode" != 3 ]; then
+        printf '已启用 ACME 自动申请和续期；首次签发完成后才能连接，请留意 sing-box 日志。\n'
+    fi
     save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
     open_firewall_port "$port" udp || printf '防火墙未能完全放行，请检查 UDP %s。\n' "$port" >&2
     link=$(hysteria2_link "$password" "$domain" "$port" "$tag") || return 1
