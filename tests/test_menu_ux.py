@@ -130,8 +130,7 @@ menu_warp < /dev/null
 [[ $(wc -l < "$PROBE_COUNT_FILE") -eq 2 ]]
 ''',
         )
-        self.assertIn("共 1 个（VLESS 1 · AnyTLS 0 · SS2022 0 · Hy2 0）", out)
-        self.assertIn("7) 添加 Hysteria 2 节点", out)
+        self.assertIn("共 1 个（VLESS 1 · AnyTLS 0 · SS2022 0）", out)
         self.assertLess(out.index("日常操作"), out.index("添加节点"))
         self.assertLess(out.index("分流规则"), out.index("出口管理"))
         self.assertIn("添加 WARP 出口（免费自动注册）", out)

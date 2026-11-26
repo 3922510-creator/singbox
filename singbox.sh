@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.6  |  快捷指令: SB / sb
+#  版本: v3.8.5  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
-#    • VLESS-Reality / AnyTLS-Reality / SS2022 / Hysteria 2 节点管理（二维码 / 分享链接）
+#    • VLESS-Reality / AnyTLS-Reality / SS2022 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / 回程路由 / DNS / 防火墙 / Swap）
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.6"
+SCRIPT_VERSION="v3.8.5"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -261,24 +261,22 @@ menu_invalid() {
 
 # 摘要行辅助（主菜单 / 各子菜单顶栏复用）
 nodes_total_count() {
-    local v a s h
+    local v a s
     v=$(count_by_type vless)
     a=$(count_by_type anytls)
     s=$(ss2022_count 2>/dev/null || echo 0)
-    h=$(count_by_type hysteria2)
-    echo $((v + a + s + h))
+    echo $((v + a + s))
 }
 nodes_summary_line() {
-    local v a s h tot
+    local v a s tot
     v=$(count_by_type vless)
     a=$(count_by_type anytls)
     s=$(ss2022_count 2>/dev/null || echo 0)
-    h=$(count_by_type hysteria2)
-    tot=$((v + a + s + h))
+    tot=$((v + a + s))
     if [ "$tot" -eq 0 ]; then
         printf '%b暂无节点%b' "$YELLOW" "$PLAIN"
     else
-        printf '%b共 %s 个%b（VLESS %s · AnyTLS %s · SS2022 %s · Hy2 %s）' "$GREEN" "$tot" "$PLAIN" "$v" "$a" "$s" "$h"
+        printf '%b共 %s 个%b（VLESS %s · AnyTLS %s · SS2022 %s）' "$GREEN" "$tot" "$PLAIN" "$v" "$a" "$s"
     fi
 }
 warp_summary_short() {
@@ -556,19 +554,18 @@ get_public_ip() {
 }
 
 open_firewall_port() {
-    local port="$1" proto
-    shift
-    [ "$#" -gt 0 ] || set -- tcp udp
+    local port="$1"
     if command -v ufw &>/dev/null && [[ $(LC_ALL=C ufw status 2>/dev/null) == 'Status: active'* ]]; then
-        for proto; do ufw allow "$port/$proto" &>/dev/null || return 1; done
+        ufw allow "$port"/tcp &>/dev/null || return 1
+        ufw allow "$port"/udp &>/dev/null || return 1
     elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
-        for proto; do firewall-cmd --zone=public --add-port="$port/$proto" --permanent &>/dev/null || return 1; done
+        firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null || return 1
+        firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null || return 1
         firewall-cmd --reload &>/dev/null || return 1
     elif command -v iptables &>/dev/null && case "$(iptables -S INPUT 2>/dev/null)" in *'-P INPUT DROP'*) true ;; *) false ;; esac; then
         # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
-        for proto; do
-            iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
-        done
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT || return 1
         echo -e "${YELLOW}已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
     fi
 }
@@ -730,7 +727,7 @@ prompt_delete_index() {
     while [ $i -lt "$total" ]; do
         local t
         t=$(inbound_node_type "$i")
-        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls || "$t" = ss2022 || "$t" = hysteria2 ]]; }; then
+        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls || "$t" = ss2022 ]]; }; then
             idxs+=("$i")
         fi
         i=$((i+1))
@@ -754,7 +751,6 @@ prompt_delete_index() {
             vless)  display=$(node_display_name "$tag"); extra=" [VLESS]" ;;
             anytls) display=$(node_display_name "$tag"); extra=" [AnyTLS]" ;;
             ss2022) display=$(node_display_name "$tag"); extra=" [SS2022]" ;;
-            hysteria2) display=$(node_display_name "$tag"); extra=" [Hysteria 2]" ;;
             direct)
                 local rip rp
                 rip=$(inbound_field "$real" "override_address")
@@ -1213,129 +1209,6 @@ add_ss2022_node() {
     return 0
 }
 
-hysteria2_link() {
-    local password="$1" domain="$2" port="$3" tag="$4" encoded
-    [ -n "$password" ] && [ -n "$domain" ] || return 1
-    encoded=$(jq -nr --arg pw "$password" '$pw | @uri') || return 1
-    printf 'hysteria2://%s@%s:%s/?sni=%s#%s' "$encoded" "$domain" "$port" "$domain" "$(node_link_fragment "$tag")"
-}
-
-hysteria2_acme_cert_saved() {
-    local domain="${1,,}" cert
-    # sing-box 的内置 ACME 使用 CertMagic 的磁盘缓存；签发中不会有这对文件。
-    for cert in "$META_DIR"/acme/certificates/*/"$domain/$domain.crt"; do
-        [[ -s "$cert" && -s "${cert%.crt}.key" ]] || continue
-        if command -v openssl >/dev/null 2>&1; then
-            openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || continue
-        fi
-        return 0
-    done
-    return 1
-}
-
-add_hysteria2_node() {
-    if [ ! -x "$BIN_FILE" ]; then
-        printf '请先安装 Sing-box 核心。\n' >&2
-        return 1
-    fi
-    ensure_config
-    local port domain cert key mode email token acme dns_challenge=null tls name tag password temp_json link show_qr
-    port=$(read_valid_port '监听端口（UDP）[默认 8444]: ' 8444 1) || return 0
-    read -rp '证书域名（DNS 须解析到本机）: ' domain || return 1
-    local domain_re='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
-    if [[ ${#domain} -gt 253 || ! "$domain" =~ $domain_re ]]; then
-        printf '域名无效。\n' >&2
-        return 1
-    fi
-    printf '  1) 自动申请 / 续期（HTTP-01，需公网 80/TCP）\n  2) 自动申请 / 续期（Cloudflare DNS-01，不占用 Web 端口）\n  3) 使用已有证书 / 私钥\n'
-    read -rp '证书方式 [1-3，默认 1]: ' mode || return 1
-    mode=${mode:-1}
-    case "$mode" in
-        1|2)
-            if ! singbox_version_ge 1.14.0 || ! "$BIN_FILE" version | grep -Eq '^Tags:.*[ ,]with_acme([ ,]|$)'; then
-                printf '自动申请需要 sing-box >= 1.14.0 且编译时启用 with_acme；也可使用已有证书。\n' >&2
-                return 1
-            fi
-            if [ "$mode" = 1 ]; then
-                if port_in_use 80; then
-                    printf '80 端口已被占用或配置使用；请选择 DNS-01 或已有证书。\n' >&2
-                    return 1
-                fi
-                printf '请确认公网可直连本机 80/TCP（包括防火墙和云安全组），续期时也需可达。\n'
-            fi
-            read -rp 'Let’s Encrypt 联系邮箱（可留空）: ' email || return 1
-            if [ "$mode" = 2 ]; then
-                read -rsp 'Cloudflare API Token（该域名 Zone:Read、DNS:Edit）: ' token || return 1
-                printf '\n'
-                if [[ -z "$token" ]]; then
-                    printf 'Cloudflare API Token 不能为空。\n' >&2
-                    return 1
-                fi
-                dns_challenge=$(printf '%s' "$token" | jq -Rs '{provider:"cloudflare", api_token:.}') || return 1
-                unset token
-            fi
-            acme=$(printf '%s\n' "$dns_challenge" | jq --arg domain "$domain" --arg dir "$META_DIR/acme" --arg email "$email" '
-                {type:"acme", provider:"letsencrypt", domain:[$domain], data_directory:$dir, disable_tls_alpn_challenge:true}
-                + (if $email == "" then {} else {email:$email} end)
-                + (if . == null then {} else {dns01_challenge:.} end)
-            ') || return 1
-            tls=$(printf '%s\n' "$acme" | jq --arg domain "$domain" '{enabled:true, server_name:$domain, certificate_provider:.}') || return 1
-            ;;
-        3)
-            read -rp '完整证书链 PEM 路径: ' cert || return 1
-            read -rp '私钥 PEM 路径: ' key || return 1
-            if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -r "$cert" || ! -f "$key" || ! -r "$key" ]]; then
-                printf '请输入可读证书和私钥文件的绝对路径。\n' >&2
-                return 1
-            fi
-            tls=$(jq -n --arg domain "$domain" --arg cert "$cert" --arg key "$key" \
-                '{enabled:true, server_name:$domain, certificate_path:$cert, key_path:$key}') || return 1
-            ;;
-        *) printf '无效的证书方式。\n' >&2; return 1 ;;
-    esac
-    name=$(read_node_name) || return 1
-    tag="hysteria2-$port"
-    password=$("$BIN_FILE" generate uuid) || return 1
-    [ -n "$password" ] || return 1
-    # 证书配置经 stdin 交给 jq，避免 DNS API Token 进入命令行参数。
-    temp_json=$(printf '%s\n' "$tls" | jq -s --argjson port "$port" --arg tag "$tag" --arg pw "$password" '
-        .[1] as $tls | .[0] | .inbounds += [{type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
-                                            users:[{password:$pw}], tls:$tls}]
-    ' "$CONFIG_FILE" -) || return 1
-    if [ "$mode" != 3 ]; then
-        printf '正在启动 sing-box 并申请 %s 的证书…\n' "$domain"
-    fi
-    apply_config_and_restart "$temp_json" || return 1
-    save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
-    open_firewall_port "$port" udp || printf '防火墙未能完全放行，请检查 UDP %s。\n' "$port" >&2
-    if [ "$mode" != 3 ]; then
-        local elapsed=0
-        while ! hysteria2_acme_cert_saved "$domain"; do
-            if [ "$elapsed" -ge 20 ]; then
-                printf '节点已保存，但暂未检测到证书。此处停止等待，sing-box 仍负责签发和重试。\n'
-                if [ "$mode" = 1 ]; then
-                    printf '请检查域名的 A/AAAA 记录是否指向本机，以及公网 80/TCP 是否能直连。\n'
-                else
-                    printf '请检查 Cloudflare API Token 是否对目标域名拥有 Zone:Read、DNS:Edit 权限。\n'
-                fi
-                printf '稍后到「节点管理 → 查看节点链接 / 二维码」复查；详细错误见「服务与核心 → 查看运行日志」。\n'
-                return 0
-            fi
-            if (( elapsed % 5 == 0 )); then printf '等待证书签发（已等 %s 秒）…\n' "$elapsed"; fi
-            sleep 1
-            elapsed=$((elapsed+1))
-        done
-        printf '已检测到 %s 的证书，可以导入节点。\n' "$domain"
-    fi
-    link=$(hysteria2_link "$password" "$domain" "$port" "$tag") || return 1
-    printf 'Hysteria 2 | %s | UDP 端口: %s\n分享链接: %s\n' "$(node_display_name "$tag")" "$port" "$link"
-    if command -v qrencode &>/dev/null; then
-        read -rp '  显示二维码？[y/N]: ' show_qr || return 0
-        [[ "$show_qr" =~ ^[Yy]$ ]] && qrencode -t ANSIUTF8 "$link"
-    fi
-    return 0
-}
-
 view_node_links() {
     ensure_config
     local ip host
@@ -1356,17 +1229,14 @@ view_node_links() {
           (.tag // ""),
           ((.listen_port // "") | tostring),
           (if kind == "vless" then (.users[0].uuid // "")
-           elif kind == "anytls" or kind == "hysteria2" then (.users[0].password // "")
+           elif kind == "anytls" then (.users[0].password // "")
            else (.method // "") end),
           (if kind == "ss2022" then (.password // "")
            else (.tls.server_name // "") end),
           (if kind == "ss2022" then ""
-           elif kind == "hysteria2" then
-             (if (.tls.certificate_provider | type) == "object" and .tls.certificate_provider.type == "acme"
-              then (.tls.certificate_provider.data_directory // "") else "" end)
            else (.tls.reality.short_id[0] // "") end)
         ] | join("\u001f");
-      (rows("vless"), rows("anytls"), rows("ss2022"), rows("hysteria2"))
+      (rows("vless"), rows("anytls"), rows("ss2022"))
     ' "$CONFIG_FILE" 2>/dev/null) || return 1
 
     if [ -z "$records" ]; then
@@ -1403,19 +1273,6 @@ view_node_links() {
                 echo -e "      公钥: ${pbk:-未记录}"
                 echo -e "      密码: $f4"
                 echo -e "      链接: ${YELLOW}$link${PLAIN}"
-                declare -F ui_subrule >/dev/null && ui_subrule
-                ;;
-            hysteria2)
-                if [[ "$f6" == "$META_DIR/acme" ]] && ! hysteria2_acme_cert_saved "$f5"; then
-                    printf '  Hysteria 2 | %s | UDP 端口: %s\n      暂未检测到证书，签发后会显示链接和二维码。可到「服务与核心 → 查看运行日志」排查。\n' "$display" "$port"
-                    declare -F ui_subrule >/dev/null && ui_subrule
-                    continue
-                fi
-                link=$(hysteria2_link "$f4" "$f5" "$port" "$tag") || continue
-                links+=("$link")
-                tags+=("$display")
-                idx=$((idx+1))
-                printf '  [%s] Hysteria 2 | %s | UDP 端口: %s\n      链接: %s\n' "$idx" "$display" "$port" "$link"
                 declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
             ss2022)
@@ -1580,7 +1437,7 @@ diagnose_config() {
             fi
         fi
         menu_header "配置管理与回滚" "$CONFIG_FILE" "$cfg_stat"
-        ui_kv "入站明细" "VLESS $(count_by_type vless) · AnyTLS $(count_by_type anytls) · SS2022 $(ss2022_count 2>/dev/null || echo 0) · Hy2 $(count_by_type hysteria2) · 转发 $(count_by_type direct)"
+        ui_kv "入站明细" "VLESS $(count_by_type vless) · AnyTLS $(count_by_type anytls) · SS2022 $(ss2022_count 2>/dev/null || echo 0) · 转发 $(count_by_type direct)"
         ui_kv "上次备份" "$([ -f "${CONFIG_FILE}.bak" ] && echo "${GREEN}可用（上一版有效配置）${PLAIN}" || echo "${YELLOW}暂无备份${PLAIN}")"
         menu_section "查看与编辑"
         menu_option 1 "查看原始 JSON 配置"
@@ -1682,7 +1539,7 @@ menu_system() {
 menu_nodes() {
     local c
     while true; do
-        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022 / Hysteria 2" "$(nodes_summary_line)"
+        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022" "$(nodes_summary_line)"
         menu_section "日常操作"
         menu_option 1 "查看节点链接 / 二维码"
         menu_option 2 "修改节点备注（无需重启）"
@@ -1691,9 +1548,8 @@ menu_nodes() {
         menu_option 4 "添加 VLESS-Reality 节点"
         menu_option 5 "添加 AnyTLS-Reality 节点"
         menu_option 6 "添加 Shadowsocks 2022 节点"
-        menu_option 7 "添加 Hysteria 2 节点"
         menu_back
-        read_menu_choice "请选择 [0-7]" || return 0
+        read_menu_choice "请选择 [0-6]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -1703,7 +1559,6 @@ menu_nodes() {
             4) add_reality_node; pause ;;
             5) add_anytls_node; pause ;;
             6) add_ss2022_node; pause ;;
-            7) add_hysteria2_node; pause ;;
             0) return ;;
             *) menu_invalid ;;
         esac
