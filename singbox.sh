@@ -5,7 +5,7 @@
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
-#    • VLESS-Reality / AnyTLS-Reality / SS2022 节点管理（二维码 / 分享链接）
+#    • VLESS-Reality / AnyTLS-Reality / SS2022 / Hysteria 2 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
 #    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / 回程路由 / DNS / 防火墙 / Swap）
@@ -261,22 +261,24 @@ menu_invalid() {
 
 # 摘要行辅助（主菜单 / 各子菜单顶栏复用）
 nodes_total_count() {
-    local v a s
+    local v a s h
     v=$(count_by_type vless)
     a=$(count_by_type anytls)
     s=$(ss2022_count 2>/dev/null || echo 0)
-    echo $((v + a + s))
+    h=$(count_by_type hysteria2)
+    echo $((v + a + s + h))
 }
 nodes_summary_line() {
-    local v a s tot
+    local v a s h tot
     v=$(count_by_type vless)
     a=$(count_by_type anytls)
     s=$(ss2022_count 2>/dev/null || echo 0)
-    tot=$((v + a + s))
+    h=$(count_by_type hysteria2)
+    tot=$((v + a + s + h))
     if [ "$tot" -eq 0 ]; then
         printf '%b暂无节点%b' "$YELLOW" "$PLAIN"
     else
-        printf '%b共 %s 个%b（VLESS %s · AnyTLS %s · SS2022 %s）' "$GREEN" "$tot" "$PLAIN" "$v" "$a" "$s"
+        printf '%b共 %s 个%b（VLESS %s · AnyTLS %s · SS2022 %s · Hy2 %s）' "$GREEN" "$tot" "$PLAIN" "$v" "$a" "$s" "$h"
     fi
 }
 warp_summary_short() {
@@ -554,18 +556,19 @@ get_public_ip() {
 }
 
 open_firewall_port() {
-    local port="$1"
+    local port="$1" proto
+    shift
+    [ "$#" -gt 0 ] || set -- tcp udp
     if command -v ufw &>/dev/null && [[ $(LC_ALL=C ufw status 2>/dev/null) == 'Status: active'* ]]; then
-        ufw allow "$port"/tcp &>/dev/null || return 1
-        ufw allow "$port"/udp &>/dev/null || return 1
+        for proto; do ufw allow "$port/$proto" &>/dev/null || return 1; done
     elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
-        firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null || return 1
-        firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null || return 1
+        for proto; do firewall-cmd --zone=public --add-port="$port/$proto" --permanent &>/dev/null || return 1; done
         firewall-cmd --reload &>/dev/null || return 1
     elif command -v iptables &>/dev/null && case "$(iptables -S INPUT 2>/dev/null)" in *'-P INPUT DROP'*) true ;; *) false ;; esac; then
         # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT || return 1
+        for proto; do
+            iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
+        done
         echo -e "${YELLOW}已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
     fi
 }
@@ -727,7 +730,7 @@ prompt_delete_index() {
     while [ $i -lt "$total" ]; do
         local t
         t=$(inbound_node_type "$i")
-        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls || "$t" = ss2022 ]]; }; then
+        if [ "$t" == "$filter_type" ] || { [ "$filter_type" = node ] && [[ "$t" = vless || "$t" = anytls || "$t" = ss2022 || "$t" = hysteria2 ]]; }; then
             idxs+=("$i")
         fi
         i=$((i+1))
@@ -751,6 +754,7 @@ prompt_delete_index() {
             vless)  display=$(node_display_name "$tag"); extra=" [VLESS]" ;;
             anytls) display=$(node_display_name "$tag"); extra=" [AnyTLS]" ;;
             ss2022) display=$(node_display_name "$tag"); extra=" [SS2022]" ;;
+            hysteria2) display=$(node_display_name "$tag"); extra=" [Hysteria 2]" ;;
             direct)
                 local rip rp
                 rip=$(inbound_field "$real" "override_address")
@@ -1209,6 +1213,55 @@ add_ss2022_node() {
     return 0
 }
 
+hysteria2_link() {
+    local password="$1" domain="$2" port="$3" tag="$4" encoded
+    [ -n "$password" ] && [ -n "$domain" ] || return 1
+    encoded=$(jq -nr --arg pw "$password" '$pw | @uri') || return 1
+    printf 'hysteria2://%s@%s:%s/?sni=%s#%s' "$encoded" "$domain" "$port" "$domain" "$(node_link_fragment "$tag")"
+}
+
+add_hysteria2_node() {
+    if [ ! -x "$BIN_FILE" ]; then
+        printf '请先安装 Sing-box 核心。\n' >&2
+        return 1
+    fi
+    ensure_config
+    local port domain cert key name tag password temp_json link show_qr
+    port=$(read_valid_port '监听端口（UDP）[默认 8444]: ' 8444 1) || return 0
+    read -rp '证书域名（DNS 须解析到本机）: ' domain || return 1
+    local domain_re='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+    if [[ ${#domain} -gt 253 || ! "$domain" =~ $domain_re ]]; then
+        printf '域名无效。\n' >&2
+        return 1
+    fi
+    read -rp '完整证书链 PEM 路径: ' cert || return 1
+    read -rp '私钥 PEM 路径: ' key || return 1
+    if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -r "$cert" || ! -f "$key" || ! -r "$key" ]]; then
+        printf '请输入可读证书和私钥文件的绝对路径。\n' >&2
+        return 1
+    fi
+    name=$(read_node_name) || return 1
+    tag="hysteria2-$port"
+    password=$("$BIN_FILE" generate uuid) || return 1
+    [ -n "$password" ] || return 1
+    temp_json=$(jq --argjson port "$port" --arg tag "$tag" --arg pw "$password" \
+        --arg domain "$domain" --arg cert "$cert" --arg key "$key" '
+        .inbounds += [{type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
+                       users:[{password:$pw}], tls:{enabled:true, server_name:$domain,
+                       certificate_path:$cert, key_path:$key}}]
+    ' "$CONFIG_FILE") || return 1
+    apply_config_and_restart "$temp_json" || return 1
+    save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
+    open_firewall_port "$port" udp || printf '防火墙未能完全放行，请检查 UDP %s。\n' "$port" >&2
+    link=$(hysteria2_link "$password" "$domain" "$port" "$tag") || return 1
+    printf 'Hysteria 2 | %s | UDP 端口: %s\n分享链接: %s\n' "$(node_display_name "$tag")" "$port" "$link"
+    if command -v qrencode &>/dev/null; then
+        read -rp '  显示二维码？[y/N]: ' show_qr || return 0
+        [[ "$show_qr" =~ ^[Yy]$ ]] && qrencode -t ANSIUTF8 "$link"
+    fi
+    return 0
+}
+
 view_node_links() {
     ensure_config
     local ip host
@@ -1229,14 +1282,14 @@ view_node_links() {
           (.tag // ""),
           ((.listen_port // "") | tostring),
           (if kind == "vless" then (.users[0].uuid // "")
-           elif kind == "anytls" then (.users[0].password // "")
+           elif kind == "anytls" or kind == "hysteria2" then (.users[0].password // "")
            else (.method // "") end),
           (if kind == "ss2022" then (.password // "")
            else (.tls.server_name // "") end),
           (if kind == "ss2022" then ""
            else (.tls.reality.short_id[0] // "") end)
         ] | join("\u001f");
-      (rows("vless"), rows("anytls"), rows("ss2022"))
+      (rows("vless"), rows("anytls"), rows("ss2022"), rows("hysteria2"))
     ' "$CONFIG_FILE" 2>/dev/null) || return 1
 
     if [ -z "$records" ]; then
@@ -1273,6 +1326,14 @@ view_node_links() {
                 echo -e "      公钥: ${pbk:-未记录}"
                 echo -e "      密码: $f4"
                 echo -e "      链接: ${YELLOW}$link${PLAIN}"
+                declare -F ui_subrule >/dev/null && ui_subrule
+                ;;
+            hysteria2)
+                link=$(hysteria2_link "$f4" "$f5" "$port" "$tag") || continue
+                links+=("$link")
+                tags+=("$display")
+                idx=$((idx+1))
+                printf '  [%s] Hysteria 2 | %s | UDP 端口: %s\n      链接: %s\n' "$idx" "$display" "$port" "$link"
                 declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
             ss2022)
@@ -1437,7 +1498,7 @@ diagnose_config() {
             fi
         fi
         menu_header "配置管理与回滚" "$CONFIG_FILE" "$cfg_stat"
-        ui_kv "入站明细" "VLESS $(count_by_type vless) · AnyTLS $(count_by_type anytls) · SS2022 $(ss2022_count 2>/dev/null || echo 0) · 转发 $(count_by_type direct)"
+        ui_kv "入站明细" "VLESS $(count_by_type vless) · AnyTLS $(count_by_type anytls) · SS2022 $(ss2022_count 2>/dev/null || echo 0) · Hy2 $(count_by_type hysteria2) · 转发 $(count_by_type direct)"
         ui_kv "上次备份" "$([ -f "${CONFIG_FILE}.bak" ] && echo "${GREEN}可用（上一版有效配置）${PLAIN}" || echo "${YELLOW}暂无备份${PLAIN}")"
         menu_section "查看与编辑"
         menu_option 1 "查看原始 JSON 配置"
@@ -1539,7 +1600,7 @@ menu_system() {
 menu_nodes() {
     local c
     while true; do
-        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022" "$(nodes_summary_line)"
+        menu_header "节点管理" "VLESS-Reality / AnyTLS-Reality / SS2022 / Hysteria 2" "$(nodes_summary_line)"
         menu_section "日常操作"
         menu_option 1 "查看节点链接 / 二维码"
         menu_option 2 "修改节点备注（无需重启）"
@@ -1548,8 +1609,9 @@ menu_nodes() {
         menu_option 4 "添加 VLESS-Reality 节点"
         menu_option 5 "添加 AnyTLS-Reality 节点"
         menu_option 6 "添加 Shadowsocks 2022 节点"
+        menu_option 7 "添加 Hysteria 2 节点"
         menu_back
-        read_menu_choice "请选择 [0-6]" || return 0
+        read_menu_choice "请选择 [0-7]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -1559,6 +1621,7 @@ menu_nodes() {
             4) add_reality_node; pause ;;
             5) add_anytls_node; pause ;;
             6) add_ss2022_node; pause ;;
+            7) add_hysteria2_node; pause ;;
             0) return ;;
             *) menu_invalid ;;
         esac
