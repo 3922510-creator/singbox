@@ -15,7 +15,7 @@ class Hysteria2Tests(unittest.TestCase):
         core = os.environ.get('SING_BOX_TEST_BIN') or shutil.which('sing-box')
         if not core or not shutil.which('openssl'):
             self.skipTest('requires sing-box and openssl')
-        names = '''add_hysteria2_node hysteria2_link view_node_links open_firewall_port
+        names = '''add_hysteria2_node hysteria2_link hysteria2_acme_cert_saved view_node_links open_firewall_port
                    count_by_type ss2022_count nodes_total_count prompt_delete_index
                    inbound_count inbound_field inbound_node_type format_url_host singbox_version_ge
                    node_link_fragment read_node_name save_node_name node_display_name'''
@@ -69,7 +69,17 @@ if singbox_version_ge 1.14.0 && "$BIN_FILE" version | grep -Eq '^Tags:.*[ ,]with
     if add_hysteria2_node <<< $'hy.example.com\n2\n\n'; then exit 1; fi
     [[ $(nodes_total_count) == 1 ]]
     HTTP_BUSY=no TEST_PORT=8445
+    cache_cert() {
+        local dir="$META_DIR/acme/certificates/acme-v02.api.letsencrypt.org-directory/$1"
+        mkdir -p "$dir"
+        cp "$D/cert.pem" "$dir/$1.crt"
+        cp "$D/key.pem" "$dir/$1.key"
+    }
+    sleep() { if [[ "$TEST_PORT" == 8445 ]]; then cache_cert http.example.com; fi; }
     add_hysteria2_node > "$D/http" <<< $'http.example.com\n\nadmin@example.com\nHTTP\n'
+    grep -Fq '等待证书签发' "$D/http"
+    grep -Fq '已检测到 http.example.com 的证书' "$D/http"
+    grep -Fq '@http.example.com:8445/' "$D/http"
     jq -e --arg dir "$META_DIR/acme" '.inbounds[1].tls.certificate_provider == {
         type:"acme", provider:"letsencrypt", domain:["http.example.com"], data_directory:$dir,
         disable_tls_alpn_challenge:true, email:"admin@example.com"}' "$CONFIG_FILE" >/dev/null
@@ -77,7 +87,15 @@ if singbox_version_ge 1.14.0 && "$BIN_FILE" version | grep -Eq '^Tags:.*[ ,]with
     add_hysteria2_node > "$D/dns" <<< $'dns.example.com\n2\n\nnot-a-real-token\nDNS\n'
     jq -e '.inbounds[2].tls.certificate_provider | .domain == ["dns.example.com"] and
         .dns01_challenge == {provider:"cloudflare", api_token:"not-a-real-token"}' "$CONFIG_FILE" >/dev/null
-    ! grep -Fq 'not-a-real-token' "$D/dns"
+    grep -Fq '暂未检测到证书' "$D/dns"
+    grep -Fq 'Zone:Read、DNS:Edit' "$D/dns"
+    if grep -Eq 'not-a-real-token|hysteria2://' "$D/dns"; then exit 1; fi
+    view_node_links > "$D/pending"
+    grep -Fq '暂未检测到证书' "$D/pending"
+    if grep -Fq '@dns.example.com:8446/' "$D/pending"; then exit 1; fi
+    cache_cert dns.example.com
+    view_node_links > "$D/ready"
+    grep -Fq '@dns.example.com:8446/' "$D/ready"
     [[ $(cat "$D/firewall") == $'allow 8444/udp\nallow 8445/udp\nallow 8446/udp' ]]
 fi
 ''', 'hy2-regression', tmp, core], capture_output=True, text=True, timeout=15)

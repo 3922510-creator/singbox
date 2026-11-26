@@ -1220,6 +1220,19 @@ hysteria2_link() {
     printf 'hysteria2://%s@%s:%s/?sni=%s#%s' "$encoded" "$domain" "$port" "$domain" "$(node_link_fragment "$tag")"
 }
 
+hysteria2_acme_cert_saved() {
+    local domain="${1,,}" cert
+    # sing-box 的内置 ACME 使用 CertMagic 的磁盘缓存；签发中不会有这对文件。
+    for cert in "$META_DIR"/acme/certificates/*/"$domain/$domain.crt"; do
+        [[ -s "$cert" && -s "${cert%.crt}.key" ]] || continue
+        if command -v openssl >/dev/null 2>&1; then
+            openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || continue
+        fi
+        return 0
+    done
+    return 1
+}
+
 add_hysteria2_node() {
     if [ ! -x "$BIN_FILE" ]; then
         printf '请先安装 Sing-box 核心。\n' >&2
@@ -1289,12 +1302,31 @@ add_hysteria2_node() {
         .[1] as $tls | .[0] | .inbounds += [{type:"hysteria2", tag:$tag, listen:"::", listen_port:$port,
                                             users:[{password:$pw}], tls:$tls}]
     ' "$CONFIG_FILE" -) || return 1
-    apply_config_and_restart "$temp_json" || return 1
     if [ "$mode" != 3 ]; then
-        printf '已启用 ACME 自动申请和续期；首次签发完成后才能连接，请留意 sing-box 日志。\n'
+        printf '正在启动 sing-box 并申请 %s 的证书…\n' "$domain"
     fi
+    apply_config_and_restart "$temp_json" || return 1
     save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
     open_firewall_port "$port" udp || printf '防火墙未能完全放行，请检查 UDP %s。\n' "$port" >&2
+    if [ "$mode" != 3 ]; then
+        local elapsed=0
+        while ! hysteria2_acme_cert_saved "$domain"; do
+            if [ "$elapsed" -ge 20 ]; then
+                printf '节点已保存，但暂未检测到证书。此处停止等待，sing-box 仍负责签发和重试。\n'
+                if [ "$mode" = 1 ]; then
+                    printf '请检查域名的 A/AAAA 记录是否指向本机，以及公网 80/TCP 是否能直连。\n'
+                else
+                    printf '请检查 Cloudflare API Token 是否对目标域名拥有 Zone:Read、DNS:Edit 权限。\n'
+                fi
+                printf '稍后到「节点管理 → 查看节点链接 / 二维码」复查；详细错误见「服务与核心 → 查看运行日志」。\n'
+                return 0
+            fi
+            if (( elapsed % 5 == 0 )); then printf '等待证书签发（已等 %s 秒）…\n' "$elapsed"; fi
+            sleep 1
+            elapsed=$((elapsed+1))
+        done
+        printf '已检测到 %s 的证书，可以导入节点。\n' "$domain"
+    fi
     link=$(hysteria2_link "$password" "$domain" "$port" "$tag") || return 1
     printf 'Hysteria 2 | %s | UDP 端口: %s\n分享链接: %s\n' "$(node_display_name "$tag")" "$port" "$link"
     if command -v qrencode &>/dev/null; then
@@ -1329,6 +1361,9 @@ view_node_links() {
           (if kind == "ss2022" then (.password // "")
            else (.tls.server_name // "") end),
           (if kind == "ss2022" then ""
+           elif kind == "hysteria2" then
+             (if (.tls.certificate_provider | type) == "object" and .tls.certificate_provider.type == "acme"
+              then (.tls.certificate_provider.data_directory // "") else "" end)
            else (.tls.reality.short_id[0] // "") end)
         ] | join("\u001f");
       (rows("vless"), rows("anytls"), rows("ss2022"), rows("hysteria2"))
@@ -1371,6 +1406,11 @@ view_node_links() {
                 declare -F ui_subrule >/dev/null && ui_subrule
                 ;;
             hysteria2)
+                if [[ "$f6" == "$META_DIR/acme" ]] && ! hysteria2_acme_cert_saved "$f5"; then
+                    printf '  Hysteria 2 | %s | UDP 端口: %s\n      暂未检测到证书，签发后会显示链接和二维码。可到「服务与核心 → 查看运行日志」排查。\n' "$display" "$port"
+                    declare -F ui_subrule >/dev/null && ui_subrule
+                    continue
+                fi
                 link=$(hysteria2_link "$f4" "$f5" "$port" "$tag") || continue
                 links+=("$link")
                 tags+=("$display")
