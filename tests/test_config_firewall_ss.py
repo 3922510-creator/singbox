@@ -319,6 +319,50 @@ if delete_ss_outbound; then exit 16; fi
 cmp "$CONFIG_FILE" "$ROOT/before"
 ''')
 
+    @unittest.skipUnless(CORE, 'real sing-box required')
+    def test_ss_add_from_uri_variants(self):
+        self.run_functions([
+            'has_ss_outbound', '_ss_pct_decode', '_ss_b64_decode', '_parse_ss_uri',
+            'add_ss_outbound', 'save_and_check_config', 'apply_config_and_restart',
+        ], r'''
+printf '{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}' > "$CONFIG_FILE"
+
+# 1. SIP002 标准 Base64 (SS2022 128-gcm，密钥含 + / =)
+b64_1=$(printf '2022-blake3-aes-128-gcm:ABCDEFGHIJKLMNOP+/012A==' | base64 -w0)
+add_ss_outbound <<< "ss://${b64_1}@198.247.125.232:22880#家宽节点"
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.outbounds[1] | .tag == "isp-ss" and .server == "198.247.125.232" and .server_port == 22880 and .method == "2022-blake3-aes-128-gcm" and .password == "ABCDEFGHIJKLMNOP+/012A=="' "$CONFIG_FILE" >/dev/null
+
+# 2. SIP002 Base64URL 无 padding + IPv6 主机
+b64u=$(printf '2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==' | base64 -w0 | tr '+/' '-_' | tr -d '=')
+add_ss_outbound <<< "ss://${b64u}@[2001:db8::9]:22881#v6"
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.outbounds[1] | .server == "2001:db8::9" and .server_port == 22881 and .password == "AAAAAAAAAAAAAAAAAAAAAA=="' "$CONFIG_FILE" >/dev/null
+
+# 3. SIP022 SS2022 URL 编码明文（含 %3A、%2B、%2F、%3D）
+add_ss_outbound <<< 'ss://2022-blake3-aes-128-gcm%3AABCDEFGHIJKLMNOP%2B%2F012A%3D%3D@isp.example.com:22882#sip022'
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.outbounds[1] | .server == "isp.example.com" and .server_port == 22882 and .method == "2022-blake3-aes-128-gcm" and .password == "ABCDEFGHIJKLMNOP+/012A=="' "$CONFIG_FILE" >/dev/null
+
+# 4. SIP022 SS2022 明文多段密钥 (serverKey:userKey)
+add_ss_outbound <<< 'ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==:BBBBBBBBBBBBBBBBBBBBBB==@203.0.113.10:22883#multi'
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.outbounds[1] | .server == "203.0.113.10" and .server_port == 22883 and .password == "AAAAAAAAAAAAAAAAAAAAAA==:BBBBBBBBBBBBBBBBBBBBBB=="' "$CONFIG_FILE" >/dev/null
+
+# 5. Legacy 全 Base64
+legacy=$(printf 'aes-256-gcm:my-secret-pass@203.0.113.11:8388' | base64 -w0 | tr -d '=')
+add_ss_outbound <<< "ss://${legacy}#legacy-node"
+"$BIN_FILE" check -c "$CONFIG_FILE"
+jq -e '.outbounds[1] | .server == "203.0.113.11" and .server_port == 8388 and .method == "aes-256-gcm" and .password == "my-secret-pass"' "$CONFIG_FILE" >/dev/null
+
+# 6. 非法链接与带 plugin 参数的链接均拒绝且不改现役配置
+cp "$CONFIG_FILE" "$ROOT/before-uri"
+if add_ss_outbound <<< 'ss://not-valid-link'; then exit 21; fi
+if add_ss_outbound <<< "ss://${b64_1}@198.247.125.232:70000#badport"; then exit 22; fi
+if add_ss_outbound <<< "ss://${b64_1}@198.247.125.232:22880/?plugin=obfs-local%3Bobfs%3Dhttp#plug"; then exit 23; fi
+cmp "$CONFIG_FILE" "$ROOT/before-uri"
+''', real_core=True)
+
 
 if __name__ == '__main__':
     unittest.main()

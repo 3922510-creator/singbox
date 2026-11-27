@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.8  |  快捷指令: SB / sb
+#  版本: v3.8.9  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.8"
+SCRIPT_VERSION="v3.8.9"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -3585,37 +3585,164 @@ has_ss_outbound() {
     jq -e 'any(.outbounds[]?; .tag == "isp-ss" and .type == "shadowsocks")' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
+_ss_pct_decode() {
+    local s="$1" out='' ch hex
+    while [ -n "$s" ]; do
+        if [[ "$s" == %[0-9A-Fa-f][0-9A-Fa-f]* ]]; then
+            hex="${s:1:2}"
+            [ "$hex" != "00" ] || return 1
+            printf -v ch '%b' "\\x$hex"
+            out+="$ch"
+            s="${s:3}"
+        else
+            out+="${s:0:1}"
+            s="${s:1}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+_ss_b64_decode() {
+    local s="$1" rem
+    s="${s//-/+}"
+    s="${s//_//}"
+    s="${s//[[:space:]]/}"
+    [ -n "$s" ] || return 1
+    rem=$(( ${#s} % 4 ))
+    if [ "$rem" -eq 2 ]; then s="${s}=="
+    elif [ "$rem" -eq 3 ]; then s="${s}="
+    elif [ "$rem" -eq 1 ]; then return 1
+    fi
+    printf '%s' "$s" | base64 -d 2>/dev/null | tr -d '\0'
+}
+
+# 从 stdin 解析 ss:// 链接（支持 SIP002 Base64/Base64URL、SIP022 SS2022 明文/URL编码、Legacy 全 Base64、IPv6）。
+# 输出 4 行：host / port / method / password（不通过 argv 暴露密码）。
+_parse_ss_uri() {
+    local raw rest body query='' userinfo hostport decoded='' u_dec='' host='' port='' method='' password=''
+    IFS= read -r raw || return 1
+    raw="${raw//$'\r'/}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ "$raw" == ss://* ]] || return 1
+    rest="${raw#ss://}"
+    rest="${rest%%#*}"
+    if [[ "$rest" == *\?* ]]; then
+        body="${rest%%\?*}"
+        query="${rest#*\?}"
+        if [[ "&$query&" == *"&plugin="* ]]; then
+            local pval="${query#*plugin=}"
+            pval="${pval%%&*}"
+            if [ -n "$pval" ]; then
+                printf '暂不支持带 plugin 参数的 SS 链接。\n' >&2
+                return 2
+            fi
+        fi
+    else
+        body="$rest"
+    fi
+    body="${body%/}"
+    if [[ "$body" == *@* ]]; then
+        userinfo="${body%@*}"
+        hostport="${body##*@}"
+        u_dec=$(_ss_pct_decode "$userinfo") || u_dec="$userinfo"
+        if [[ "$u_dec" == *:* ]] && [[ "${u_dec%%:*}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            method="${u_dec%%:*}"
+            password="${u_dec#*:}"
+        else
+            decoded=$(_ss_b64_decode "$userinfo") || decoded=''
+            if [[ "$decoded" != *:* ]]; then
+                decoded=$(_ss_b64_decode "$u_dec") || decoded=''
+            fi
+            [[ "$decoded" == *:* ]] || return 1
+            method="${decoded%%:*}"
+            password="${decoded#*:}"
+        fi
+    else
+        decoded=$(_ss_b64_decode "$body") || return 1
+        [[ "$decoded" == *@* ]] || return 1
+        userinfo="${decoded%@*}"
+        hostport="${decoded##*@}"
+        [[ "$userinfo" == *:* ]] || return 1
+        method="${userinfo%%:*}"
+        password="${userinfo#*:}"
+    fi
+    if [[ "$hostport" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]{1,5})$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$hostport" == *:* ]]; then
+        host="${hostport%:*}"
+        port="${hostport##*:}"
+        [[ "$host" != *:* ]] || return 1
+    else
+        return 1
+    fi
+    if ! [[ "$host" =~ ^[A-Za-z0-9_.:-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] ||
+        (( 10#$port < 1 || 10#$port > 65535 )); then
+        return 1
+    fi
+    if ! [[ "$method" =~ ^[A-Za-z0-9._-]+$ ]] || [ -z "$password" ]; then
+        return 1
+    fi
+    if [[ "$password" == *$'\n'* || "$password" == *$'\r'* ]]; then
+        return 1
+    fi
+    printf '%s\n%s\n%s\n%s\n' "$host" "$((10#$port))" "$method" "$password"
+}
+
 add_ss_outbound() {
     ensure_config || return 1
-    local host port method password choice temp_json
+    local host port method password choice temp_json parsed rc
     if ! has_ss_outbound && jq -e 'any((.outbounds[]?, .endpoints[]?); .tag == "isp-ss")' "$CONFIG_FILE" >/dev/null; then
         printf '标签 isp-ss 已被其他出口占用，未修改配置。\n' >&2; return 1
     fi
     if has_ss_outbound; then
         jq -r '.outbounds[] | select(.tag == "isp-ss") | "当前 SS 家宽：\(.server):\(.server_port) [\(.method)]；更新保留分流规则。"' "$CONFIG_FILE"
     fi
-    read -rp '  SS 家宽地址（域名 / IP，回车取消）: ' host || return 0
+    read -rp '  SS 链接（ss://...）或地址（域名 / IP，回车取消）: ' host || return 0
+    host="${host//$'\r'/}"
+    host="${host#"${host%%[![:space:]]*}"}"
+    host="${host%"${host##*[![:space:]]}"}"
     [ -n "$host" ] || return 0
-    host=${host#\[}; host=${host%\]}
-    read -rp '  SS 家宽端口: ' port || return 0
-    if ! [[ "$host" =~ ^[A-Za-z0-9_.:-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] ||
-        (( 10#$port < 1 || 10#$port > 65535 )); then
-        printf '地址或端口无效。\n' >&2; return 1
+    if [[ "$host" == ss://* ]]; then
+        if ! declare -F _parse_ss_uri >/dev/null; then
+            printf 'SS 链接解析器不可用。\n' >&2; return 1
+        fi
+        rc=0
+        parsed=$(_parse_ss_uri <<< "$host") || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            [ "$rc" -eq 2 ] || printf 'SS 链接格式无效，请检查后重试。\n' >&2
+            return 1
+        fi
+        {
+            IFS= read -r host
+            IFS= read -r port
+            IFS= read -r method
+            IFS= read -r password
+        } <<< "$parsed"
+        printf '  已解析：%s:%s [%s]\n' "$host" "$port" "$method"
+    else
+        host=${host#\[}; host=${host%\]}
+        read -rp '  SS 家宽端口: ' port || return 0
+        if ! [[ "$host" =~ ^[A-Za-z0-9_.:-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] ||
+            (( 10#$port < 1 || 10#$port > 65535 )); then
+            printf '地址或端口无效。\n' >&2; return 1
+        fi
+        printf '  1. 2022-blake3-aes-128-gcm\n  2. 2022-blake3-aes-256-gcm\n  3. 2022-blake3-chacha20-poly1305\n  4. aes-128-gcm\n  5. aes-256-gcm\n  6. chacha20-ietf-poly1305\n'
+        read -rp '  加密方式 [默认 1，须与家宽服务端一致]: ' choice || return 0
+        case "${choice:-1}" in
+            1) method=2022-blake3-aes-128-gcm ;;
+            2) method=2022-blake3-aes-256-gcm ;;
+            3) method=2022-blake3-chacha20-poly1305 ;;
+            4) method=aes-128-gcm ;;
+            5) method=aes-256-gcm ;;
+            6) method=chacha20-ietf-poly1305 ;;
+            *) printf '加密方式无效。\n' >&2; return 1 ;;
+        esac
+        read -rsp '  SS 密钥 / 密码（不回显）: ' password || { printf '\n'; return 0; }
+        printf '\n'
+        [ -n "$password" ] || { printf '密钥 / 密码不能为空。\n' >&2; return 1; }
     fi
-    printf '  1. 2022-blake3-aes-128-gcm\n  2. 2022-blake3-aes-256-gcm\n  3. 2022-blake3-chacha20-poly1305\n  4. aes-128-gcm\n  5. aes-256-gcm\n  6. chacha20-ietf-poly1305\n'
-    read -rp '  加密方式 [默认 1，须与家宽服务端一致]: ' choice || return 0
-    case "${choice:-1}" in
-        1) method=2022-blake3-aes-128-gcm ;;
-        2) method=2022-blake3-aes-256-gcm ;;
-        3) method=2022-blake3-chacha20-poly1305 ;;
-        4) method=aes-128-gcm ;;
-        5) method=aes-256-gcm ;;
-        6) method=chacha20-ietf-poly1305 ;;
-        *) printf '加密方式无效。\n' >&2; return 1 ;;
-    esac
-    read -rsp '  SS 密钥 / 密码（不回显）: ' password || { printf '\n'; return 0; }
-    printf '\n'
-    [ -n "$password" ] || { printf '密钥 / 密码不能为空。\n' >&2; return 1; }
     # 密钥不通过 argv 传递；由核心校验 SS2022 密钥长度与配置兼容性。
     temp_json=$(jq --arg host "$host" --argjson port "$((10#$port))" --arg method "$method" \
         --rawfile password /dev/fd/3 '
@@ -4018,10 +4145,103 @@ view_warp() {
     [ -f "$WARP_META" ] && echo -e "  账号元数据: $WARP_META"
 }
 
-menu_warp() {
-    local c yn exit_ip_cache='' exit_ip_config='' current_config
+manage_warp_rules() {
+    ensure_config || return 1
+    local n
+    n=$(count_split_rules)
+    if [ "${n:-0}" -eq 0 ]; then
+        view_warp_rules
+        pause
+        return 0
+    fi
+    delete_warp_rule
+    pause
+}
+
+menu_warp_manage() {
+    local c yn peer_info stack_lbl
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        add_warp
+        pause
+        return 0
+    fi
     while true; do
-        local warp_has warp_status ai_state media_state rule_count socks_status ss_status warp_peer_info warp_stack_lbl
+        [ "$(has_warp_endpoint)" -gt 0 ] || return 0
+        peer_info=$(get_warp_peer_summary)
+        stack_lbl=$(warp_stack_mode_label "$(get_warp_stack_mode)")
+        menu_header "WARP 管理" "" "${peer_info:-未知} · ${stack_lbl}"
+        menu_option 1 "接管模式（双栈 / 仅 IPv4 / 仅 IPv6 / 关闭）"
+        menu_option 2 "切换对端（IPv4 / IPv6 / 端口）"
+        menu_option 3 "重新注册 WARP 出口"
+        menu_option 4 "查看配置详情"
+        menu_option 5 "删除 WARP 出口及关联规则"
+        menu_back
+        read_menu_choice "请选择 [0-5]" || return 0
+        c="$REPLY"
+        case "$c" in
+            "") continue ;;
+            1) menu_warp_stack_mode; pause ;;
+            2) switch_warp_peer; pause ;;
+            3) add_warp; pause ;;
+            4) view_warp; pause ;;
+            5) read -rp "  确认删除 WARP 出口及全部关联分流规则？[y/N]: " yn || continue
+               if [[ "$yn" =~ ^[Yy]$ ]]; then
+                   delete_warp
+                   pause
+                   return 0
+               fi ;;
+            0) return 0 ;;
+            *) menu_invalid ;;
+        esac
+    done
+}
+
+manage_socks5_outbound() {
+    local c yn cur
+    if ! has_socks5_outbound; then
+        add_socks5_outbound
+        pause
+        return 0
+    fi
+    cur=$(jq -r 'first(.outbounds[]? | select(.tag == "socks5") | "\(.server):\(.server_port)") // ""' "$CONFIG_FILE" 2>/dev/null)
+    printf '\n  %b当前 SOCKS5：%b%s%b\n' "$DIM" "$BLUE" "${cur:-已配置}" "$PLAIN"
+    printf '  1. 更新 SOCKS5 出口\n'
+    printf '  2. 删除 SOCKS5 出口及关联规则\n'
+    read -rp '  请选择 [1-2，回车取消]: ' c || return 0
+    case "$c" in
+        '') return 0 ;;
+        1) add_socks5_outbound; pause ;;
+        2) read -rp '  确认删除 SOCKS5 出口及全部关联分流规则？[y/N]: ' yn || return 0
+           if [[ "$yn" =~ ^[Yy]$ ]]; then delete_socks5_outbound; pause; fi ;;
+        *) menu_invalid ;;
+    esac
+}
+
+manage_ss_outbound() {
+    local c yn cur
+    if ! has_ss_outbound; then
+        add_ss_outbound
+        pause
+        return 0
+    fi
+    cur=$(jq -r 'first(.outbounds[]? | select(.tag == "isp-ss") | "\(.server):\(.server_port) [\(.method)]") // ""' "$CONFIG_FILE" 2>/dev/null)
+    printf '\n  %b当前 SS 家宽：%b%s%b\n' "$DIM" "$BLUE" "${cur:-已配置}" "$PLAIN"
+    printf '  1. 更新 SS 家宽出口（支持 ss:// 链接）\n'
+    printf '  2. 删除 SS 家宽出口及关联规则\n'
+    read -rp '  请选择 [1-2，回车取消]: ' c || return 0
+    case "$c" in
+        '') return 0 ;;
+        1) add_ss_outbound; pause ;;
+        2) read -rp '  确认删除 SS 家宽出口及全部关联分流规则？[y/N]: ' yn || return 0
+           if [[ "$yn" == y ]]; then delete_ss_outbound; pause; fi ;;
+        *) menu_invalid ;;
+    esac
+}
+
+menu_warp() {
+    local c exit_ip_cache='' exit_ip_config='' current_config
+    while true; do
+        local warp_has warp_status ai_state media_state rule_count socks_status ss_status warp_brief
         warp_has=$(has_warp_endpoint)
         warp_status=$(warp_summary_short)
         socks_status=未配置
@@ -4033,44 +4253,31 @@ menu_warp() {
         fi
         ss_status=未配置
         has_ss_outbound && ss_status=已配置
-        local header_status="$warp_status / SOCKS5 $socks_status / SS $ss_status"
+        local header_status="WARP $warp_status / SOCKS5 $socks_status / SS $ss_status"
         [ -z "$exit_ip_cache" ] || header_status+=$'\n'"$exit_ip_cache"
-        menu_header "WARP / SOCKS5 / SS 出口与分流" "" "$header_status"
-        menu_section "分流规则（再次选择当前出口可关闭规则集）"
+        menu_header "出口与分流" "" "$header_status"
+        menu_section "分流规则（再次选择当前出口可关闭）"
         ai_state=$(split_ruleset_outbound "$WARP_AI_RULE_TAG")
         media_state=$(split_ruleset_outbound "$WARP_MEDIA_RULE_TAG")
         ai_state=${ai_state^^}; ai_state=${ai_state:-关}
         media_state=${media_state^^}; media_state=${media_state:-关}
         rule_count=$(count_split_rules)
-        menu_option 1 "AI 分流开关 [${ai_state}]"
-        menu_option 2 "流媒体分流开关 [${media_state}]"
-        menu_option 3 "添加自定义域名分流"
-        menu_option 4 "指定节点的全部流量出口"
-        menu_option 5 "查看分流规则（${rule_count:-0} 条）"
-        menu_option 6 "删除指定规则"
+        menu_option 1 "AI 分流 [${ai_state}]"
+        menu_option 2 "流媒体分流 [${media_state}]"
+        menu_option 3 "自定义域名分流"
+        menu_option 4 "节点全部流量分流"
+        menu_option 5 "查看 / 删除规则（${rule_count:-0} 条）"
         menu_section "出口管理"
         if [ "$warp_has" -gt 0 ]; then
-            warp_peer_info=$(get_warp_peer_summary)
-            warp_stack_lbl=$(warp_stack_mode_label "$(get_warp_stack_mode)")
-            menu_option 7 "重新注册 / 重置 WARP 出口"
+            warp_brief=$(warp_stack_mode_label "$(get_warp_stack_mode)")
+            menu_option 6 "WARP 管理 [${warp_brief}]"
         else
-            menu_option 7 "添加 WARP 出口（免费自动注册）"
+            menu_option 6 "添加 WARP 出口（免费自动注册）"
         fi
-        menu_option 8 "查看 WARP 出口详情"
-        menu_option 9 "删除 WARP 出口及全部关联规则"
-        menu_option 10 "添加 / 更新 SOCKS5 出口"
-        menu_option 11 "删除 SOCKS5 出口及全部关联规则"
-        menu_option 12 "添加 / 更新 SS 家宽出口"
-        menu_option 13 "删除 SS 家宽出口及全部关联规则"
-        if [ "$warp_has" -gt 0 ]; then
-            menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口） [${warp_peer_info:-未设置}]"
-            menu_option 15 "设置 WARP 接管模式 [${warp_stack_lbl}]"
-        else
-            menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口）"
-            menu_option 15 "设置 WARP 接管模式（双栈 / 仅 IPv4 / 仅 IPv6）"
-        fi
+        menu_option 7 "SOCKS5 出口 [${socks_status}]"
+        menu_option 8 "SS 家宽出口 [${ss_status}]（支持 ss:// 链接）"
         menu_back
-        read_menu_choice "请选择 [0-15]" || return 0
+        read_menu_choice "请选择 [0-8]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -4078,35 +4285,10 @@ menu_warp() {
             2) add_warp_media; pause ;;
             3) add_warp_route; pause ;;
             4) add_warp_node_route; pause ;;
-            5) view_warp_rules; pause ;;
-            6) delete_warp_rule; pause ;;
-            7) add_warp; pause ;;
-            8) view_warp; pause ;;
-            9) if [ "$(has_warp_endpoint)" -eq 0 ]; then
-                   echo -e "  ${YELLOW}当前没有 WARP 出口。${PLAIN}"; pause
-               else
-                   read -rp "  确认删除 WARP 出口及全部关联分流规则？[y/N]: " yn || continue
-                   if [[ "$yn" =~ ^[Yy]$ ]]; then
-                       delete_warp
-                       pause
-                   fi
-               fi ;;
-            10) add_socks5_outbound; pause ;;
-            11) if ! has_socks5_outbound; then
-                    printf '  尚未设置 SOCKS5 出口。\n'; pause
-                else
-                    read -rp '  确认删除 SOCKS5 出口及全部关联分流规则？[y/N]: ' yn || continue
-                    if [[ "$yn" =~ ^[Yy]$ ]]; then delete_socks5_outbound; pause; fi
-                fi ;;
-            12) add_ss_outbound; pause ;;
-            13) if ! has_ss_outbound; then
-                    printf '  尚未设置 SS 家宽出口。\n'; pause
-                else
-                    read -rp '  确认删除 SS 家宽出口及全部关联分流规则？[y/N]: ' yn || continue
-                    if [[ "$yn" == y ]]; then delete_ss_outbound; pause; fi
-                fi ;;
-            14) switch_warp_peer; pause ;;
-            15) menu_warp_stack_mode; pause ;;
+            5) manage_warp_rules ;;
+            6) menu_warp_manage ;;
+            7) manage_socks5_outbound ;;
+            8) manage_ss_outbound ;;
             0) return ;;
             *) menu_invalid ;;
         esac

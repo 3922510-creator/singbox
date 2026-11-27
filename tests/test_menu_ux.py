@@ -110,7 +110,8 @@ printf 'OK pause=%s\n' "$PAUSE_COUNT"
                 "inbound_count", "inbound_field", "count_by_type", "ss2022_count",
                 "nodes_summary_line", "menu_nodes",
                 "has_warp_endpoint", "has_socks5_outbound", "has_ss_outbound", "split_ruleset_outbound",
-                "count_split_rules", "warp_summary_short", "menu_warp",
+                "count_split_rules", "warp_summary_short", "manage_socks5_outbound", "manage_ss_outbound",
+                "menu_warp_manage", "menu_warp",
             ],
             r'''
 PAUSE_COUNT=0
@@ -121,9 +122,10 @@ menu_nodes <<< $'\n0\n'
 # 出口 IP 自动显示；同次菜单无配置变更不重复检测。
 PROBE_COUNT_FILE="$ROOT/probe-count"
 view_split_exit_ips() { echo probe >> "$PROBE_COUNT_FILE"; printf 'S5 IPv4：203.0.113.4\n'; }
-# SOCKS5 菜单选项能调用对应操作；无出口时删除只提示。
+# 未配置时直接进入添加流程（7=SOCKS5, 8=SS）；空回车刷新不增加 pause。
 add_socks5_outbound() { printf 'SOCKS5-menu-dispatched\n'; }
-menu_warp <<< $'\n10\n11\n0\n'
+add_ss_outbound() { printf 'SS-menu-dispatched\n'; }
+menu_warp <<< $'\n7\n8\n0\n'
 [[ "$PAUSE_COUNT" -eq 2 ]]
 [[ $(wc -l < "$PROBE_COUNT_FILE") -eq 1 ]]
 menu_warp < /dev/null
@@ -133,15 +135,15 @@ menu_warp < /dev/null
         self.assertIn("共 1 个（VLESS 1 · AnyTLS 0 · SS2022 0）", out)
         self.assertLess(out.index("日常操作"), out.index("添加节点"))
         self.assertLess(out.index("分流规则"), out.index("出口管理"))
-        self.assertIn("添加 WARP 出口（免费自动注册）", out)
-        self.assertIn("添加 / 更新 SOCKS5 出口", out)
+        self.assertIn("6) 添加 WARP 出口（免费自动注册）", out)
+        self.assertIn("7) SOCKS5 出口 [未配置]", out)
+        self.assertIn("8) SS 家宽出口 [未配置]（支持 ss:// 链接）", out)
         self.assertIn("SOCKS5-menu-dispatched", out)
+        self.assertIn("SS-menu-dispatched", out)
         self.assertIn("S5 IPv4：203.0.113.4", out)
         self.assertLess(out.index("S5 IPv4：203.0.113.4"), out.index("分流规则"))
         self.assertNotIn("正在检测", out)
-        self.assertIn("12) 添加 / 更新 SS 家宽出口", out)
-        self.assertIn("13) 删除 SS 家宽出口及全部关联规则", out)
-        self.assertIn("尚未设置 SOCKS5 出口", out)
+        self.assertIn("请选择 [0-8]", out)
 
     def test_narrow_terminal_no_overwide_fixed_dashes(self):
         source = SCRIPT.read_text(encoding="utf-8")
