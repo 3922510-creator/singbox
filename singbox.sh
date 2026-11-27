@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.7  |  快捷指令: SB / sb
+#  版本: v3.8.8  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.7"
+SCRIPT_VERSION="v3.8.8"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -290,8 +290,9 @@ warp_summary_short() {
         ' "$CONFIG_FILE" 2>/dev/null)
         if declare -F get_warp_stack_mode >/dev/null; then
             case "$(get_warp_stack_mode)" in
-                v4_*) mode_tag='仅WARP v4 · ' ;;
-                v6_*) mode_tag='仅WARP v6 · ' ;;
+                dual) mode_tag='双栈 · ' ;;
+                v4) mode_tag='WARP v4 · ' ;;
+                v6) mode_tag='WARP v6 · ' ;;
             esac
         fi
         printf '%b已配置%b（%s%s 条规则）' "$GREEN" "$PLAIN" "$mode_tag" "${rc:-0}"
@@ -3270,47 +3271,45 @@ get_warp_stack_mode() {
     jq -r --arg dns "${WARP_DNS_TAG:-sb-warp-dns}" '
       (.route.rules // []) as $r |
       ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $dns) | .key][0]) as $s |
-      if $s == null then "dual"
+      if $s == null then "off"
       else
         ($r[$s + 1] // {}) as $r1 | ($r[$s + 2] // {}) as $r2 |
-        if $r1.ip_cidr == ["::/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["0.0.0.0/0"] and $r2.outbound == "warp" then "v4_prefer_host_v6"
-        elif $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "warp" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "direct" then "v4_prefer_warp_v4"
-        elif $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "warp" then "v6_prefer_host_v4"
-        elif $r1.ip_cidr == ["::/0"] and $r1.outbound == "warp" and $r2.ip_cidr == ["0.0.0.0/0"] and $r2.outbound == "direct" then "v6_prefer_warp_v6"
+        if $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "warp" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "warp" then "dual"
+        elif $r1.ip_cidr == ["::/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["0.0.0.0/0"] and $r2.outbound == "warp" then "v4"
+        elif $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "warp" then "v6"
         else "custom" end
       end
-    ' "$CONFIG_FILE" 2>/dev/null || echo "dual"
+    ' "$CONFIG_FILE" 2>/dev/null || echo "off"
 }
 
 warp_stack_mode_label() {
-    case "${1:-dual}" in
-        dual) printf '双栈（按分流规则）' ;;
-        v4_prefer_host_v6) printf '仅WARP v4 + 本机v6（双栈优先本机v6）' ;;
-        v4_prefer_warp_v4) printf '仅WARP v4 + 本机v6（双栈优先WARP v4）' ;;
-        v6_prefer_host_v4) printf '仅WARP v6 + 本机v4（双栈优先本机v4）' ;;
-        v6_prefer_warp_v6) printf '仅WARP v6 + 本机v4（双栈优先WARP v6）' ;;
+    case "${1:-off}" in
+        off) printf '仅按分流规则' ;;
+        dual) printf '双栈（IPv4 + IPv6 走 WARP）' ;;
+        v4) printf '仅 IPv4（WARP v4 + 本机 v6）' ;;
+        v6) printf '仅 IPv6（WARP v6 + 本机 v4）' ;;
         *) printf '自定义' ;;
     esac
 }
 
 apply_warp_stack_mode() {
     ensure_config || return 1
-    local mode="${1:-dual}" temp_json dns_tag="${WARP_DNS_TAG:-sb-warp-dns}" local_dns_tag="${WARP_LOCAL_DNS_TAG:-sb-local-dns}"
+    local mode="${1:-off}" temp_json dns_tag="${WARP_DNS_TAG:-sb-warp-dns}" local_dns_tag="${WARP_LOCAL_DNS_TAG:-sb-local-dns}"
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
         printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN" >&2; return 1
     fi
     case "$mode" in
-        dual|v4_prefer_host_v6|v4_prefer_warp_v4|v6_prefer_host_v4|v6_prefer_warp_v6) ;;
-        *) printf '%b无效的 WARP IP 栈模式：%s%b\n' "$RED" "$mode" "$PLAIN" >&2; return 1 ;;
+        off|dual|v4|v6) ;;
+        *) printf '%b无效的 WARP 接管模式：%s%b\n' "$RED" "$mode" "$PLAIN" >&2; return 1 ;;
     esac
-    if [[ "$mode" == v6_* ]] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; contains(":"))' "$CONFIG_FILE" >/dev/null 2>&1; then
-        printf '%b当前 WARP 出口缺少 IPv6 隧道地址，无法启用仅 WARP IPv6 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
+    if [ "$mode" = v6 ] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; contains(":"))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        printf '%b当前 WARP 出口缺少 IPv6 隧道地址，无法启用仅 IPv6 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
     fi
-    if [[ "$mode" == v4_* ]] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; (contains(":") | not))' "$CONFIG_FILE" >/dev/null 2>&1; then
-        printf '%b当前 WARP 出口缺少 IPv4 隧道地址，无法启用仅 WARP IPv4 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
+    if [ "$mode" = v4 ] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; (contains(":") | not))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        printf '%b当前 WARP 出口缺少 IPv4 隧道地址，无法启用仅 IPv4 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
     fi
     temp_json=$(jq --arg mode "$mode" --arg wdns "$dns_tag" --arg ldns "$local_dns_tag" '
-        # 先剥离已有的 WARP 全局按栈规则块
+        # 先剥离已有的 WARP 全局接管规则块
         def strip_stack_rules:
           (. // []) as $r |
           ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
@@ -3335,20 +3334,18 @@ apply_warp_stack_mode() {
           else . end;
         .route = (.route // {}) |
         .route.rules = ((.route.rules // []) | strip_stack_rules) |
-        if $mode == "dual" then
+        if $mode == "off" then
           .endpoints |= map(if .tag == "warp" then .peers[0].allowed_ips = ["0.0.0.0/0", "::/0"] else . end) |
           cleanup_sb_dns
         else
-          (if ($mode | startswith("v4_")) then ["0.0.0.0/0"] else ["::/0"] end) as $allowed |
-          (if ($mode | startswith("v4_")) then "1.1.1.1" else "2606:4700:4700::1111" end) as $dns_ip |
-          (if $mode == "v4_prefer_host_v6" then
+          (if $mode == "v4" then ["0.0.0.0/0"] elif $mode == "v6" then ["::/0"] else ["0.0.0.0/0", "::/0"] end) as $allowed |
+          (if $mode == "v6" then "2606:4700:4700::1111" else "1.1.1.1" end) as $dns_ip |
+          (if $mode == "dual" then
+             [{action:"resolve", server:$wdns}, {ip_cidr:["0.0.0.0/0"], outbound:"warp"}, {ip_cidr:["::/0"], outbound:"warp"}]
+           elif $mode == "v4" then
              [{action:"resolve", server:$wdns, strategy:"prefer_ipv6"}, {ip_cidr:["::/0"], outbound:"direct"}, {ip_cidr:["0.0.0.0/0"], outbound:"warp"}]
-           elif $mode == "v4_prefer_warp_v4" then
-             [{action:"resolve", server:$wdns, strategy:"prefer_ipv4"}, {ip_cidr:["0.0.0.0/0"], outbound:"warp"}, {ip_cidr:["::/0"], outbound:"direct"}]
-           elif $mode == "v6_prefer_host_v4" then
-             [{action:"resolve", server:$wdns, strategy:"prefer_ipv4"}, {ip_cidr:["0.0.0.0/0"], outbound:"direct"}, {ip_cidr:["::/0"], outbound:"warp"}]
            else
-             [{action:"resolve", server:$wdns, strategy:"prefer_ipv6"}, {ip_cidr:["::/0"], outbound:"warp"}, {ip_cidr:["0.0.0.0/0"], outbound:"direct"}]
+             [{action:"resolve", server:$wdns, strategy:"prefer_ipv4"}, {ip_cidr:["0.0.0.0/0"], outbound:"direct"}, {ip_cidr:["::/0"], outbound:"warp"}]
            end) as $stack_rules |
           .endpoints |= map(if .tag == "warp" then .peers[0].allowed_ips = $allowed else . end) |
           (if (.dns?.servers? // []) | length == 0 then
@@ -3362,7 +3359,7 @@ apply_warp_stack_mode() {
         end
     ' "$CONFIG_FILE") || return 1
     if apply_config_and_restart "$temp_json"; then
-        printf '%bWARP IP 栈模式已切换为：%s。%b\n' "$GREEN" "$(warp_stack_mode_label "$mode")" "$PLAIN"
+        printf '%bWARP 接管模式已切换为：%s。%b\n' "$GREEN" "$(warp_stack_mode_label "$mode")" "$PLAIN"
     else
         return 1
     fi
@@ -3376,21 +3373,18 @@ menu_warp_stack_mode() {
     fi
     local cur choice
     cur=$(get_warp_stack_mode)
-    printf '\n  %b当前 WARP IP 栈模式：%b%s%b\n' "$DIM" "$BLUE" "$(warp_stack_mode_label "$cur")" "$PLAIN"
-    printf '  1. 双栈（默认，仅按分流规则走 WARP）\n'
-    printf '  2. 仅 WARP IPv4 + 本机 IPv6（双栈优先本机 IPv6，NAT 独立 IPv6 推荐）\n'
-    printf '  3. 仅 WARP IPv4 + 本机 IPv6（双栈优先 WARP IPv4）\n'
-    printf '  4. 仅 WARP IPv6 + 本机 IPv4（双栈优先本机 IPv4，纯 IPv4 补 IPv6 推荐）\n'
-    printf '  5. 仅 WARP IPv6 + 本机 IPv4（双栈优先 WARP IPv6）\n'
-    printf '  说明：具体分流规则（AI / 流媒体 / 域名 / 节点 / 家宽）仍优先于全局分栈。\n'
-    read -rp '  选择模式 [1-5，回车取消]: ' choice || return 0
+    printf '\n  %b当前模式：%b%s%b\n' "$DIM" "$BLUE" "$(warp_stack_mode_label "$cur")" "$PLAIN"
+    printf '  1. 为本机添加双栈（IPv4 + IPv6 均走 WARP）\n'
+    printf '  2. 为本机添加 IPv4（IPv4 走 WARP，IPv6 走本机）\n'
+    printf '  3. 为本机添加 IPv6（IPv6 走 WARP，IPv4 走本机）\n'
+    printf '  4. 关闭全局接管（仅按分流规则走 WARP）\n'
+    read -rp '  请选择 [1-4，回车取消]: ' choice || return 0
     case "$choice" in
         '') return 0 ;;
         1) apply_warp_stack_mode dual ;;
-        2) apply_warp_stack_mode v4_prefer_host_v6 ;;
-        3) apply_warp_stack_mode v4_prefer_warp_v4 ;;
-        4) apply_warp_stack_mode v6_prefer_host_v4 ;;
-        5) apply_warp_stack_mode v6_prefer_warp_v6 ;;
+        2) apply_warp_stack_mode v4 ;;
+        3) apply_warp_stack_mode v6 ;;
+        4) apply_warp_stack_mode off ;;
         *) menu_invalid ;;
     esac
 }
@@ -3513,7 +3507,7 @@ add_warp() (
     if [ "$probe_state" = fail ]; then
         printf '%b提示：自动探测未连通，可在菜单中切换 WARP 对端（IPv4/IPv6/端口），或核查本机出站 UDP。%b\n' "$YELLOW" "$PLAIN"
     else
-        printf '%b提示：返回菜单即可开启 AI / 流媒体分流、设置 IP 栈模式，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
+        printf '%b提示：返回菜单即可开启 AI / 流媒体分流、设置 WARP 接管模式，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
     fi
 )
 
@@ -3824,8 +3818,8 @@ view_warp_rules() {
     fi
     if declare -F get_warp_stack_mode >/dev/null && [ "$(has_warp_endpoint)" -gt 0 ]; then
         mode=$(get_warp_stack_mode)
-        if [ "$mode" != dual ]; then
-            printf '  [全局分栈] %s（在菜单「设置 WARP IP 栈模式」中切换）\n' "$(warp_stack_mode_label "$mode")"
+        if [ "$mode" != off ]; then
+            printf '  [全局接管] %s（在菜单「设置 WARP 接管模式」中切换）\n' "$(warp_stack_mode_label "$mode")"
         fi
     fi
 }
@@ -4019,7 +4013,7 @@ view_warp() {
        select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and ($r[$i].outbound? // "") == "warp")] | length
     ' "$CONFIG_FILE" 2>/dev/null)
     echo -e "  当前对端地址: ${BLUE}${peer_info:-未知}${PLAIN}"
-    echo -e "  当前 IP 栈模式: ${BLUE}$(warp_stack_mode_label "$mode")${PLAIN}"
+    echo -e "  当前接管模式: ${BLUE}$(warp_stack_mode_label "$mode")${PLAIN}"
     echo -e "  指向 warp 的分流规则数: ${BLUE}${rc:-0}${PLAIN}"
     [ -f "$WARP_META" ] && echo -e "  账号元数据: $WARP_META"
 }
@@ -4070,10 +4064,10 @@ menu_warp() {
         menu_option 13 "删除 SS 家宽出口及全部关联规则"
         if [ "$warp_has" -gt 0 ]; then
             menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口） [${warp_peer_info:-未设置}]"
-            menu_option 15 "设置 WARP IP 栈模式 [${warp_stack_lbl}]"
+            menu_option 15 "设置 WARP 接管模式 [${warp_stack_lbl}]"
         else
             menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口）"
-            menu_option 15 "设置 WARP IP 栈模式（仅 v4 / 仅 v6 / 双栈）"
+            menu_option 15 "设置 WARP 接管模式（双栈 / 仅 IPv4 / 仅 IPv6）"
         fi
         menu_back
         read_menu_choice "请选择 [0-15]" || return 0

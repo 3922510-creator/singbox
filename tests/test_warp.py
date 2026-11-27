@@ -385,50 +385,49 @@ svc_active() { return 0; }
 svc_restart() { :; }
 sleep() { :; }
 ''' + consts + '\n' + funcs + r'''
-[[ "$(get_warp_stack_mode)" == dual ]]
+[[ "$(get_warp_stack_mode)" == off ]]
 
-# 1. 仅 WARP IPv4 + 本机 IPv6（双栈优先本机 IPv6）
-apply_warp_stack_mode v4_prefer_host_v6
+# 1. 为本机添加双栈（IPv4 + IPv6 均走 WARP）
+apply_warp_stack_mode dual
 "$BIN_FILE" check -c "$CONFIG_FILE"
-[[ "$(get_warp_stack_mode)" == v4_prefer_host_v6 ]]
+[[ "$(get_warp_stack_mode)" == dual ]]
+jq -e '.endpoints[0].peers[0].allowed_ips == ["0.0.0.0/0", "::/0"]' "$CONFIG_FILE" >/dev/null
+jq -e '.dns.servers | any(.tag == "sb-warp-dns" and .server == "1.1.1.1" and .detour == "warp")' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rules[-3].action == "resolve" and .route.rules[-2].ip_cidr == ["0.0.0.0/0"] and .route.rules[-2].outbound == "warp" and .route.rules[-1].ip_cidr == ["::/0"] and .route.rules[-1].outbound == "warp"' "$CONFIG_FILE" >/dev/null
+[[ "$(count_split_rules)" == 0 ]]
+
+# 2. 为本机添加 IPv4（IPv4 走 WARP，IPv6 走本机）
+apply_warp_stack_mode v4
+"$BIN_FILE" check -c "$CONFIG_FILE"
+[[ "$(get_warp_stack_mode)" == v4 ]]
 jq -e '.endpoints[0].peers[0].allowed_ips == ["0.0.0.0/0"]' "$CONFIG_FILE" >/dev/null
 jq -e '.dns.servers | any(.tag == "sb-warp-dns" and .server == "1.1.1.1" and .detour == "warp")' "$CONFIG_FILE" >/dev/null
 jq -e '.route.rules[-3].action == "resolve" and .route.rules[-3].strategy == "prefer_ipv6" and .route.rules[-2].ip_cidr == ["::/0"] and .route.rules[-2].outbound == "direct" and .route.rules[-1].ip_cidr == ["0.0.0.0/0"] and .route.rules[-1].outbound == "warp"' "$CONFIG_FILE" >/dev/null
 [[ "$(count_split_rules)" == 0 ]]
 
-# 2. 在单栈模式下添加自定义域名和 AI 规则集，必须插入到全局按栈块之前
+# 在单栈模式下添加自定义域名和 AI 规则集，必须插入到全局接管块之前
 add_warp_route <<< 'openai.com'
 add_warp_ai
 "$BIN_FILE" check -c "$CONFIG_FILE"
 [[ "$(count_split_rules)" == 2 ]]
 jq -e '.route.rules[0].domain_suffix == ["openai.com"] and .route.rules[1].rule_set == "geosite-ai" and .route.rules[2].action == "resolve"' "$CONFIG_FILE" >/dev/null
-view_warp_rules | grep -q '全局分栈'
+view_warp_rules | grep -q '全局接管'
 
-# 删除普通规则序号 1 不应破坏后面的全局栈块
+# 删除普通规则序号 1 不应破坏后面的全局接管块
 delete_warp_rule <<< '1'
 "$BIN_FILE" check -c "$CONFIG_FILE"
 [[ "$(count_split_rules)" == 1 ]]
-[[ "$(get_warp_stack_mode)" == v4_prefer_host_v6 ]]
+[[ "$(get_warp_stack_mode)" == v4 ]]
 
-# 3. 切换到仅 WARP IPv4（双栈优先 WARP IPv4）
-apply_warp_stack_mode v4_prefer_warp_v4
+# 3. 为本机添加 IPv6（IPv6 走 WARP，IPv4 走本机）
+apply_warp_stack_mode v6
 "$BIN_FILE" check -c "$CONFIG_FILE"
-[[ "$(get_warp_stack_mode)" == v4_prefer_warp_v4 ]]
-jq -e '.route.rules[-2].outbound == "warp" and .route.rules[-1].outbound == "direct"' "$CONFIG_FILE" >/dev/null
-
-# 4. 切换到仅 WARP IPv6 + 本机 IPv4（双栈优先本机 IPv4 & 双栈优先 WARP IPv6）
-apply_warp_stack_mode v6_prefer_host_v4
-"$BIN_FILE" check -c "$CONFIG_FILE"
-[[ "$(get_warp_stack_mode)" == v6_prefer_host_v4 ]]
+[[ "$(get_warp_stack_mode)" == v6 ]]
 jq -e '.endpoints[0].peers[0].allowed_ips == ["::/0"]' "$CONFIG_FILE" >/dev/null
 jq -e '.dns.servers | any(.tag == "sb-warp-dns" and .server == "2606:4700:4700::1111" and .detour == "warp")' "$CONFIG_FILE" >/dev/null
+jq -e '.route.rules[-3].strategy == "prefer_ipv4" and .route.rules[-2].ip_cidr == ["0.0.0.0/0"] and .route.rules[-2].outbound == "direct" and .route.rules[-1].ip_cidr == ["::/0"] and .route.rules[-1].outbound == "warp"' "$CONFIG_FILE" >/dev/null
 
-apply_warp_stack_mode v6_prefer_warp_v6
-"$BIN_FILE" check -c "$CONFIG_FILE"
-[[ "$(get_warp_stack_mode)" == v6_prefer_warp_v6 ]]
-jq -e '.route.rules[-3].strategy == "prefer_ipv6" and .route.rules[-2].ip_cidr == ["::/0"] and .route.rules[-2].outbound == "warp"' "$CONFIG_FILE" >/dev/null
-
-# 5. probe_split_outbound 在仅 IPv6 模式下只请求 api6.ipify.org
+# 4. probe_split_outbound 在仅 IPv6 模式下只请求 api6.ipify.org
 curl() {
     case "${@: -1}" in
       https://api6.ipify.org) echo 2a09:bac5::1 ;;
@@ -439,18 +438,18 @@ curl() {
 out=$(probe_split_outbound warp WARP)
 [[ "$out" == *"WARP IPV6: 2a09:bac5::1"* && "$out" != *" IP: "* ]]
 
-# 6. 切回双栈模式应清理 sb-warp-dns / sb-local-dns 并恢复双栈 allowed_ips
-apply_warp_stack_mode dual
+# 5. 关闭全局接管应清理 sb-warp-dns / sb-local-dns 并恢复双栈 allowed_ips
+apply_warp_stack_mode off
 "$BIN_FILE" check -c "$CONFIG_FILE"
-[[ "$(get_warp_stack_mode)" == dual ]]
+[[ "$(get_warp_stack_mode)" == off ]]
 jq -e '.endpoints[0].peers[0].allowed_ips == ["0.0.0.0/0", "::/0"]' "$CONFIG_FILE" >/dev/null
 jq -e 'has("dns") | not' "$CONFIG_FILE" >/dev/null
 jq -e '.route | has("default_domain_resolver") | not' "$CONFIG_FILE" >/dev/null
 
-# 7. 若已有用户自定义 DNS，启用单栈与删除 WARP 都必须保留用户 DNS
+# 6. 若已有用户自定义 DNS，启用接管与删除 WARP 都必须保留用户 DNS
 jq '.dns = {servers:[{tag:"user-dns", type:"udp", server:"9.9.9.9"}], final:"user-dns"} | .route.default_domain_resolver = "user-dns"' "$CONFIG_FILE" > "$D/custom.json"
 mv "$D/custom.json" "$CONFIG_FILE"
-apply_warp_stack_mode v4_prefer_host_v6
+apply_warp_stack_mode v4
 "$BIN_FILE" check -c "$CONFIG_FILE"
 jq -e '.dns.final == "user-dns" and .route.default_domain_resolver == "user-dns" and (.dns.servers | map(.tag) == ["user-dns", "sb-warp-dns"])' "$CONFIG_FILE" >/dev/null
 delete_warp
