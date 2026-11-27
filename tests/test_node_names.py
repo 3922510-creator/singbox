@@ -114,7 +114,7 @@ read_valid_port() { printf '%s' "$2"; }
 singbox_version_ge() { return 0; }
 save_and_check_config() { printf '%s' "$1" > "$CONFIG_FILE"; }
 save_reality_meta() { :; }
-open_firewall_port() { :; }
+report_firewall_port() { :; }
 svc_restart() { :; }
 command() { if [ "$1" = -v ] && [ "$2" = qrencode ]; then return 0; else builtin command "$@"; fi; }
 qrencode() { printf '%s' "$3" > "$META_DIR/qr-link"; }

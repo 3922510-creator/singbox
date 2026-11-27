@@ -56,8 +56,15 @@ sudo bash singbox.sh
 - 免费 WARP 账号自动注册与配置（直连 Cloudflare 官方 API，无需 Zero Trust 或第三方注册工具），默认接入 `162.159.192.8:2408/UDP`，不会自动开启分流
 - AI 分流开关（`SagerNet/sing-geosite` `geosite-category-ai-chat-!cn.srs`，默认每 24 小时自动更新）
 - 流媒体分流开关（`SagerNet/sing-geosite` `geosite-category-entertainment@!cn.srs`，默认每 24 小时自动更新）
-- AI、流媒体、域名后缀、指定入站节点均可选择 WARP 或 SOCKS5；AI、流媒体再次选择当前出口即关闭该规则
-- 查看、删除两种出口的分流规则；删除出口仅清理指向该出口的分流规则
+- AI、流媒体、域名后缀、指定入站节点均可选择 WARP、SOCKS5 或 SS 家宽；AI、流媒体再次选择当前出口即关闭该规则
+- 查看、删除三种出口的分流规则；删除出口仅清理指向该出口的分流规则
+
+### v3.8.6：配置保护、防火墙与 SS 家宽
+
+- 已存在的配置若损坏、为空或不是 JSON 对象，脚本会报错退出，保留原文件和 `.bak`，不会自动重置。只有配置不存在时才初始化；各操作遇到配置错误立即中止。
+- VLESS-Reality / AnyTLS-Reality 只申请放行 TCP；SS2022 和端口转发申请 TCP + UDP。防火墙结果单独显示，失败或未识别时不再显示“已放行”。原生 iptables/ip6tables 仅尝试为 INPUT 默认 DROP 补规则，自定义链、nftables、规则持久化和云安全组仍需人工核对。
+- `sb → WARP / SOCKS5 / SS 出口与分流 → 12` 添加或更新 SS 家宽，使用 `isp-ss` 标签，也可接管已有同名 Shadowsocks 出站。地址、端口、加密方式和密钥需与家宽服务端一致；支持三种 SS2022 方式与 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。不安装或修改远端家宽服务。
+- SS 家宽复用 AI、流媒体、域名和指定节点分流，以及临时核心出口 IP 检测；添加出口不会自动启用分流或更改默认出口。更新保留规则及原出站其他选项；配置经核心校验，启动失败自动回滚。菜单 `13` 删除 SS 出口及关联分流规则，保留其他出口；SS 为默认出口时拒绝删除。
 
 ### 网络加速（BBR / BBRv3）
 

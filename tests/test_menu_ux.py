@@ -109,7 +109,7 @@ printf 'OK pause=%s\n' "$PAUSE_COUNT"
                 "menu_back", "read_menu_choice", "menu_invalid",
                 "inbound_count", "inbound_field", "count_by_type", "ss2022_count",
                 "nodes_summary_line", "menu_nodes",
-                "has_warp_endpoint", "has_socks5_outbound", "split_ruleset_outbound",
+                "has_warp_endpoint", "has_socks5_outbound", "has_ss_outbound", "split_ruleset_outbound",
                 "count_split_rules", "warp_summary_short", "menu_warp",
             ],
             r'''
@@ -139,7 +139,8 @@ menu_warp < /dev/null
         self.assertIn("S5 IPv4：203.0.113.4", out)
         self.assertLess(out.index("S5 IPv4：203.0.113.4"), out.index("分流规则"))
         self.assertNotIn("正在检测", out)
-        self.assertNotIn("12)", out)
+        self.assertIn("12) 添加 / 更新 SS 家宽出口", out)
+        self.assertIn("13) 删除 SS 家宽出口及全部关联规则", out)
         self.assertIn("尚未设置 SOCKS5 出口", out)
 
     def test_narrow_terminal_no_overwide_fixed_dashes(self):

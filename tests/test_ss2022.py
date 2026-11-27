@@ -45,7 +45,7 @@ ss() { return 1; }
 netstat() { return 1; }
 svc_active() { return 0; }
 svc_restart() { :; }
-open_firewall_port() { [[ "$1" == 8388 ]]; }
+report_firewall_port() { [[ "$1" == 8388 ]]; }
 add_ss2022_node > "$D/add" <<<$'08388\n测试节点'
 "$BIN_FILE" check -c "$CONFIG_FILE"
 jq -e '.inbounds[0] | .type=="shadowsocks" and .method=="2022-blake3-aes-256-gcm" and .listen_port==8388 and (.password|length==44)' "$CONFIG_FILE" >/dev/null
@@ -55,7 +55,7 @@ view_node_links > "$D/links"; grep -q '^      链接: ss://2022-blake3-aes-256-g
 cp "$CONFIG_FILE" "$D/previous"
 attempt=0
 svc_restart() { attempt=$((attempt+1)); [[ "$attempt" -eq 2 ]]; }
-open_firewall_port() { touch "$D/unexpected-firewall"; }
+report_firewall_port() { touch "$D/unexpected-firewall"; }
 if add_ss2022_node > "$D/failed" <<<$'8388\n8389\n失败节点'; then exit 1; fi
 cmp "$CONFIG_FILE" "$D/previous"
 [[ "$attempt" == 2 && ! -e "$D/unexpected-firewall" && $(node_display_name ss2022-8389) == ss2022-8389 ]]

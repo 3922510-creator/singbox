@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.5  |  快捷指令: SB / sb
+#  版本: v3.8.6  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
 #    • VLESS-Reality / AnyTLS-Reality / SS2022 节点管理（二维码 / 分享链接）
 #    • TCP/UDP 端口转发
-#    • Cloudflare WARP 出口（AI / 流媒体 / 自定义分流）
+#    • WARP / SOCKS5 / SS 家宽出口（AI / 流媒体 / 自定义分流）
 #    • 实用小工具（流媒体解锁检测 / 回程路由 / DNS / 防火墙 / Swap）
 #    • 网络加速（BBR / BBRv3 拥塞控制切换 + BBRv3 内核安装）
 #    • 配置校验 + 自动回滚 + 并发锁
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.5"
+SCRIPT_VERSION="v3.8.6"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -382,9 +382,15 @@ apk_ensure_community() {
 
 # ==================== 安全读取与配置管理 ====================
 ensure_config() {
-    mkdir -p /etc/sing-box "$META_DIR"
-    if [ ! -f "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-        cat > "$CONFIG_FILE" <<'EOF'
+    mkdir -p /etc/sing-box "$META_DIR" || return 1
+    if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+        if [ ! -f "$CONFIG_FILE" ] || ! jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+            printf '配置文件损坏或不是 JSON 对象：%s；原文件与备份保持不变，请先修复或恢复。\n' "$CONFIG_FILE" >&2
+            return 1
+        fi
+    else
+        # 仅初始化不存在的配置；已存在但损坏的文件绝不能自动覆盖。
+        (umask 077; set -o noclobber; cat > "$CONFIG_FILE" <<'EOF'
 {
   "log": {"level": "info", "timestamp": true},
   "inbounds": [],
@@ -392,6 +398,7 @@ ensure_config() {
   "route": {"rules": []}
 }
 EOF
+        ) || return 1
     fi
     chmod 600 "$CONFIG_FILE"
 }
@@ -553,21 +560,51 @@ get_public_ip() {
     printf '%s\n' "${ip:-127.0.0.1}"
 }
 
+# 返回 0=已处理，1=失败，2=未自动处理；绝不将未识别的防火墙报告为已放行。
 open_firewall_port() {
-    local port="$1"
+    local port="$1" network="${2:-tcp,udp}" proto tool status
+    local protocols=()
+    validate_port "$port" || return 1
+    case "$network" in
+        tcp|udp) protocols=("$network") ;;
+        tcp,udp) protocols=(tcp udp) ;;
+        *) printf '不支持的端口协议：%s\n' "$network" >&2; return 1 ;;
+    esac
     if command -v ufw &>/dev/null && [[ $(LC_ALL=C ufw status 2>/dev/null) == 'Status: active'* ]]; then
-        ufw allow "$port"/tcp &>/dev/null || return 1
-        ufw allow "$port"/udp &>/dev/null || return 1
+        for proto in "${protocols[@]}"; do
+            ufw allow "$port/$proto" &>/dev/null || return 1
+        done
     elif command -v firewall-cmd &>/dev/null && svc_active_name firewalld; then
-        firewall-cmd --zone=public --add-port="$port"/tcp --permanent &>/dev/null || return 1
-        firewall-cmd --zone=public --add-port="$port"/udp --permanent &>/dev/null || return 1
+        for proto in "${protocols[@]}"; do
+            firewall-cmd --zone=public --add-port="$port/$proto" --permanent &>/dev/null || return 1
+        done
         firewall-cmd --reload &>/dev/null || return 1
-    elif command -v iptables &>/dev/null && case "$(iptables -S INPUT 2>/dev/null)" in *'-P INPUT DROP'*) true ;; *) false ;; esac; then
-        # 无 ufw/firewalld 但 INPUT 是 DROP 策略（Alpine / 纯 iptables 环境）：显式放行
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || return 1
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT || return 1
-        echo -e "${YELLOW}已用 iptables 放行 ${port}；持久化：rc-service iptables save（或写入 /etc/iptables/rules-save）${PLAIN}"
+    else
+        # 原生 nftables / 自定义链无法安全推断。仅对明确的 DROP 默认策略补规则。
+        for tool in iptables ip6tables; do
+            command -v "$tool" &>/dev/null || continue
+            status=$("$tool" -S INPUT 2>/dev/null) || continue
+            case "$status" in
+                *'-P INPUT DROP'*)
+                    for proto in "${protocols[@]}"; do
+                        "$tool" -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ||
+                            "$tool" -I INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
+                    done ;;
+            esac
+        done
+        printf '原生防火墙仅尝试补充 IPv4/IPv6 INPUT DROP 放行；未核实自定义链、nftables 或持久化，请人工检查 %s/%s。\n' "$port" "$network" >&2
+        return 2
     fi
+}
+
+report_firewall_port() {
+    local port="$1" network="$2" rc=0
+    open_firewall_port "$port" "$network" || rc=$?
+    case "$rc" in
+        0) printf '防火墙：已放行 %s/%s（云安全组需另行核对）。\n' "$port" "$network" ;;
+        1) printf '防火墙：放行失败或仅部分成功，请检查 %s/%s；节点配置已保留。\n' "$port" "$network" >&2 ;;
+        *) printf '防火墙：未确认自动放行，请检查 %s/%s 及云安全组。\n' "$port" "$network" >&2 ;;
+    esac
 }
 
 get_singbox_status() {
@@ -775,6 +812,7 @@ prompt_delete_index() {
 
 # ==================== 系统管理 ====================
 install_singbox() {
+    ensure_config || return 1
     echo -e "${BLUE}正在获取最新版 Sing-box...${PLAIN}"
     local tag arch url tmp new_bin old_bin="" bin_dir stage_bin
     tag=$(curl -fsSL --connect-timeout 10 --max-time 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest \
@@ -859,7 +897,7 @@ install_singbox() {
     if [ "$INIT_SYS" != "systemd" ] || [ ! -f "$SERVICE_FILE" ]; then
         install_service_file
     fi
-    ensure_config
+    ensure_config || return 1
     if svc_restart && sleep 1 && svc_active; then
         rm -rf -- "$tmp"
         echo -e "${GREEN}安装/更新成功！版本: ${tag}${PLAIN}"
@@ -1012,7 +1050,7 @@ view_logs() {
 # ==================== 节点操作 ====================
 add_reality_node() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
-    ensure_config
+    ensure_config || return 1
 
     echo -e "\n  ${CYAN}▌ 添加 VLESS-Reality 节点${PLAIN}"
     local port
@@ -1053,13 +1091,13 @@ add_reality_node() {
     if apply_config_and_restart "$temp_json"; then
         save_reality_meta "$tag" "$public_key"
         save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
-        open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+        report_firewall_port "$port" tcp
         local ip host
         ip=$(get_public_ip)
         host=$(format_url_host "$ip")
         local link="vless://$uuid@$host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
-        echo -e "  ${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
+        echo -e "  ${GREEN}节点配置已保存，服务已启动；防火墙结果见上方。${PLAIN}"
         declare -F ui_subrule >/dev/null && ui_subrule
         echo -e "  服务器 IP  : ${BLUE}$ip${PLAIN}"
         echo -e "  端口       : ${BLUE}$port${PLAIN}"
@@ -1084,7 +1122,7 @@ add_reality_node() {
 
 add_anytls_node() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
-    ensure_config
+    ensure_config || return 1
     if ! singbox_version_ge 1.12.0; then
         echo -e "${RED}当前核心不支持 AnyTLS（需要 sing-box >= 1.12.0）。${PLAIN}"
         echo -e "${YELLOW}请先到「系统管理 -> 安装 / 更新 Sing-box 核心」升级再来。${PLAIN}"
@@ -1131,13 +1169,13 @@ add_anytls_node() {
     if apply_config_and_restart "$temp_json"; then
         save_reality_meta "$tag" "$public_key"
         save_node_name "$tag" "$name" || printf '节点已创建，但备注保存失败，可稍后重新设置。\n' >&2
-        open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+        report_firewall_port "$port" tcp
         local ip host
         ip=$(get_public_ip)
         host=$(format_url_host "$ip")
         local link="anytls://$password@$host:$port/?security=reality&sni=$sni&fp=chrome&pbk=$public_key&sid=$short_id#$(node_link_fragment "$tag")"
         printf '节点备注   : %s\n' "$(node_display_name "$tag")"
-        echo -e "  ${GREEN}节点添加成功！（已放行防火墙）${PLAIN}"
+        echo -e "  ${GREEN}节点配置已保存，服务已启动；防火墙结果见上方。${PLAIN}"
         declare -F ui_subrule >/dev/null && ui_subrule
         echo -e "  服务器 IP  : ${BLUE}$ip${PLAIN}"
         echo -e "  端口       : ${BLUE}$port${PLAIN}"
@@ -1180,7 +1218,7 @@ add_ss2022_node() {
         printf '请先安装 Sing-box 核心。\n' >&2
         return 1
     fi
-    ensure_config
+    ensure_config || return 1
     local port name tag password method=2022-blake3-aes-256-gcm temp_json ip link show_qr
     port=$(read_valid_port '监听端口 [默认 8388]: ' 8388 1) || return 0
     name=$(read_node_name) || return 1
@@ -1194,7 +1232,7 @@ add_ss2022_node() {
         --arg pw "$password" '.inbounds += [{type:"shadowsocks",tag:$tag,listen:"::",listen_port:$port,method:$method,password:$pw}]' "$CONFIG_FILE") || return 1
     apply_config_and_restart "$temp_json" || return 1
     save_node_name "$tag" "$name" || printf '节点已保存，但备注保存失败。\n' >&2
-    open_firewall_port "$port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$port" >&2
+    report_firewall_port "$port" tcp,udp
     ip=$(get_public_ip)
     if [[ "$ip" == 127.0.0.1 || -z "$ip" ]]; then
         printf '节点已保存；未获取到公网 IP，请稍后在节点管理中查看链接。\n'
@@ -1210,7 +1248,7 @@ add_ss2022_node() {
 }
 
 view_node_links() {
-    ensure_config
+    ensure_config || return 1
     local ip host
     ip=$(get_public_ip)
     host=$(format_url_host "$ip")
@@ -1297,7 +1335,7 @@ view_node_links() {
 }
 
 delete_node() {
-    ensure_config
+    ensure_config || return 1
     local real_idx del_tag del_display yn
     real_idx=$(prompt_delete_index "要删除的节点" node)
     [ -z "$real_idx" ] && return 0
@@ -1330,7 +1368,7 @@ delete_node() {
 # ==================== 端口转发 ====================
 add_port_forward() {
     [ ! -f "$BIN_FILE" ] && echo -e "${RED}请先安装 Sing-box！${PLAIN}" && return 1
-    ensure_config
+    ensure_config || return 1
 
     echo -e "\n  ${CYAN}▌ 添加 TCP/UDP 端口转发${PLAIN}"
     local local_port remote_ip remote_port
@@ -1354,13 +1392,13 @@ add_port_forward() {
                    "$CONFIG_FILE") || return 1
 
     if apply_config_and_restart "$temp_json"; then
-        open_firewall_port "$local_port" || printf '防火墙未能完全放行，请检查 TCP/UDP %s。\n' "$local_port" >&2
+        report_firewall_port "$local_port" tcp,udp
         echo -e "${GREEN}转发成功：本机 [${local_port}] -> ${remote_ip}:${remote_port}${PLAIN}"
     fi
 }
 
 view_port_forwards() {
-    ensure_config
+    ensure_config || return 1
     echo -e "\n  ${CYAN}▌ 端口转发列表${PLAIN}"
     ui_subrule
 
@@ -1391,7 +1429,7 @@ view_port_forwards() {
 }
 
 delete_port_forward() {
-    ensure_config
+    ensure_config || return 1
     local total
     total=$(count_by_type "direct")
     if [ "$total" -eq 0 ]; then
@@ -1458,7 +1496,7 @@ diagnose_config() {
                else
                    local editor="vi" edit_tmp edited_json
                    command -v nano &>/dev/null && editor="nano"
-                   ensure_config
+                   ensure_config || return 1
                    if edit_tmp=$(mktemp "${CONFIG_FILE%/*}/.sb-edit.XXXXXX") && install -m 600 "$CONFIG_FILE" "$edit_tmp"; then
                        "$editor" "$edit_tmp"
                        if cmp -s "$CONFIG_FILE" "$edit_tmp"; then
@@ -1489,7 +1527,7 @@ diagnose_config() {
                if [[ "$cc" =~ ^[Yy]$ ]]; then
                    cp "$CONFIG_FILE" "${CONFIG_FILE}.broken.$(date +%s)" 2>/dev/null
                    rm -f "$CONFIG_FILE"
-                   ensure_config
+                   ensure_config || return 1
                    echo -e "  ${GREEN}已重置（旧文件已备份）${PLAIN}"
                    pause
                fi ;;
@@ -1655,7 +1693,7 @@ media_check_quick() {
     if [[ -n "$ttc" ]]; then tt="${GREEN}可用${PLAIN} (地区: $ttc)"; else tt="${YELLOW}未获取到地区${PLAIN}"; fi
     printf '  %-10s: %b\n' "TikTok" "$tt"
     ui_subrule
-    echo -e "  ${YELLOW}提示：此结果为服务器本机直连出口。可在「WARP / SOCKS5 出口与分流」为节点流量设置规则。${PLAIN}"
+    echo -e "  ${YELLOW}提示：此结果为服务器本机直连出口。可在「WARP / SOCKS5 / SS 出口与分流」为节点流量设置规则。${PLAIN}"
 }
 
 media_check_full() {
@@ -3028,7 +3066,7 @@ show_menu() {
     menu_section "代理与分流"
     menu_option 1 "节点管理（链接 / 备注 / 增删）"
     menu_option 2 "端口转发（TCP / UDP）"
-    menu_option 3 "WARP / SOCKS5 出口与分流"
+    menu_option 3 "WARP / SOCKS5 / SS 出口与分流"
     menu_section "核心与配置"
     menu_option 4 "服务与核心（启停 / 更新 / 日志 / 卸载）"
     menu_option 5 "配置管理（查看 / 编辑 / 回滚）"
@@ -3106,7 +3144,7 @@ add_warp() (
     if [ ! -x "$BIN_FILE" ]; then
         printf '%b请先安装 Sing-box。%b\n' "$RED" "$PLAIN" >&2; exit 1
     fi
-    ensure_config
+    ensure_config || return 1
     if [ "$(has_warp_endpoint)" -gt 0 ]; then
         printf '%b已存在 WARP 出口，将重新注册并覆盖（保留现有分流规则）。%b\n' "$YELLOW" "$PLAIN"
     fi
@@ -3151,25 +3189,31 @@ has_socks5_outbound() {
 
 # stdout 只返回出口标签，菜单提示走 stderr。
 choose_split_outbound() {
-    local warp=0 socks=0 choice
-    [ "$(has_warp_endpoint)" -gt 0 ] && warp=1
-    has_socks5_outbound && socks=1
-    case "$warp$socks" in
-        10) printf 'warp\n' ;;
-        01) printf 'socks5\n' ;;
-        11) read -rp '  选择出口 [1. WARP / 2. SOCKS5，回车取消]: ' choice || return 1
-            case "$choice" in
-                1) printf 'warp\n' ;;
-                2) printf 'socks5\n' ;;
-                '') return 1 ;;
-                *) menu_invalid >&2; return 1 ;;
-            esac ;;
-        *) printf '%b请先添加 WARP 或 SOCKS5 出口。%b\n' "$YELLOW" "$PLAIN" >&2; return 1 ;;
-    esac
+    local choice i tag
+    local tags=() labels=()
+    if [ "$(has_warp_endpoint)" -gt 0 ]; then tags+=(warp); labels+=(WARP); fi
+    if has_socks5_outbound; then tags+=(socks5); labels+=(SOCKS5); fi
+    # 复用现有家宽标签；不把其他自定义出站自动纳入面板管理。
+    if jq -e 'any(.outbounds[]?; .tag == "isp-ss" and .type == "shadowsocks")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        tags+=(isp-ss); labels+=("SS 家宽")
+    fi
+    if [ "${#tags[@]}" -eq 0 ]; then
+        printf '%b请先添加 WARP、SOCKS5 或 SS 家宽出口。%b\n' "$YELLOW" "$PLAIN" >&2
+        return 1
+    fi
+    if [ "${#tags[@]}" -eq 1 ]; then printf '%s\n' "${tags[0]}"; return 0; fi
+    for i in "${!tags[@]}"; do printf '  %s. %s\n' "$((i+1))" "${labels[$i]}" >&2; done
+    read -rp '  选择出口（回车取消）: ' choice || return 1
+    [ -n "$choice" ] || return 1
+    if ! [[ "$choice" =~ ^[0-9]{1,2}$ ]] || (( 10#$choice < 1 || 10#$choice > ${#tags[@]} )); then
+        menu_invalid >&2; return 1
+    fi
+    tag=${tags[$((10#$choice-1))]}
+    printf '%s\n' "$tag"
 }
 
 add_socks5_outbound() {
-    ensure_config
+    ensure_config || return 1
     local host port username password='' temp_json
     if ! has_socks5_outbound && jq -e 'any((.outbounds[]?, .endpoints[]?); .tag == "socks5")' "$CONFIG_FILE" >/dev/null; then
         printf '%b标签 socks5 已被其他出口占用，未修改配置。%b\n' "$RED" "$PLAIN"
@@ -3208,8 +3252,69 @@ add_socks5_outbound() {
     fi
 }
 
+has_ss_outbound() {
+    jq -e 'any(.outbounds[]?; .tag == "isp-ss" and .type == "shadowsocks")' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+add_ss_outbound() {
+    ensure_config || return 1
+    local host port method password choice temp_json
+    if ! has_ss_outbound && jq -e 'any((.outbounds[]?, .endpoints[]?); .tag == "isp-ss")' "$CONFIG_FILE" >/dev/null; then
+        printf '标签 isp-ss 已被其他出口占用，未修改配置。\n' >&2; return 1
+    fi
+    if has_ss_outbound; then
+        jq -r '.outbounds[] | select(.tag == "isp-ss") | "当前 SS 家宽：\(.server):\(.server_port) [\(.method)]；更新保留分流规则。"' "$CONFIG_FILE"
+    fi
+    read -rp '  SS 家宽地址（域名 / IP，回车取消）: ' host || return 0
+    [ -n "$host" ] || return 0
+    host=${host#\[}; host=${host%\]}
+    read -rp '  SS 家宽端口: ' port || return 0
+    if ! [[ "$host" =~ ^[A-Za-z0-9_.:-]+$ && "$port" =~ ^[0-9]{1,5}$ ]] ||
+        (( 10#$port < 1 || 10#$port > 65535 )); then
+        printf '地址或端口无效。\n' >&2; return 1
+    fi
+    printf '  1. 2022-blake3-aes-128-gcm\n  2. 2022-blake3-aes-256-gcm\n  3. 2022-blake3-chacha20-poly1305\n  4. aes-128-gcm\n  5. aes-256-gcm\n  6. chacha20-ietf-poly1305\n'
+    read -rp '  加密方式 [默认 1，须与家宽服务端一致]: ' choice || return 0
+    case "${choice:-1}" in
+        1) method=2022-blake3-aes-128-gcm ;;
+        2) method=2022-blake3-aes-256-gcm ;;
+        3) method=2022-blake3-chacha20-poly1305 ;;
+        4) method=aes-128-gcm ;;
+        5) method=aes-256-gcm ;;
+        6) method=chacha20-ietf-poly1305 ;;
+        *) printf '加密方式无效。\n' >&2; return 1 ;;
+    esac
+    read -rsp '  SS 密钥 / 密码（不回显）: ' password || { printf '\n'; return 0; }
+    printf '\n'
+    [ -n "$password" ] || { printf '密钥 / 密码不能为空。\n' >&2; return 1; }
+    # 密钥不通过 argv 传递；由核心校验 SS2022 密钥长度与配置兼容性。
+    temp_json=$(jq --arg host "$host" --argjson port "$((10#$port))" --arg method "$method" \
+        --rawfile password /dev/fd/3 '
+        {type:"shadowsocks",tag:"isp-ss",server:$host,server_port:$port,method:$method,password:$password} as $proxy |
+        if any(.outbounds[]?; .tag == "isp-ss") then
+            .outbounds |= map(if .tag == "isp-ss" then (. + $proxy) else . end)
+        else .outbounds = ((.outbounds // []) + [$proxy]) end
+    ' "$CONFIG_FILE" 3< <(printf '%s' "$password")) || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf 'SS 家宽已保存（isp-ss）；未自动开启分流或修改默认出口。\n'
+    else return 1; fi
+}
+
+delete_ss_outbound() {
+    ensure_config || return 1
+    local temp_json
+    has_ss_outbound || { printf '尚未设置 SS 家宽出口。\n' >&2; return 1; }
+    if jq -e '.route.final == "isp-ss"' "$CONFIG_FILE" >/dev/null; then
+        printf 'SS 家宽是默认出口，请先手动调整默认出口再删除。\n' >&2; return 1
+    fi
+    temp_json=$(config_without_split_outbound isp-ss) || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf 'SS 家宽出口及指向它的分流规则已删除。\n'
+    else return 1; fi
+}
+
 add_warp_node_route() {
-    ensure_config
+    ensure_config || return 1
     local real_idx selected outbound temp_json
     outbound=$(choose_split_outbound) || return 0
     real_idx=$(prompt_delete_index "要全部走 ${outbound^^} 的节点" node)
@@ -3219,7 +3324,7 @@ add_warp_node_route() {
 
     temp_json=$(jq --arg tag "$selected" --arg to "$outbound" '
         .route.rules |= (
-          [(. // [])[] | select((.outbound != "warp" and .outbound != "socks5") or
+          [(. // [])[] | select((.outbound != "warp" and .outbound != "socks5" and .outbound != "isp-ss") or
             ((.inbound != [$tag] and .inbound != $tag) or ((keys - ["inbound","outbound","action"]) | length > 0)))] |
           ((map(.outbound != null) | index(true)) // length) as $i |
           .[:$i] + [{inbound:[$tag],outbound:$to}] + .[$i:])
@@ -3230,7 +3335,7 @@ add_warp_node_route() {
 }
 
 add_warp_route() {
-    ensure_config
+    ensure_config || return 1
     local outbound doms
     outbound=$(choose_split_outbound) || return 0
     read -rp "  输入要走 ${outbound^^} 的域名后缀（逗号分隔，如 openai.com,claude.ai，回车取消）: " doms || return 0
@@ -3242,7 +3347,7 @@ add_warp_route() {
     fi
     local temp_json
     temp_json=$(jq --argjson doms "$arr" --arg to "$outbound" '
-        def same_domains: (.outbound == "warp" or .outbound == "socks5") and
+        def same_domains: (.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss") and
           ((keys - ["domain_suffix","outbound","action"]) | length == 0) and
           (([.domain_suffix? | if type == "array" then .[] else strings end] | unique) == ($doms | unique));
         .route.rules |= ((. // []) |
@@ -3255,7 +3360,7 @@ add_warp_route() {
 
 split_ruleset_outbound() {
     jq -r --arg t "$1" '
-      first(.route.rules[]? | select((.outbound == "warp" or .outbound == "socks5") and
+      first(.route.rules[]? | select((.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss") and
         (.rule_set == $t or ((.rule_set | type) == "array" and (.rule_set | index($t)) != null))) | .outbound)
     ' "$CONFIG_FILE" 2>/dev/null
 }
@@ -3289,7 +3394,7 @@ toggle_warp_ruleset() {
           .route = (.route // {}) |
           .route.rule_set = [.route.rule_set[]? | select(.tag as $x | ($drop | index($x)) == null)] |
           .route.rules = [.route.rules[]? | select(
-            (.outbound != "warp" and .outbound != "socks5") or (
+            (.outbound != "warp" and .outbound != "socks5" and .outbound != "isp-ss") or (
               .rule_set as $rs |
               (($rs | type) != "string" or ($drop | index($rs)) == null) and
               (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
@@ -3312,7 +3417,7 @@ toggle_warp_ruleset() {
           ) |
           .route.rules = (
             [.route.rules[]? | select(
-              (.outbound != "warp" and .outbound != "socks5") or (
+              (.outbound != "warp" and .outbound != "socks5" and .outbound != "isp-ss") or (
                 .rule_set as $rs |
                 (($rs | type) != "string" or ($drop | index($rs)) == null) and
                 (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
@@ -3329,32 +3434,32 @@ toggle_warp_ruleset() {
 }
 
 add_warp_ai() {
-    ensure_config
+    ensure_config || return 1
     toggle_warp_ruleset "$WARP_AI_RULE_TAG" "AI 分流" "$WARP_AI_RULE_FILE" \
         geosite-category-ai-!cn geosite-openai geosite-anthropic
 }
 
 add_warp_media() {
-    ensure_config
+    ensure_config || return 1
     toggle_warp_ruleset "$WARP_MEDIA_RULE_TAG" "流媒体分流" "$WARP_MEDIA_RULE_FILE" \
         geosite-netflix geosite-disney geosite-hbo geosite-youtube \
         geosite-primevideo geosite-tiktok geosite-spotify geosite-hulu
 }
 
 count_split_rules() {
-    jq '[.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5")] | length' "$CONFIG_FILE" 2>/dev/null
+    jq '[.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss")] | length' "$CONFIG_FILE" 2>/dev/null
 }
 
 view_warp_rules() {
-    ensure_config
+    ensure_config || return 1
     local n
     n=$(count_split_rules)
-    echo -e "\n  ${CYAN}▌ WARP / SOCKS5 分流规则（共 ${n:-0} 条）${PLAIN}"
+    echo -e "\n  ${CYAN}▌ WARP / SOCKS5 / SS 分流规则（共 ${n:-0} 条）${PLAIN}"
     if [ "${n:-0}" -eq 0 ]; then
         echo -e "  ${YELLOW}暂无规则，可在分流菜单中开启规则集或添加自定义规则。${PLAIN}"; return
     fi
     jq -r '
-      [.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5")]
+      [.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss")]
       | to_entries[]
       | .value as $r
       | ([
@@ -3370,11 +3475,11 @@ view_warp_rules() {
 }
 
 delete_warp_rule() {
-    ensure_config
+    ensure_config || return 1
     local n
     n=$(count_split_rules)
     if [ "${n:-0}" -eq 0 ]; then
-        echo -e "${YELLOW}暂无 WARP / SOCKS5 分流规则。${PLAIN}"; return
+        echo -e "${YELLOW}暂无 WARP / SOCKS5 / SS 分流规则。${PLAIN}"; return
     fi
     view_warp_rules
     declare -F ui_subrule >/dev/null && ui_subrule
@@ -3386,7 +3491,7 @@ delete_warp_rule() {
     fi
     local abs
     abs=$(jq --argjson k "$((10#$idx-1))" '
-      [.route.rules | to_entries[] | select(.value.outbound == "warp" or .value.outbound == "socks5") | .key][$k]' "$CONFIG_FILE") || return 1
+      [.route.rules | to_entries[] | select(.value.outbound == "warp" or .value.outbound == "socks5" or .value.outbound == "isp-ss") | .key][$k]' "$CONFIG_FILE") || return 1
     local temp_json
     temp_json=$(jq --argjson i "$abs" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
       .route.rules |= (.[:$i] + .[$i+1:]) |
@@ -3402,7 +3507,7 @@ delete_warp_rule() {
 }
 
 delete_warp() {
-    ensure_config
+    ensure_config || return 1
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
         echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
     fi
@@ -3488,11 +3593,14 @@ view_split_exit_ips() {
     if [ "$(has_warp_endpoint)" -gt 0 ]; then
         probe_split_outbound warp WARP || :
     fi
+    if has_ss_outbound; then
+        probe_split_outbound isp-ss SS || :
+    fi
     return 0
 }
 
 view_warp() {
-    ensure_config
+    ensure_config || return 1
     if [ "$(has_warp_endpoint)" -eq 0 ]; then
         echo -e "${YELLOW}当前没有 WARP 出口。${PLAIN}"; return
     fi
@@ -3507,7 +3615,7 @@ view_warp() {
 menu_warp() {
     local c yn exit_ip_cache='' exit_ip_config='' current_config
     while true; do
-        local warp_has warp_status ai_state media_state rule_count socks_status
+        local warp_has warp_status ai_state media_state rule_count socks_status ss_status
         warp_has=$(has_warp_endpoint)
         warp_status=$(warp_summary_short)
         socks_status=未配置
@@ -3517,9 +3625,11 @@ menu_warp() {
             exit_ip_cache=$(view_split_exit_ips)
             exit_ip_config=$current_config
         fi
-        local header_status="$warp_status / SOCKS5 $socks_status"
+        ss_status=未配置
+        has_ss_outbound && ss_status=已配置
+        local header_status="$warp_status / SOCKS5 $socks_status / SS $ss_status"
         [ -z "$exit_ip_cache" ] || header_status+=$'\n'"$exit_ip_cache"
-        menu_header "WARP / SOCKS5 出口与分流" "" "$header_status"
+        menu_header "WARP / SOCKS5 / SS 出口与分流" "" "$header_status"
         menu_section "分流规则（再次选择当前出口可关闭规则集）"
         ai_state=$(split_ruleset_outbound "$WARP_AI_RULE_TAG")
         media_state=$(split_ruleset_outbound "$WARP_MEDIA_RULE_TAG")
@@ -3542,8 +3652,10 @@ menu_warp() {
         menu_option 9 "删除 WARP 出口及全部关联规则"
         menu_option 10 "添加 / 更新 SOCKS5 出口"
         menu_option 11 "删除 SOCKS5 出口及全部关联规则"
+        menu_option 12 "添加 / 更新 SS 家宽出口"
+        menu_option 13 "删除 SS 家宽出口及全部关联规则"
         menu_back
-        read_menu_choice "请选择 [0-11]" || return 0
+        read_menu_choice "请选择 [0-13]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -3571,6 +3683,13 @@ menu_warp() {
                     read -rp '  确认删除 SOCKS5 出口及全部关联分流规则？[y/N]: ' yn || continue
                     if [[ "$yn" =~ ^[Yy]$ ]]; then delete_socks5_outbound; pause; fi
                 fi ;;
+            12) add_ss_outbound; pause ;;
+            13) if ! has_ss_outbound; then
+                    printf '  尚未设置 SS 家宽出口。\n'; pause
+                else
+                    read -rp '  确认删除 SS 家宽出口及全部关联分流规则？[y/N]: ' yn || continue
+                    if [[ "$yn" == y ]]; then delete_ss_outbound; pause; fi
+                fi ;;
             0) return ;;
             *) menu_invalid ;;
         esac
@@ -3584,8 +3703,8 @@ if [ "${1:-}" = --ssh-bark-worker ]; then
 fi
 # 只有交互面板会修改代理配置；只读告警进程不应争用面板锁。
 acquire_lock
-install_dependencies
-ensure_config
+install_dependencies || exit 1
+ensure_config || exit 1
 ensure_service_def_fresh
 while true; do
     show_menu
