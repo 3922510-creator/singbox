@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ====================================================================
 #  Sing-box 管理面板
-#  版本: v3.8.6  |  快捷指令: SB / sb
+#  版本: v3.8.7  |  快捷指令: SB / sb
 # --------------------------------------------------------------------
 #  特性:
 #    • 同时支持 systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine）发行版
@@ -16,7 +16,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="v3.8.6"
+SCRIPT_VERSION="v3.8.7"
 SSH_BARK_CONFIG="/etc/sb-ssh-bark.json"  # 不放进 sing-box 的配置扫描目录
 SSH_BARK_UNIT="sb-ssh-bark.service"
 
@@ -281,9 +281,20 @@ nodes_summary_line() {
 }
 warp_summary_short() {
     if [ "$(has_warp_endpoint)" -gt 0 ]; then
-        local rc
-        rc=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-        printf '%b已配置%b（%s 条规则）' "$GREEN" "$PLAIN" "${rc:-0}"
+        local rc mode_tag=''
+        rc=$(jq --arg dns "${WARP_DNS_TAG:-sb-warp-dns}" '
+            (.route.rules // []) as $r |
+            ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $dns) | .key][0]) as $s |
+            [range(0; ($r | length)) as $i |
+             select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and ($r[$i].outbound? // "") == "warp")] | length
+        ' "$CONFIG_FILE" 2>/dev/null)
+        if declare -F get_warp_stack_mode >/dev/null; then
+            case "$(get_warp_stack_mode)" in
+                v4_*) mode_tag='仅WARP v4 · ' ;;
+                v6_*) mode_tag='仅WARP v6 · ' ;;
+            esac
+        fi
+        printf '%b已配置%b（%s%s 条规则）' "$GREEN" "$PLAIN" "$mode_tag" "${rc:-0}"
     else
         printf '%b未配置%b' "$YELLOW" "$PLAIN"
     fi
@@ -3095,6 +3106,12 @@ show_menu() {
 # ==================== WARP 出口 ====================
 # sing-box 1.11+ 将 wireguard 从 outbound 迁移为 endpoint，这里采用 endpoint 架构。
 # 账号直连 Cloudflare 官方 API 免费注册（不依赖第三方注册工具）。
+WARP_DEFAULT_V4="162.159.192.8"
+WARP_DEFAULT_V6="2606:4700:d0::a29f:c008"
+WARP_DEFAULT_PORT=2408
+WARP_DNS_TAG="sb-warp-dns"
+WARP_LOCAL_DNS_TAG="sb-local-dns"
+
 _warp_decode_reserved() {
     local cid="$1" bytes
     [[ "$cid" =~ ^[A-Za-z0-9+/=]{4,8}$ ]] || { printf '[]\n'; return 0; }
@@ -3108,20 +3125,123 @@ _warp_decode_reserved() {
     printf '%s\n' "${bytes:-[]}"
 }
 
+_warp_extract_peer_hosts() {
+    local def_v4="${WARP_DEFAULT_V4:-162.159.192.8}"
+    local def_v6="${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}"
+    jq -r --arg dv4 "$def_v4" --arg dv6 "$def_v6" '
+      (.config.peers[0].endpoint.v4 // "") as $raw4 |
+      (.config.peers[0].endpoint.v6 // "") as $raw6 |
+      ($raw4 | sub(":[0-9]+$"; "")) as $h4 |
+      ($raw6 | sub("^\\["; "") | sub("\\]:[0-9]+$"; "") | sub("\\]$"; "")) as $h6 |
+      (if ($h4 | test("^[0-9]+(\\.[0-9]+){3}$")) then $h4 else $dv4 end) as $v4 |
+      (if ($h6 | test("^[0-9a-fA-F:]+$") and ($h6 | contains(":"))) then $h6 else $dv6 end) as $v6 |
+      "\($v4)\t\($v6)"
+    ' 2>/dev/null || printf '%s\t%s\n' "$def_v4" "$def_v6"
+}
+
 _warp_registration_endpoint() {
-    local payload reserved
+    local payload reserved peer_addr peer_port allowed_ips
     payload=$(cat)
+    peer_addr="${2:-${WARP_DEFAULT_V4:-162.159.192.8}}"
+    peer_port="${3:-${WARP_DEFAULT_PORT:-2408}}"
+    allowed_ips="${4:-[\"0.0.0.0/0\",\"::/0\"]}"
     reserved=$(_warp_decode_reserved "$(jq -r '.config.client_id // empty' <<< "$payload" 2>/dev/null)")
     # 留足 WireGuard 封装开销，避免大包 sendmmsg: message too long。
-    jq -ce --rawfile priv /dev/fd/3 --argjson reserved "$reserved" '
+    jq -ce --rawfile priv /dev/fd/3 --argjson reserved "$reserved" \
+      --arg peer_addr "$peer_addr" --argjson peer_port "$peer_port" --argjson allowed "$allowed_ips" '
       .config.interface.addresses as $addr | .config.peers[0].public_key as $peer |
       select(($addr.v4 | strings | test("^[0-9]+(\\.[0-9]+){3}$")) and
         ($peer | strings | test("^[A-Za-z0-9+/]{43}=$"))) |
       {type: "wireguard", tag: "warp", mtu: 1280, private_key: ($priv | rtrimstr("\n")),
         address: ([$addr.v4 + "/32"] + (if ($addr.v6 // "") == "" then [] else [$addr.v6 + "/128"] end)),
-        peers: [({address: "162.159.192.8", port: 2408, public_key: $peer, allowed_ips: ["0.0.0.0/0", "::/0"]} +
+        peers: [({address: $peer_addr, port: $peer_port, public_key: $peer, allowed_ips: $allowed} +
           (if ($reserved | length) == 3 then {reserved: $reserved} else {} end))]}
     ' 3<<< "$1" <<< "$payload"
+}
+
+# 用独立临时核心探测给定 warp endpoint JSON 是否可连通；经隧道内 1.1.1.1 解析以避开宿主机 DNS64/NAT64。
+_warp_probe_endpoint_json() (
+    local ep_json="$1" max_time="${2:-5}" work pid='' port='' i dns_ip want_v4=0 want_v6=0 ip
+    [ -x "${BIN_FILE:-}" ] || exit 1
+    work=$(mktemp -d) || exit 1
+    chmod 700 "$work"
+    trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }; rm -f -- "$work/config.json" "$work/core.log"; rmdir "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    umask 077
+    jq -e 'any(.peers[]?.allowed_ips[]?; . == "0.0.0.0/0")' <<< "$ep_json" >/dev/null 2>&1 && want_v4=1
+    jq -e 'any(.peers[]?.allowed_ips[]?; . == "::/0")' <<< "$ep_json" >/dev/null 2>&1 && want_v6=1
+    if [ "$want_v4" -eq 0 ] && [ "$want_v6" -eq 0 ]; then want_v4=1; want_v6=1; fi
+    if [ "$want_v4" -eq 1 ]; then dns_ip="1.1.1.1"; else dns_ip="2606:4700:4700::1111"; fi
+    jq -n --argjson ep "$ep_json" --arg dns_ip "$dns_ip" '
+      {log:{level:"info", timestamp:false},
+       dns:{servers:[{type:"udp", server:$dns_ip, detour:"warp", tag:"probe-dns"}]},
+       inbounds:[{type:"mixed", tag:"probe", listen:"127.0.0.1", listen_port:0}],
+       outbounds:[],
+       endpoints:[$ep],
+       route:{final:"warp", default_domain_resolver:"probe-dns"}}
+    ' > "$work/config.json" || exit 1
+    "$BIN_FILE" check -c "$work/config.json" > "$work/core.log" 2>&1 || exit 1
+    "$BIN_FILE" run -c "$work/config.json" > "$work/core.log" 2>&1 &
+    pid=$!
+    for ((i=0; i<30; i++)); do
+        port=$(sed -n 's/.*inbound\/mixed\[probe\]: tcp server started at 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$work/core.log" | head -1)
+        [ -z "$port" ] || break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    [ -n "$port" ] && kill -0 "$pid" 2>/dev/null || exit 1
+    if [ "$want_v4" -eq 1 ]; then
+        ip=$(curl --silent --fail --connect-timeout 4 --max-time "$max_time" --noproxy '' \
+            --proxy "socks5h://127.0.0.1:$port" "https://api4.ipify.org" 2>/dev/null) || ip=''
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then exit 0; fi
+    fi
+    if [ "$want_v6" -eq 1 ]; then
+        ip=$(curl --silent --fail --connect-timeout 4 --max-time "$max_time" --noproxy '' \
+            --proxy "socks5h://127.0.0.1:$port" "https://api6.ipify.org" 2>/dev/null) || ip=''
+        if [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then exit 0; fi
+    fi
+    exit 1
+)
+
+# 自动按本机路由与连通性挑选可用的 WARP 对端；stdout 输出: "<addr>\t<port>\t<ok|fail>"
+_warp_auto_pick_peer() {
+    local base_ep="$1" v4_host="${2:-${WARP_DEFAULT_V4:-162.159.192.8}}" v6_host="${3:-${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}}" extra_ports="${4:-500}"
+    local has_v4=0 has_v6=0 p cand_addr cand_port test_ep
+    local cand_addrs=() cand_ports=()
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route get "$v4_host" >/dev/null 2>&1 && has_v4=1
+        ip -6 route get "$v6_host" >/dev/null 2>&1 && has_v6=1
+    else
+        has_v4=1
+    fi
+    if [ "$has_v4" -eq 1 ]; then cand_addrs+=("$v4_host"); cand_ports+=(2408); fi
+    if [ "$has_v6" -eq 1 ]; then cand_addrs+=("$v6_host"); cand_ports+=(2408); fi
+    for p in $extra_ports; do
+        if [ "$has_v6" -eq 1 ]; then cand_addrs+=("$v6_host"); cand_ports+=("$p"); fi
+        if [ "$has_v4" -eq 1 ]; then cand_addrs+=("$v4_host"); cand_ports+=("$p"); fi
+    done
+    if [ "${#cand_addrs[@]}" -eq 0 ]; then
+        cand_addrs=("$v4_host" "$v6_host")
+        cand_ports=(2408 2408)
+    fi
+    local idx
+    for idx in "${!cand_addrs[@]}"; do
+        cand_addr="${cand_addrs[$idx]}"
+        cand_port="${cand_ports[$idx]}"
+        test_ep=$(jq -c --arg a "$cand_addr" --argjson p "$cand_port" \
+            '.peers[0].address = $a | .peers[0].port = $p' <<< "$base_ep" 2>/dev/null) || continue
+        if _warp_probe_endpoint_json "$test_ep" 5; then
+            printf '%s\t%s\tok\n' "$cand_addr" "$cand_port"
+            return 0
+        fi
+    done
+    if [ "$has_v4" -eq 0 ] && [ "$has_v6" -eq 1 ]; then
+        printf '%s\t2408\tfail\n' "$v6_host"
+    else
+        printf '%s\t2408\tfail\n' "$v4_host"
+    fi
+    return 1
 }
 
 # geosite 规则集（SagerNet/sing-geosite rule-set 分支，.srs 二进制，与 sbx 保持一致）
@@ -3137,16 +3257,208 @@ has_warp_endpoint() {
     [[ "$c" =~ ^[0-9]+$ ]] && echo "$c" || echo "0"
 }
 
+get_warp_peer_summary() {
+    jq -r '
+      first(.endpoints[]? | select(.tag == "warp") | .peers[0]?) // empty |
+      if .address == null then ""
+      elif (.address | contains(":")) then "[\(.address)]:\(.port // 2408) (IPv6)"
+      else "\(.address):\(.port // 2408) (IPv4)" end
+    ' "$CONFIG_FILE" 2>/dev/null
+}
+
+get_warp_stack_mode() {
+    jq -r --arg dns "${WARP_DNS_TAG:-sb-warp-dns}" '
+      (.route.rules // []) as $r |
+      ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $dns) | .key][0]) as $s |
+      if $s == null then "dual"
+      else
+        ($r[$s + 1] // {}) as $r1 | ($r[$s + 2] // {}) as $r2 |
+        if $r1.ip_cidr == ["::/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["0.0.0.0/0"] and $r2.outbound == "warp" then "v4_prefer_host_v6"
+        elif $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "warp" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "direct" then "v4_prefer_warp_v4"
+        elif $r1.ip_cidr == ["0.0.0.0/0"] and $r1.outbound == "direct" and $r2.ip_cidr == ["::/0"] and $r2.outbound == "warp" then "v6_prefer_host_v4"
+        elif $r1.ip_cidr == ["::/0"] and $r1.outbound == "warp" and $r2.ip_cidr == ["0.0.0.0/0"] and $r2.outbound == "direct" then "v6_prefer_warp_v6"
+        else "custom" end
+      end
+    ' "$CONFIG_FILE" 2>/dev/null || echo "dual"
+}
+
+warp_stack_mode_label() {
+    case "${1:-dual}" in
+        dual) printf '双栈（按分流规则）' ;;
+        v4_prefer_host_v6) printf '仅WARP v4 + 本机v6（双栈优先本机v6）' ;;
+        v4_prefer_warp_v4) printf '仅WARP v4 + 本机v6（双栈优先WARP v4）' ;;
+        v6_prefer_host_v4) printf '仅WARP v6 + 本机v4（双栈优先本机v4）' ;;
+        v6_prefer_warp_v6) printf '仅WARP v6 + 本机v4（双栈优先WARP v6）' ;;
+        *) printf '自定义' ;;
+    esac
+}
+
+apply_warp_stack_mode() {
+    ensure_config || return 1
+    local mode="${1:-dual}" temp_json dns_tag="${WARP_DNS_TAG:-sb-warp-dns}" local_dns_tag="${WARP_LOCAL_DNS_TAG:-sb-local-dns}"
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN" >&2; return 1
+    fi
+    case "$mode" in
+        dual|v4_prefer_host_v6|v4_prefer_warp_v4|v6_prefer_host_v4|v6_prefer_warp_v6) ;;
+        *) printf '%b无效的 WARP IP 栈模式：%s%b\n' "$RED" "$mode" "$PLAIN" >&2; return 1 ;;
+    esac
+    if [[ "$mode" == v6_* ]] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; contains(":"))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        printf '%b当前 WARP 出口缺少 IPv6 隧道地址，无法启用仅 WARP IPv6 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
+    fi
+    if [[ "$mode" == v4_* ]] && ! jq -e 'any(.endpoints[]? | select(.tag == "warp") | .address[]?; (contains(":") | not))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        printf '%b当前 WARP 出口缺少 IPv4 隧道地址，无法启用仅 WARP IPv4 模式。%b\n' "$RED" "$PLAIN" >&2; return 1
+    fi
+    temp_json=$(jq --arg mode "$mode" --arg wdns "$dns_tag" --arg ldns "$local_dns_tag" '
+        # 先剥离已有的 WARP 全局按栈规则块
+        def strip_stack_rules:
+          (. // []) as $r |
+          ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+          if $s == null then $r
+          else
+            ($r | length) as $len |
+            ($s + 1) as $i1 | ($s + 2) as $i2 |
+            ($i1 < $len and (($r[$i1].ip_cidr == ["0.0.0.0/0"] or $r[$i1].ip_cidr == ["::/0"]) and ($r[$i1].outbound == "warp" or $r[$i1].outbound == "direct"))) as $d1 |
+            ($d1 and $i2 < $len and (($r[$i2].ip_cidr == ["0.0.0.0/0"] or $r[$i2].ip_cidr == ["::/0"]) and ($r[$i2].outbound == "warp" or $r[$i2].outbound == "direct"))) as $d2 |
+            [range(0; $len) as $i | select($i != $s and (($d1 and $i == $i1) | not) and (($d2 and $i == $i2) | not)) | $r[$i]]
+          end;
+        def cleanup_sb_dns:
+          if .dns?.servers? then
+            .dns.servers |= [.[] | select(.tag != $wdns)] |
+            if (.dns.servers | map(.tag) == [$ldns]) and ((.dns.rules // []) | length == 0) and
+               ((.dns | keys) - ["servers", "final"] | length == 0) then
+              del(.dns) |
+              if .route?.default_domain_resolver? == $ldns then del(.route.default_domain_resolver) else . end
+            else
+              if .dns.final == $wdns then .dns.final = (.dns.servers[0].tag // $ldns) else . end
+            end
+          else . end;
+        .route = (.route // {}) |
+        .route.rules = ((.route.rules // []) | strip_stack_rules) |
+        if $mode == "dual" then
+          .endpoints |= map(if .tag == "warp" then .peers[0].allowed_ips = ["0.0.0.0/0", "::/0"] else . end) |
+          cleanup_sb_dns
+        else
+          (if ($mode | startswith("v4_")) then ["0.0.0.0/0"] else ["::/0"] end) as $allowed |
+          (if ($mode | startswith("v4_")) then "1.1.1.1" else "2606:4700:4700::1111" end) as $dns_ip |
+          (if $mode == "v4_prefer_host_v6" then
+             [{action:"resolve", server:$wdns, strategy:"prefer_ipv6"}, {ip_cidr:["::/0"], outbound:"direct"}, {ip_cidr:["0.0.0.0/0"], outbound:"warp"}]
+           elif $mode == "v4_prefer_warp_v4" then
+             [{action:"resolve", server:$wdns, strategy:"prefer_ipv4"}, {ip_cidr:["0.0.0.0/0"], outbound:"warp"}, {ip_cidr:["::/0"], outbound:"direct"}]
+           elif $mode == "v6_prefer_host_v4" then
+             [{action:"resolve", server:$wdns, strategy:"prefer_ipv4"}, {ip_cidr:["0.0.0.0/0"], outbound:"direct"}, {ip_cidr:["::/0"], outbound:"warp"}]
+           else
+             [{action:"resolve", server:$wdns, strategy:"prefer_ipv6"}, {ip_cidr:["::/0"], outbound:"warp"}, {ip_cidr:["0.0.0.0/0"], outbound:"direct"}]
+           end) as $stack_rules |
+          .endpoints |= map(if .tag == "warp" then .peers[0].allowed_ips = $allowed else . end) |
+          (if (.dns?.servers? // []) | length == 0 then
+             .dns = {servers:[{tag:$ldns, type:"local"}, {tag:$wdns, type:"udp", server:$dns_ip, detour:"warp"}], final:$ldns} |
+             if (.route.default_domain_resolver // "") == "" then .route.default_domain_resolver = $ldns else . end
+           else
+             .dns.servers = ([.dns.servers[] | select(.tag != $wdns)] + [{tag:$wdns, type:"udp", server:$dns_ip, detour:"warp"}])
+           end) |
+          .route.rules = (.route.rules + $stack_rules) |
+          if (.route.final // "") == "" then .route.final = "direct" else . end
+        end
+    ' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf '%bWARP IP 栈模式已切换为：%s。%b\n' "$GREEN" "$(warp_stack_mode_label "$mode")" "$PLAIN"
+    else
+        return 1
+    fi
+}
+
+menu_warp_stack_mode() {
+    ensure_config || return 1
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN"
+        return 0
+    fi
+    local cur choice
+    cur=$(get_warp_stack_mode)
+    printf '\n  %b当前 WARP IP 栈模式：%b%s%b\n' "$DIM" "$BLUE" "$(warp_stack_mode_label "$cur")" "$PLAIN"
+    printf '  1. 双栈（默认，仅按分流规则走 WARP）\n'
+    printf '  2. 仅 WARP IPv4 + 本机 IPv6（双栈优先本机 IPv6，NAT 独立 IPv6 推荐）\n'
+    printf '  3. 仅 WARP IPv4 + 本机 IPv6（双栈优先 WARP IPv4）\n'
+    printf '  4. 仅 WARP IPv6 + 本机 IPv4（双栈优先本机 IPv4，纯 IPv4 补 IPv6 推荐）\n'
+    printf '  5. 仅 WARP IPv6 + 本机 IPv4（双栈优先 WARP IPv6）\n'
+    printf '  说明：具体分流规则（AI / 流媒体 / 域名 / 节点 / 家宽）仍优先于全局分栈。\n'
+    read -rp '  选择模式 [1-5，回车取消]: ' choice || return 0
+    case "$choice" in
+        '') return 0 ;;
+        1) apply_warp_stack_mode dual ;;
+        2) apply_warp_stack_mode v4_prefer_host_v6 ;;
+        3) apply_warp_stack_mode v4_prefer_warp_v4 ;;
+        4) apply_warp_stack_mode v6_prefer_host_v4 ;;
+        5) apply_warp_stack_mode v6_prefer_warp_v6 ;;
+        *) menu_invalid ;;
+    esac
+}
+
+switch_warp_peer() {
+    ensure_config || return 1
+    if [ "$(has_warp_endpoint)" -eq 0 ]; then
+        printf '%b请先添加 WARP 出口。%b\n' "$YELLOW" "$PLAIN"
+        return 0
+    fi
+    local cur choice new_addr='' new_port='' cur_ep picked_addr picked_port picked_status temp_json
+    cur=$(get_warp_peer_summary)
+    printf '\n  %b当前 WARP 对端：%b%s%b\n' "$DIM" "$BLUE" "${cur:-未知}" "$PLAIN"
+    printf '  1. IPv4 对端 (%s:2408)\n' "${WARP_DEFAULT_V4:-162.159.192.8}"
+    printf '  2. IPv6 对端 ([%s]:2408)（NAT 独立 IPv6 推荐）\n' "${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}"
+    printf '  3. 自动探测可用对端（IPv4 / IPv6 × 2408 / 500 / 4500 / 1701）\n'
+    printf '  4. 自定义对端 IP 与端口\n'
+    read -rp '  请选择 [1-4，回车取消]: ' choice || return 0
+    case "$choice" in
+        '') return 0 ;;
+        1) new_addr="${WARP_DEFAULT_V4:-162.159.192.8}"; new_port=2408 ;;
+        2) new_addr="${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}"; new_port=2408 ;;
+        3)
+            cur_ep=$(jq -c 'first(.endpoints[]? | select(.tag == "warp"))' "$CONFIG_FILE" 2>/dev/null)
+            printf '%b正在自动探测可用 WARP 对端...%b\n' "$BLUE" "$PLAIN"
+            if IFS=$'\t' read -r picked_addr picked_port picked_status < <(_warp_auto_pick_peer "$cur_ep" "${WARP_DEFAULT_V4:-162.159.192.8}" "${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}" "500 4500 1701"); then
+                new_addr="$picked_addr"; new_port="$picked_port"
+                printf '%b探测成功：%s 端口 %s%b\n' "$GREEN" "$new_addr" "$new_port" "$PLAIN"
+            else
+                printf '%b所有候选对端均未连通（请检查本机是否允许出站 UDP）。未修改配置。%b\n' "$YELLOW" "$PLAIN"
+                return 1
+            fi ;;
+        4)
+            read -rp '  对端 IP（IPv4 或 IPv6，回车取消）: ' new_addr || return 0
+            [ -n "$new_addr" ] || return 0
+            new_addr=${new_addr#\[}; new_addr=${new_addr%\]}
+            read -rp '  对端端口 [默认 2408，可选 500/1701/4500]: ' new_port || return 0
+            new_port=${new_port:-2408}
+            if ! [[ "$new_addr" =~ ^[0-9A-Za-z.:-]+$ && "$new_port" =~ ^[0-9]{1,5}$ ]] ||
+                (( 10#$new_port < 1 || 10#$new_port > 65535 )); then
+                printf '%b对端地址或端口无效。%b\n' "$RED" "$PLAIN"
+                return 1
+            fi
+            new_port=$((10#$new_port)) ;;
+        *) menu_invalid; return 1 ;;
+    esac
+    temp_json=$(jq --arg addr "$new_addr" --argjson port "$new_port" '
+        .endpoints |= map(if .tag == "warp" then .peers[0].address = $addr | .peers[0].port = $port else . end)
+    ' "$CONFIG_FILE") || return 1
+    if apply_config_and_restart "$temp_json"; then
+        printf '%bWARP 对端已切换为：%s%b\n' "$GREEN" "$(get_warp_peer_summary)" "$PLAIN"
+    fi
+}
+
 add_warp() (
     set +x
     umask 077
-    local keys priv pub id payload response endpoint candidate addresses
+    local keys priv pub id payload response endpoint candidate addresses curl_flag
+    local v4_host="${WARP_DEFAULT_V4:-162.159.192.8}" v6_host="${WARP_DEFAULT_V6:-2606:4700:d0::a29f:c008}"
+    local peer_addr="$v4_host" peer_port="${WARP_DEFAULT_PORT:-2408}" probe_state='' allowed_ips='["0.0.0.0/0","::/0"]'
     if [ ! -x "$BIN_FILE" ]; then
         printf '%b请先安装 Sing-box。%b\n' "$RED" "$PLAIN" >&2; exit 1
     fi
     ensure_config || return 1
     if [ "$(has_warp_endpoint)" -gt 0 ]; then
         printf '%b已存在 WARP 出口，将重新注册并覆盖（保留现有分流规则）。%b\n' "$YELLOW" "$PLAIN"
+        allowed_ips=$(jq -c 'first(.endpoints[]? | select(.tag == "warp") | .peers[0].allowed_ips) // ["0.0.0.0/0","::/0"]' "$CONFIG_FILE" 2>/dev/null)
+        [ -n "$allowed_ips" ] || allowed_ips='["0.0.0.0/0","::/0"]'
     fi
     printf '%b正在向 Cloudflare 注册免费 WARP 账号...%b\n' "$BLUE" "$PLAIN"
     keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null) || {
@@ -3164,11 +3476,29 @@ add_warp() (
     payload=$(jq -nc --arg key "$pub" --arg id "${id//-/}" '
       {key: $key, install_id: $id, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $id, locale: "en_US"}
     ') || exit 1
-    if ! response=$(curl -qfsS --connect-timeout 8 --max-time 20 https://api.cloudflareclient.com/v0a2158/reg \
-      -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' --data "$payload") ||
-       ! endpoint=$(_warp_registration_endpoint "$priv" <<< "$response" 2>/dev/null); then
+    response=''
+    for curl_flag in '' '-6' '-4'; do
+        if response=$(curl -qfsS ${curl_flag:+"$curl_flag"} --connect-timeout 8 --max-time 20 https://api.cloudflareclient.com/v0a2158/reg \
+          -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' --data "$payload" 2>/dev/null) && [ -n "$response" ]; then
+            break
+        fi
+        response=''
+    done
+    if [ -n "$response" ] && declare -F _warp_extract_peer_hosts >/dev/null; then
+        IFS=$'\t' read -r v4_host v6_host < <(_warp_extract_peer_hosts <<< "$response")
+        peer_addr="$v4_host"
+    fi
+    if [ -z "$response" ] || ! endpoint=$(_warp_registration_endpoint "$priv" "$peer_addr" "$peer_port" "$allowed_ips" <<< "$response" 2>/dev/null); then
         printf '%bWARP 注册失败或返回缺少地址/公钥，原配置未改动。%b\n' "$RED" "$PLAIN" >&2
         exit 1
+    fi
+    if declare -F _warp_auto_pick_peer >/dev/null; then
+        printf '%b正在探测可用 WARP 对端（IPv4 / IPv6）...%b\n' "$BLUE" "$PLAIN"
+        IFS=$'\t' read -r peer_addr peer_port probe_state < <(_warp_auto_pick_peer "$endpoint" "$v4_host" "$v6_host" "500" || true)
+        if [ -n "$peer_addr" ] && [ -n "$peer_port" ]; then
+            endpoint=$(jq -c --arg a "$peer_addr" --argjson p "$peer_port" \
+                '.peers[0].address = $a | .peers[0].port = $p' <<< "$endpoint") || exit 1
+        fi
     fi
     candidate=$(jq --slurpfile ep /dev/fd/3 '
         .endpoints = ([.endpoints[]? | select(.tag != "warp")] + $ep) |
@@ -3178,8 +3508,13 @@ add_warp() (
     addresses=$(jq -r '.address | join(" / ")' <<< "$endpoint")
     printf '%bWARP 出口添加成功。%b\n' "$GREEN" "$PLAIN"
     printf '  出口标签 : %bwarp%b（wireguard endpoint）\n' "$BLUE" "$PLAIN"
+    printf '  对端地址 : %b%s:%s%b\n' "$BLUE" "$peer_addr" "$peer_port" "$PLAIN"
     printf '  隧道地址 : %b%s%b\n' "$BLUE" "$addresses" "$PLAIN"
-    printf '%b提示：返回菜单即可开启 AI / 流媒体分流，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
+    if [ "$probe_state" = fail ]; then
+        printf '%b提示：自动探测未连通，可在菜单中切换 WARP 对端（IPv4/IPv6/端口），或核查本机出站 UDP。%b\n' "$YELLOW" "$PLAIN"
+    else
+        printf '%b提示：返回菜单即可开启 AI / 流媒体分流、设置 IP 栈模式，或按域名 / 节点分流。%b\n' "$YELLOW" "$PLAIN"
+    fi
 )
 
 has_socks5_outbound() {
@@ -3346,13 +3681,16 @@ add_warp_route() {
         echo -e "${RED}域名解析为空。${PLAIN}"; return
     fi
     local temp_json
-    temp_json=$(jq --argjson doms "$arr" --arg to "$outbound" '
+    temp_json=$(jq --argjson doms "$arr" --arg to "$outbound" --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
         def same_domains: (.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss") and
           ((keys - ["domain_suffix","outbound","action"]) | length == 0) and
           (([.domain_suffix? | if type == "array" then .[] else strings end] | unique) == ($doms | unique));
         .route.rules |= ((. // []) |
           if any(.[]; same_domains) then map(if same_domains then .outbound = $to else . end)
-          else . + [{domain_suffix:$doms,outbound:$to}] end)' "$CONFIG_FILE") || return 1
+          else
+            ([to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0] // length) as $s |
+            .[:$s] + [{domain_suffix:$doms,outbound:$to}] + .[$s:]
+          end)' "$CONFIG_FILE") || return 1
     if apply_config_and_restart "$temp_json"; then
         echo -e "${GREEN}已设置分流规则：$doms -> ${outbound^^}${PLAIN}"
     fi
@@ -3405,7 +3743,7 @@ toggle_warp_ruleset() {
             printf '%b%s 已关闭。%b\n' "$GREEN" "$r_name" "$PLAIN"
         fi
     else
-        temp_json=$(jq --arg t "$r_tag" --arg to "$outbound" --arg url "${GEOSITE_BASE}/${r_file}" --argjson legacy "$legacy_json" '
+        temp_json=$(jq --arg t "$r_tag" --arg to "$outbound" --arg url "${GEOSITE_BASE}/${r_file}" --argjson legacy "$legacy_json" --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
           ($legacy + [$t]) as $drop |
           # sing-box 1.14+: 以 http_clients + default_http_client 代替已弃用的 download_detour
           .http_clients = ((.http_clients // []) + [{"tag":"rs-http"}] | group_by(.tag) | map(.[0])) |
@@ -3422,8 +3760,9 @@ toggle_warp_ruleset() {
                 (($rs | type) != "string" or ($drop | index($rs)) == null) and
                 (($rs | type) != "array" or (all($rs[]; . as $x | ($drop | index($x)) == null)))
               )
-            )] +
-            [{"action": "route", "rule_set": $t, "outbound": $to}]
+            )] |
+            ([to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0] // length) as $s |
+            .[:$s] + [{"action": "route", "rule_set": $t, "outbound": $to}] + .[$s:]
           )
         ' "$CONFIG_FILE") || return 1
         if apply_config_and_restart "$temp_json"; then
@@ -3447,31 +3786,48 @@ add_warp_media() {
 }
 
 count_split_rules() {
-    jq '[.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss")] | length' "$CONFIG_FILE" 2>/dev/null
+    jq --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
+      (.route.rules // []) as $r |
+      ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+      [range(0; ($r | length)) as $i |
+       select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and
+              ($r[$i].outbound == "warp" or $r[$i].outbound == "socks5" or $r[$i].outbound == "isp-ss"))] | length
+    ' "$CONFIG_FILE" 2>/dev/null
 }
 
 view_warp_rules() {
     ensure_config || return 1
-    local n
+    local n mode=''
     n=$(count_split_rules)
     echo -e "\n  ${CYAN}▌ WARP / SOCKS5 / SS 分流规则（共 ${n:-0} 条）${PLAIN}"
     if [ "${n:-0}" -eq 0 ]; then
-        echo -e "  ${YELLOW}暂无规则，可在分流菜单中开启规则集或添加自定义规则。${PLAIN}"; return
+        echo -e "  ${YELLOW}暂无规则，可在分流菜单中开启规则集或添加自定义规则。${PLAIN}"
+    else
+        jq -r --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
+          (.route.rules // []) as $r |
+          ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+          [range(0; ($r | length)) as $i |
+           select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and
+                  ($r[$i].outbound == "warp" or $r[$i].outbound == "socks5" or $r[$i].outbound == "isp-ss")) | $r[$i]]
+          | to_entries[]
+          | .value as $item
+          | ([
+              (if ($item.inbound?       // null) != null then "入站: "     + (($item.inbound       | if type == "array" then join(",") else tostring end)) else empty end),
+              (if ($item.rule_set?      // null) != null then "规则集: "   + (($item.rule_set      | if type == "array" then join(",") else tostring end)) else empty end),
+              (if ($item.domain_suffix? // null) != null then "域名后缀: " + (($item.domain_suffix | if type == "array" then join(",") else tostring end)) else empty end),
+              (if ($item.domain?        // null) != null then "域名: "     + (($item.domain        | if type == "array" then join(",") else tostring end)) else empty end),
+              (if ($item.domain_keyword? // null) != null then "关键词: "   + (($item.domain_keyword | if type == "array" then join(",") else tostring end)) else empty end),
+              (if ($item.ip_cidr?       // null) != null then "IP: "       + (($item.ip_cidr       | if type == "array" then join(",") else tostring end)) else empty end)
+            ] | map(select(. != "")) | join("  |  ")) as $detail
+          | "  [\(.key + 1)] " + (if $detail == "" then "全部流量" else $detail end) + " -> \($item.outbound | ascii_upcase)"
+        ' "$CONFIG_FILE"
     fi
-    jq -r '
-      [.route.rules[]? | select(.outbound == "warp" or .outbound == "socks5" or .outbound == "isp-ss")]
-      | to_entries[]
-      | .value as $r
-      | ([
-          (if ($r.inbound?       // null) != null then "入站: "     + (($r.inbound       | if type == "array" then join(",") else tostring end)) else empty end),
-          (if ($r.rule_set?      // null) != null then "规则集: "   + (($r.rule_set      | if type == "array" then join(",") else tostring end)) else empty end),
-          (if ($r.domain_suffix? // null) != null then "域名后缀: " + (($r.domain_suffix | if type == "array" then join(",") else tostring end)) else empty end),
-          (if ($r.domain?        // null) != null then "域名: "     + (($r.domain        | if type == "array" then join(",") else tostring end)) else empty end),
-          (if ($r.domain_keyword? // null) != null then "关键词: "   + (($r.domain_keyword | if type == "array" then join(",") else tostring end)) else empty end),
-          (if ($r.ip_cidr?       // null) != null then "IP: "       + (($r.ip_cidr       | if type == "array" then join(",") else tostring end)) else empty end)
-        ] | map(select(. != "")) | join("  |  ")) as $detail
-      | "  [\(.key + 1)] " + (if $detail == "" then "全部流量" else $detail end) + " -> \($r.outbound | ascii_upcase)"
-    ' "$CONFIG_FILE"
+    if declare -F get_warp_stack_mode >/dev/null && [ "$(has_warp_endpoint)" -gt 0 ]; then
+        mode=$(get_warp_stack_mode)
+        if [ "$mode" != dual ]; then
+            printf '  [全局分栈] %s（在菜单「设置 WARP IP 栈模式」中切换）\n' "$(warp_stack_mode_label "$mode")"
+        fi
+    fi
 }
 
 delete_warp_rule() {
@@ -3490,8 +3846,13 @@ delete_warp_rule() {
         echo -e "${RED}无效序号！${PLAIN}"; return
     fi
     local abs
-    abs=$(jq --argjson k "$((10#$idx-1))" '
-      [.route.rules | to_entries[] | select(.value.outbound == "warp" or .value.outbound == "socks5" or .value.outbound == "isp-ss") | .key][$k]' "$CONFIG_FILE") || return 1
+    abs=$(jq --argjson k "$((10#$idx-1))" --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
+      (.route.rules // []) as $r |
+      ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+      [range(0; ($r | length)) as $i |
+       select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and
+              ($r[$i].outbound == "warp" or $r[$i].outbound == "socks5" or $r[$i].outbound == "isp-ss")) | $i][$k]
+    ' "$CONFIG_FILE") || return 1
     local temp_json
     temp_json=$(jq --argjson i "$abs" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
       .route.rules |= (.[:$i] + .[$i+1:]) |
@@ -3520,8 +3881,31 @@ delete_warp() {
 }
 
 config_without_split_outbound() {
-    jq --arg to "$1" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" '
-        if $to == "warp" then .endpoints |= map(select(.tag != $to))
+    jq --arg to "$1" --arg ai "$WARP_AI_RULE_TAG" --arg media "$WARP_MEDIA_RULE_TAG" \
+       --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" --arg ldns "${WARP_LOCAL_DNS_TAG:-sb-local-dns}" '
+        if $to == "warp" then
+          .endpoints |= map(select(.tag != $to)) |
+          if .route.rules then
+            (.route.rules) as $r |
+            ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+            if $s != null then
+              ($r | length) as $len |
+              ($s + 1) as $i1 | ($s + 2) as $i2 |
+              ($i1 < $len and (($r[$i1].ip_cidr == ["0.0.0.0/0"] or $r[$i1].ip_cidr == ["::/0"]) and ($r[$i1].outbound == "warp" or $r[$i1].outbound == "direct"))) as $d1 |
+              ($d1 and $i2 < $len and (($r[$i2].ip_cidr == ["0.0.0.0/0"] or $r[$i2].ip_cidr == ["::/0"]) and ($r[$i2].outbound == "warp" or $r[$i2].outbound == "direct"))) as $d2 |
+              .route.rules = [range(0; $len) as $i | select($i != $s and (($d1 and $i == $i1) | not) and (($d2 and $i == $i2) | not)) | $r[$i]]
+            else . end
+          else . end |
+          if .dns?.servers? then
+            .dns.servers |= [.[] | select(.tag != $wdns)] |
+            if (.dns.servers | map(.tag) == [$ldns]) and ((.dns.rules // []) | length == 0) and
+               ((.dns | keys) - ["servers", "final"] | length == 0) then
+              del(.dns) |
+              if .route?.default_domain_resolver? == $ldns then del(.route.default_domain_resolver) else . end
+            else
+              if .dns.final == $wdns then .dns.final = (.dns.servers[0].tag // $ldns) else . end
+            end
+          else . end
         else .outbounds |= map(select(.tag != $to)) end |
         if .route.rules then .route.rules |= map(select(.outbound != $to)) else . end |
         if .route.rule_set then
@@ -3541,21 +3925,40 @@ delete_socks5_outbound() {
 
 # 用独立临时核心测试指定出口；端口由系统分配，不改生产配置/路由。
 probe_split_outbound() (
-    local tag="$1" label="$2" work pid='' port='' ip family host i result=''
+    local tag="$1" label="$2" work pid='' port='' ip family host i result='' families='4 6' dns_ip=''
     work=$(mktemp -d) || return 1
     chmod 700 "$work"
     trap '[ -z "$pid" ] || { kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :; }; rm -f -- "$work/config.json" "$work/core.log"; rmdir "$work"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     umask 077
-    jq --arg tag "$tag" '
-      {log:{level:"info", timestamp:false},
-       dns:{servers:[{type:"local",tag:"probe-local"}]},
-       inbounds:[{type:"mixed",tag:"probe",listen:"127.0.0.1",listen_port:0}],
-       outbounds:[.outbounds[]? | select(.tag == $tag) | .domain_resolver = "probe-local"],
-       endpoints:[.endpoints[]? | select(.tag == $tag)],
-       route:{final:$tag,default_domain_resolver:"probe-local"}}
-    ' "$CONFIG_FILE" > "$work/config.json" || return 1
+    if [ "$tag" = warp ]; then
+        local want_v4=0 want_v6=0
+        jq -e 'any(.endpoints[]? | select(.tag == "warp") | .peers[]?.allowed_ips[]?; . == "0.0.0.0/0")' "$CONFIG_FILE" >/dev/null 2>&1 && want_v4=1
+        jq -e 'any(.endpoints[]? | select(.tag == "warp") | .peers[]?.allowed_ips[]?; . == "::/0")' "$CONFIG_FILE" >/dev/null 2>&1 && want_v6=1
+        if [ "$want_v4" -eq 0 ] && [ "$want_v6" -eq 0 ]; then want_v4=1; want_v6=1; fi
+        families=''
+        [ "$want_v4" -eq 1 ] && families="${families} 4"
+        [ "$want_v6" -eq 1 ] && families="${families} 6"
+        if [ "$want_v4" -eq 1 ]; then dns_ip="1.1.1.1"; else dns_ip="2606:4700:4700::1111"; fi
+        jq --arg tag "$tag" --arg dns_ip "$dns_ip" '
+          {log:{level:"info", timestamp:false},
+           dns:{servers:[{type:"udp", server:$dns_ip, detour:$tag, tag:"probe-dns"}]},
+           inbounds:[{type:"mixed",tag:"probe",listen:"127.0.0.1",listen_port:0}],
+           outbounds:[],
+           endpoints:[.endpoints[]? | select(.tag == $tag)],
+           route:{final:$tag,default_domain_resolver:"probe-dns"}}
+        ' "$CONFIG_FILE" > "$work/config.json" || return 1
+    else
+        jq --arg tag "$tag" '
+          {log:{level:"info", timestamp:false},
+           dns:{servers:[{type:"local",tag:"probe-local"}]},
+           inbounds:[{type:"mixed",tag:"probe",listen:"127.0.0.1",listen_port:0}],
+           outbounds:[.outbounds[]? | select(.tag == $tag) | .domain_resolver = "probe-local"],
+           endpoints:[.endpoints[]? | select(.tag == $tag)],
+           route:{final:$tag,default_domain_resolver:"probe-local"}}
+        ' "$CONFIG_FILE" > "$work/config.json" || return 1
+    fi
     if ! "$BIN_FILE" check -c "$work/config.json" > "$work/core.log" 2>&1; then
         return 1
     fi
@@ -3570,7 +3973,7 @@ probe_split_outbound() (
     if [ -z "$port" ] || ! kill -0 "$pid" 2>/dev/null; then
         return 1
     fi
-    for family in 4 6; do
+    for family in $families; do
         host="api${family}.ipify.org"
         ip=$(curl --silent --fail --connect-timeout 5 --max-time 10 --noproxy '' \
             --proxy "socks5h://127.0.0.1:$port" "https://$host" 2>/dev/null) || ip=''
@@ -3606,16 +4009,25 @@ view_warp() {
     fi
     echo -e "\n  ${CYAN}▌ WARP 出口 (wireguard endpoint)${PLAIN}"
     jq '.endpoints[] | select(.tag == "warp")' "$CONFIG_FILE"
-    local rc
-    rc=$(jq '[.route.rules[]? | select((.outbound? // "") == "warp")] | length' "$CONFIG_FILE" 2>/dev/null)
-    echo -e "  指向 warp 的路由规则数: ${BLUE}${rc:-0}${PLAIN}"
+    local rc mode peer_info
+    peer_info=$(get_warp_peer_summary)
+    mode=$(get_warp_stack_mode)
+    rc=$(jq --arg wdns "${WARP_DNS_TAG:-sb-warp-dns}" '
+      (.route.rules // []) as $r |
+      ([$r | to_entries[] | select(.value.action == "resolve" and .value.server == $wdns) | .key][0]) as $s |
+      [range(0; ($r | length)) as $i |
+       select(($s == null or ($i != $s and $i != ($s + 1) and $i != ($s + 2))) and ($r[$i].outbound? // "") == "warp")] | length
+    ' "$CONFIG_FILE" 2>/dev/null)
+    echo -e "  当前对端地址: ${BLUE}${peer_info:-未知}${PLAIN}"
+    echo -e "  当前 IP 栈模式: ${BLUE}$(warp_stack_mode_label "$mode")${PLAIN}"
+    echo -e "  指向 warp 的分流规则数: ${BLUE}${rc:-0}${PLAIN}"
     [ -f "$WARP_META" ] && echo -e "  账号元数据: $WARP_META"
 }
 
 menu_warp() {
     local c yn exit_ip_cache='' exit_ip_config='' current_config
     while true; do
-        local warp_has warp_status ai_state media_state rule_count socks_status ss_status
+        local warp_has warp_status ai_state media_state rule_count socks_status ss_status warp_peer_info warp_stack_lbl
         warp_has=$(has_warp_endpoint)
         warp_status=$(warp_summary_short)
         socks_status=未配置
@@ -3644,6 +4056,8 @@ menu_warp() {
         menu_option 6 "删除指定规则"
         menu_section "出口管理"
         if [ "$warp_has" -gt 0 ]; then
+            warp_peer_info=$(get_warp_peer_summary)
+            warp_stack_lbl=$(warp_stack_mode_label "$(get_warp_stack_mode)")
             menu_option 7 "重新注册 / 重置 WARP 出口"
         else
             menu_option 7 "添加 WARP 出口（免费自动注册）"
@@ -3654,8 +4068,15 @@ menu_warp() {
         menu_option 11 "删除 SOCKS5 出口及全部关联规则"
         menu_option 12 "添加 / 更新 SS 家宽出口"
         menu_option 13 "删除 SS 家宽出口及全部关联规则"
+        if [ "$warp_has" -gt 0 ]; then
+            menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口） [${warp_peer_info:-未设置}]"
+            menu_option 15 "设置 WARP IP 栈模式 [${warp_stack_lbl}]"
+        else
+            menu_option 14 "切换 WARP 对端（IPv4/IPv6/端口）"
+            menu_option 15 "设置 WARP IP 栈模式（仅 v4 / 仅 v6 / 双栈）"
+        fi
         menu_back
-        read_menu_choice "请选择 [0-13]" || return 0
+        read_menu_choice "请选择 [0-15]" || return 0
         c="$REPLY"
         case "$c" in
             "") continue ;;
@@ -3690,6 +4111,8 @@ menu_warp() {
                     read -rp '  确认删除 SS 家宽出口及全部关联分流规则？[y/N]: ' yn || continue
                     if [[ "$yn" == y ]]; then delete_ss_outbound; pause; fi
                 fi ;;
+            14) switch_warp_peer; pause ;;
+            15) menu_warp_stack_mode; pause ;;
             0) return ;;
             *) menu_invalid ;;
         esac
